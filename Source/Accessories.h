@@ -17,4 +17,4 @@
 //             숫자+W = Weight (예 "700W" 면 Weight 를 700 으로)
 //           숫자는 바로 뒤에 오는 속성의 값(정도)으로 쓰인다.
 // dpi_y   : 세로 방향 DPI (포인트를 픽셀 높이로 환산할 때 사용, 보통 96)
-LOGFONTW ParseFontOpts(const char* name, int size_pt, const char* opts, int dpi_y);
+LOGFONTW ParseFontOpts(const char* name, float size_pt, const char* opts, int dpi_y);

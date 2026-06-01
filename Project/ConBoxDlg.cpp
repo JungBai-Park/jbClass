@@ -61,6 +61,18 @@ BOOL CConBoxDlg::OnInitDialog()
 	SetIcon(m_hIcon, TRUE);			// 큰 아이콘을 설정합니다.
 	SetIcon(m_hIcon, FALSE);		// 작은 아이콘을 설정합니다.
 
+	// 타이틀바에 최소화/최대화 버튼을 추가한다.
+	// 캡션 버튼은 시스템 메뉴(WS_SYSMENU)가 있어야 보이므로 함께 켠다.
+	// 최소화 버튼으로 창을 작업표시줄 아이콘으로 보낼 수 있다. (EXSTYLE 에 WS_EX_APPWINDOW 가 있어 항상 표시됨)
+	ModifyStyle(0, WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX);
+	SetWindowPos(NULL, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+
+	// 데모에서는 확인/취소 버튼을 쓰지 않으므로 제거한다.
+	if (CWnd* ok = GetDlgItem(IDOK))
+		ok->DestroyWindow();
+	if (CWnd* cancel = GetDlgItem(IDCANCEL))
+		cancel->DestroyWindow();
+
 	// 폰트는 창 생성 전에 지정한다. (기본값과 동일하지만 API 사용 예시를 겸한다.)
 	con_box.set_efont("Consolas", 13, "B");
 	con_box.set_kfont("Malgun Gothic", 13, "B");
@@ -108,28 +120,9 @@ void CConBoxDlg::layout_children()
 
 	const int margin = 20;
 
-	// 확인/취소 버튼을 오른쪽 아래에 둔다. 버튼 크기는 현재 값을 그대로 쓴다.
-	int bw = 50, bh = 14, gap = 6;
-	CWnd* ok = GetDlgItem(IDOK);
-	CWnd* cancel = GetDlgItem(IDCANCEL);
-	if (ok != NULL) {
-		CRect r;
-		ok->GetWindowRect(&r);
-		bw = r.Width();
-		bh = r.Height();
-	}
-
-	int btn_y = client.bottom - margin - bh;
-	if (cancel != NULL)
-		cancel->SetWindowPos(NULL, client.right - margin - bw, btn_y, 0, 0,
-			SWP_NOSIZE | SWP_NOZORDER);
-	if (ok != NULL)
-		ok->SetWindowPos(NULL, client.right - margin - bw - gap - bw, btn_y, 0, 0,
-			SWP_NOSIZE | SWP_NOZORDER);
-
-	// ConBox 는 위/좌/우 20px 마진, 아래쪽은 버튼 위 20px 까지 채운다.
-	int box_w = client.right - 2 * margin;
-	int box_h = (btn_y - margin) - margin;
+	// 확인/취소 버튼이 없으므로 ConBox 가 사방 20px 마진으로 클라이언트 영역을 꽉 채운다.
+	int box_w = client.Width() - 2 * margin;
+	int box_h = client.Height() - 2 * margin;
 	if (box_w < 10) box_w = 10;
 	if (box_h < 10) box_h = 10;
 	con_box.MoveWindow(margin, margin, box_w, box_h);

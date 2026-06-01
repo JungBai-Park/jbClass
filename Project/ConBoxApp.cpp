@@ -37,6 +37,11 @@ CConBoxApp theApp;
 
 BOOL CConBoxApp::InitInstance()
 {
+	// 디스플레이 배율(비100%) 환경에서 글자가 흐려지지 않도록 프로세스를 System DPI Aware 로 만든다.
+	// DPI 인식은 프로세스 단위 속성이므로 이식 대상 컨트롤(CConBox)이 아니라 호스트 앱에서 켠다.
+	// 윈도우/DC 생성 전에 호출해야 하므로 InitInstance 의 가장 앞에 둔다.
+	SetProcessDPIAware();
+
 	// Windows XP에서는 InitCommonControlsEx()를 필요로 합니다.
 	// 사용하도록 지정하는 경우, Windows XP 상에서 반드시 InitCommonControlsEx()가 필요합니다.
 	// InitCommonControlsEx()를 사용하지 않으면 창을 만들 수 없습니다.

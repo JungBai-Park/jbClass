@@ -9,12 +9,11 @@
 #include <imm.h>            // 한글 IME (Input Method Manager)
 #pragma comment(lib, "imm32.lib")
 
-// 메시지 맵: 그리기/배경/크기/타이머/키보드/스크롤/IME 를 처리한다.
+// 메시지 맵: 그리기/배경/크기/키보드/스크롤/IME 를 처리한다.
 BEGIN_MESSAGE_MAP(CConBox, CWnd)
 	ON_WM_PAINT()
 	ON_WM_ERASEBKGND()
 	ON_WM_SIZE()
-	ON_WM_TIMER()
 	ON_WM_CHAR()
 	ON_WM_KEYDOWN()
 	ON_WM_GETDLGCODE()
@@ -23,7 +22,9 @@ BEGIN_MESSAGE_MAP(CConBox, CWnd)
 	ON_MESSAGE(WM_IME_STARTCOMPOSITION, &CConBox::OnImeStart)
 	ON_MESSAGE(WM_IME_COMPOSITION, &CConBox::OnImeComp)
 	ON_MESSAGE(WM_IME_ENDCOMPOSITION, &CConBox::OnImeEnd)
+	ON_MESSAGE(WM_IME_NOTIFY, &CConBox::OnImeNotify)
 	ON_WM_LBUTTONDOWN()
+	ON_WM_LBUTTONDBLCLK()
 	ON_WM_MOUSEMOVE()
 	ON_WM_LBUTTONUP()
 	ON_WM_RBUTTONDOWN()
@@ -45,6 +46,32 @@ static bool IsWideChar(wchar_t ch)
 		|| (ch >= 0xFFE0 && ch <= 0xFFE6);  // 전각 통화기호 등
 }
 
+// 더블클릭 단어 선택에서 쓰는 문자 부류 판정.
+// 단어는 공백으로 끊되, 영문/한글/특수문자가 섞이지 않도록 같은 부류끼리만 묶는다.
+//   0 = 구분자(공백/탭/소프트 줄바꿈), 1 = 한글, 2 = 영문(영숫자), 3 = 특수문자(그 외 비구분자)
+static int CharClass(wchar_t ch)
+{
+	if (ch == L' ' || ch == L'\t' || ch == L'\n')
+		return 0;
+
+	// 한글: 완성형 음절, 자모, 호환 자모, 확장 자모 영역.
+	if ((ch >= 0xAC00 && ch <= 0xD7A3)
+		|| (ch >= 0x1100 && ch <= 0x11FF)
+		|| (ch >= 0x3130 && ch <= 0x318F)
+		|| (ch >= 0xA960 && ch <= 0xA97F)
+		|| (ch >= 0xD7B0 && ch <= 0xD7FF))
+		return 1;
+
+	// 영문: ASCII 영문자와 숫자. (숫자는 영문 부류로 함께 묶는다.)
+	if ((ch >= L'0' && ch <= L'9')
+		|| (ch >= L'A' && ch <= L'Z')
+		|| (ch >= L'a' && ch <= L'z'))
+		return 2;
+
+	// 그 밖의 비구분자는 특수문자로 본다.
+	return 3;
+}
+
 CConBox::CConBox()
 {
 	// 색상 기본값: 검은 바탕에 흰 글씨.
@@ -56,22 +83,32 @@ CConBox::CConBox()
 	cell_h = 16;
 	cell_base = 12;
 
+	// 기본적으로 줄 높이를 영문 폰트 기준으로 잡고 한글 높이를 거기에 맞춘다.
+	kfont_match_efont = true;
+
 	cols = 1;
 	rows = 1;
+
+	// 안쪽 여백 기본값은 사방 10 픽셀.
+	margin_top = 10;
+	margin_bottom = 10;
+	margin_left = 10;
+	margin_right = 10;
 
 	scroll_top = 0;
 	cur_log = 0;
 	cur_col = 0;
 	edit_log = 0;
 	edit_col = 0;
+	ime_anchor = 0;
+	desired_vx = -1;
 
 	// Enter 콜백은 기본적으로 없다. 사용 측에서 대입한다.
 	on_enter = nullptr;
 
-	// 커서 기본값: 칸 높이의 20% 두께 언더바, 0.5초 간격 깜빡임.
-	cursor_pct = 20;
-	cursor_blink_ms = 500;
-	cursor_on = true;
+	// 블록 커서 색 혼합 비율 기본값: 배경:전경 = 6:4 (배경에 가까운 중간색).
+	cursor_bg_weight = 6;
+	cursor_fg_weight = 4;
 
 	// 선택 상태 초기화
 	selecting = false;
@@ -112,14 +149,9 @@ void CConBox::open(CWnd* parent, int x0, int y0, int x1, int y1)
 	update_metrics();
 	rebuild_scr_lines();
 	update_scrollbar();
-
-	// 커서 깜빡임 타이머를 시작한다. (간격이 0이면 깜빡이지 않는다.)
-	cursor_on = true;
-	if (cursor_blink_ms > 0)
-		SetTimer(CURSOR_TIMER, cursor_blink_ms, NULL);
 }
 
-void CConBox::make_font(CFont& font, LOGFONTW& lf_out, const char* name, int size, const char* opts)
+void CConBox::make_font(CFont& font, LOGFONTW& lf_out, const char* name, float size, const char* opts)
 {
 	// 포인트->픽셀 환산에 쓸 화면 DPI 를 구한다.
 	HDC hdc = ::GetDC(NULL);
@@ -147,32 +179,101 @@ void CConBox::calc_cell_size()
 	HWND meas_wnd = has_wnd ? m_hWnd : NULL;
 	HDC hdc = ::GetDC(meas_wnd);
 
-	// 영문 폰트로 한 글자 폭과 높이, 기준선(ascent)을 잰다. (고정폭 폰트 기준)
+	// 먼저 영문 폰트를 사용자 원본(efont_lf, 자연 폭)으로 되돌려 자연 크기를 잰다.
+	// (이전 호출에서 장평이 적용돼 있을 수 있으므로 매번 원본부터 측정한다.)
+	efont.DeleteObject();
+	efont.CreateFontIndirectW(&efont_lf);
+
 	HGDIOBJ old = ::SelectObject(hdc, efont.GetSafeHandle());
 	TEXTMETRICW tm;
 	::GetTextMetricsW(hdc, &tm);
 	SIZE sz;
 	::GetTextExtentPoint32W(hdc, L"W", 1, &sz);
-	cell_w = sz.cx;
+	int natw = sz.cx;                 // 영문 자연 글자폭
+	cell_w = natw;
 	int eh = tm.tmHeight + tm.tmExternalLeading;
 	int ea = tm.tmAscent;
 
-	// 한글 폰트 높이와 기준선도 재서 더 큰 쪽을 채택한다.
-	::SelectObject(hdc, kfont.GetSafeHandle());
-	::GetTextMetricsW(hdc, &tm);
-	int kh = tm.tmHeight + tm.tmExternalLeading;
-	int ka = tm.tmAscent;
+	if (kfont_match_efont) {
+		// 한글 자간이 넓어 보이는 문제를 줄인다.
+		// 핵심: 한글은 가로로 찌그러뜨리지 않고(자연 폭 유지, 압축하면 획이 깨진다)
+		// 높이만 영문에 맞춘다. 그런 다음 그 한글 폭에 맞춰 한 칸 폭(cell_w)을 좁혀,
+		// 한글이 두 칸을 거의 채우게 한다. 영문은 그 cell_w 로 장평(약간 좁아짐)한다.
+		const double KFILL_RATIO = 0.92;   // 한글이 채울 두 칸 폭 비율(약간의 여백)
+		const double EMIN_RATIO  = 0.7;    // 영문을 이보다 더 좁히지는 않는다(가독성 하한)
 
-	// 줄 높이는 두 폰트 중 큰 쪽, 기준선도 두 폰트 중 아래쪽(큰 ascent)에 맞춘다.
-	// 이렇게 하면 한글과 영문이 같은 기준선 위에 놓여 글자 바닥이 가지런해진다.
-	cell_h = (eh > kh) ? eh : kh;
-	cell_base = (ea > ka) ? ea : ka;
+		// 한글 높이 맞춤: 영문과 같은 em 으로 만들어 실제 높이를 재고, 영문 높이(eh)와
+		// 같아지도록 em 을 비례 보정한다. 폭은 자연 폭(lfWidth=0) 그대로 둔다.
+		LOGFONTW lf = kfont_lf;
+		lf.lfWidth = 0;
+		lf.lfHeight = efont_lf.lfHeight;
+		kfont.DeleteObject();
+		kfont.CreateFontIndirectW(&lf);
+		::SelectObject(hdc, kfont.GetSafeHandle());
+		::GetTextMetricsW(hdc, &tm);
+		int kh0 = tm.tmHeight + tm.tmExternalLeading;
+		if (kh0 > 0 && kh0 != eh) {
+			LONG newh = (LONG)((double)lf.lfHeight * (double)eh / (double)kh0);
+			if (newh == 0) newh = lf.lfHeight;
+			lf.lfHeight = newh;
+			::SelectObject(hdc, old);
+			kfont.DeleteObject();
+			kfont.CreateFontIndirectW(&lf);
+			::SelectObject(hdc, kfont.GetSafeHandle());
+			::GetTextMetricsW(hdc, &tm);
+		}
+
+		// 높이를 맞춘 한글 한 글자의 자연 폭을 잰다.
+		SIZE ksz;
+		::GetTextExtentPoint32W(hdc, L"가", 1, &ksz);
+		int kwid = ksz.cx;
+		int kh = tm.tmHeight + tm.tmExternalLeading;
+		int ka = tm.tmAscent;
+
+		// 한 칸 폭을 한글 자연 폭 기준으로 정한다(두 칸이 한글의 KFILL_RATIO 만큼이 되도록).
+		// 영문은 원본보다 넓히지 않고(<=natw), 가독성 하한(EMIN_RATIO) 밑으로 좁히지도 않는다.
+		int cw = (int)(kwid / (2.0 * KFILL_RATIO) + 0.5);
+		int emin = (int)(natw * EMIN_RATIO + 0.5);
+		if (cw > natw) cw = natw;
+		if (cw < emin) cw = emin;
+		if (cw < 1) cw = 1;
+
+		// 영문 장평: 위에서 정한 cw 로 폭만 좁혀 다시 만든다. (지금 hdc 에는 kfont 가 선택돼 있어
+		// efont 는 선택돼 있지 않으므로 바로 삭제·재생성해도 된다.)
+		LOGFONTW elf = efont_lf;
+		elf.lfWidth = cw;
+		efont.DeleteObject();
+		efont.CreateFontIndirectW(&elf);
+		::SelectObject(hdc, efont.GetSafeHandle());
+		::GetTextExtentPoint32W(hdc, L"W", 1, &sz);
+		cell_w = sz.cx;
+
+		// 줄 높이/기준선은 두 폰트 중 큰 쪽을 택해 글자 잘림을 막는다(거의 영문과 같다).
+		cell_h = (eh > kh) ? eh : kh;
+		cell_base = (ea > ka) ? ea : ka;
+	}
+	else {
+		// 옵션을 끈 경우: 영문은 위에서 원본으로 복원됨(cell_w = natw). 한글도 원본 크기로 만든다.
+		LOGFONTW lf = kfont_lf;
+		kfont.DeleteObject();
+		kfont.CreateFontIndirectW(&lf);
+
+		// 한글 폰트 높이와 기준선도 재서 두 폰트 중 큰 쪽(기준선은 큰 ascent)에 맞춘다.
+		// 이렇게 하면 한글과 영문이 같은 기준선 위에 놓여 글자 바닥이 가지런해진다.
+		::SelectObject(hdc, kfont.GetSafeHandle());
+		::GetTextMetricsW(hdc, &tm);
+		int kh = tm.tmHeight + tm.tmExternalLeading;
+		int ka = tm.tmAscent;
+
+		cell_h = (eh > kh) ? eh : kh;
+		cell_base = (ea > ka) ? ea : ka;
+	}
 
 	::SelectObject(hdc, old);
 	::ReleaseDC(meas_wnd, hdc);
 }
 
-void CConBox::set_efont(const char* name, int size, const char* opts)
+void CConBox::set_efont(const char* name, float size, const char* opts)
 {
 	make_font(efont, efont_lf, name, size, opts);
 
@@ -183,12 +284,32 @@ void CConBox::set_efont(const char* name, int size, const char* opts)
 	}
 }
 
-void CConBox::set_kfont(const char* name, int size, const char* opts)
+void CConBox::set_kfont(const char* name, float size, const char* opts)
 {
 	make_font(kfont, kfont_lf, name, size, opts);
 
 	if (::IsWindow(m_hWnd)) {
 		calc_cell_size();
+		Invalidate();
+	}
+}
+
+void CConBox::set_kfont_match_efont(bool on)
+{
+	kfont_match_efont = on;
+
+	// 창이 떠 있으면 칸 크기(줄 높이)가 바뀌므로 그리드/줄바꿈을 다시 계산한다.
+	if (::IsWindow(m_hWnd)) {
+		calc_cell_size();
+		update_metrics();
+		rebuild_scr_lines();
+
+		// 스크롤 위치가 범위를 벗어나면 맞춰 준다.
+		int maxtop = (int)scr_lines.size() - rows;
+		if (maxtop < 0) maxtop = 0;
+		if (scroll_top > maxtop) scroll_top = maxtop;
+
+		update_scrollbar();
 		Invalidate();
 	}
 }
@@ -203,12 +324,18 @@ void CConBox::set_bg_color(COLORREF bg)
 	cur_bg = bg;
 }
 
-void CConBox::set_cursor_size(int height_pct)
+void CConBox::set_cursor_blend(int bg_weight, int fg_weight)
 {
-	cursor_pct = height_pct;
-	if (height_pct < 1) cursor_pct = 1;
-	if (height_pct > 100) cursor_pct = 100;
+	// 음수는 0 으로 막고, 합이 0 이면(둘 다 0) 의미가 없으므로 무시한다.
+	if (bg_weight < 0) bg_weight = 0;
+	if (fg_weight < 0) fg_weight = 0;
+	if (bg_weight + fg_weight <= 0)
+		return;
 
+	cursor_bg_weight = bg_weight;
+	cursor_fg_weight = fg_weight;
+
+	// 창이 있으면 커서 칸을 다시 그려 바뀐 색을 즉시 반영한다.
 	if (::IsWindow(m_hWnd)) {
 		CRect rc;
 		if (get_cursor_rect(rc))
@@ -216,18 +343,49 @@ void CConBox::set_cursor_size(int height_pct)
 	}
 }
 
-void CConBox::set_cursor_blink(int interval_ms)
+void CConBox::set_margin(int top, int left, int bottom, int right)
 {
-	cursor_blink_ms = interval_ms;
+	// CSS 단축 스타일로 생략한 변을 채운다. left 를 먼저 결정해야 right 가 그 값을 따를 수 있다.
+	if (left < 0) left = top;
+	if (bottom < 0) bottom = top;
+	if (right < 0) right = left;
 
+	margin_top = top;
+	margin_left = left;
+	margin_bottom = bottom;
+	margin_right = right;
+
+	// open 이후라면 resize 와 마찬가지로 칸 수/줄 수와 줄바꿈을 다시 계산한다.
 	if (::IsWindow(m_hWnd)) {
-		// 기존 타이머를 끄고 다시 건다. 간격이 0이면 깜빡임 없이 항상 켜 둔다.
-		KillTimer(CURSOR_TIMER);
-		cursor_on = true;
-		if (cursor_blink_ms > 0)
-			SetTimer(CURSOR_TIMER, cursor_blink_ms, NULL);
+		update_metrics();
+		rebuild_scr_lines();
+
+		// 스크롤 위치가 범위를 벗어나면 맞춰 준다.
+		int maxtop = (int)scr_lines.size() - rows;
+		if (maxtop < 0) maxtop = 0;
+		if (scroll_top > maxtop) scroll_top = maxtop;
+
+		update_scrollbar();
 		Invalidate();
 	}
+}
+
+// 블록 커서 색을 계산한다.
+// 배경색과 전경색을 채널별로 cursor_bg_weight : cursor_fg_weight 비율로 섞는다.
+// 기본값(6:4)은 배경에 가까운 중간색이라, 커서가 칸을 채워도 그 위에 전경색으로
+// 그린 글자가 잘 보인다. 비율은 set_cursor_blend 로 바꿀 수 있다.
+COLORREF CConBox::blend_cursor_color() const
+{
+	int bw = cursor_bg_weight;
+	int fw = cursor_fg_weight;
+	int sum = bw + fw;
+	if (sum <= 0)
+		return cur_bg;
+
+	int r = (GetRValue(cur_bg) * bw + GetRValue(cur_fg) * fw) / sum;
+	int g = (GetGValue(cur_bg) * bw + GetGValue(cur_fg) * fw) / sum;
+	int b = (GetBValue(cur_bg) * bw + GetBValue(cur_fg) * fw) / sum;
+	return RGB(r, g, b);
 }
 
 bool CConBox::cursor_screen_pos(int& row_out, int& vx_out) const
@@ -273,24 +431,46 @@ bool CConBox::get_cursor_rect(CRect& rc) const
 	if (row < 0 || row >= rows)
 		return false;
 
-	// 칸 아래쪽에 cursor_pct 비율 두께의 언더바를 둔다.
-	int ch = cell_h * cursor_pct / 100;
-	if (ch < 2) ch = 2;
+	// 커서는 칸을 꽉 채우는 블록이다.
+	// 한글 입력 모드이면 (아직 조합 전이라도) 한글 한 글자 폭에 맞춰
+	// 두 칸 폭으로, 영문 모드면 한 칸 폭으로 채운다.
+	int cw = is_hangul_mode() ? cell_w * 2 : cell_w;
 
-	int px = vx * cell_w;
-	int py = row * cell_h;
-	rc.SetRect(px, py + cell_h - ch, px + cell_w, py + cell_h);
+	int px = margin_left + vx * cell_w;
+	int py = margin_top + row * cell_h;
+	rc.SetRect(px, py, px + cw, py + cell_h);
 	return true;
+}
+
+// 지금 IME 가 한글 자모 입력 모드인지 조회한다.
+// ImmGetConversionStatus 의 IME_CMODE_NATIVE 플래그가 켜져 있으면 한글 모드다.
+// 한/영 키로 모드만 바꾼 직후(조합 시작 전)에도 올바른 값을 돌려준다.
+bool CConBox::is_hangul_mode() const
+{
+	HIMC himc = ImmGetContext(m_hWnd);
+	if (!himc)
+		return false;
+
+	DWORD conv = 0, sentence = 0;
+	bool native = false;
+	if (ImmGetConversionStatus(himc, &conv, &sentence))
+		native = (conv & IME_CMODE_NATIVE) != 0;
+
+	ImmReleaseContext(m_hWnd, himc);
+	return native;
 }
 
 void CConBox::update_metrics()
 {
-	// 클라이언트 크기를 한 칸 크기로 나누어 가로 칸 수와 세로 줄 수를 구한다.
+	// 클라이언트 크기에서 안쪽 여백을 뺀 영역을 한 칸 크기로 나누어
+	// 가로 칸 수와 세로 줄 수를 구한다.
 	CRect rc;
 	GetClientRect(&rc);
 
-	cols = (cell_w > 0) ? (rc.Width() / cell_w) : 1;
-	rows = (cell_h > 0) ? (rc.Height() / cell_h) : 1;
+	int avail_w = rc.Width() - margin_left - margin_right;
+	int avail_h = rc.Height() - margin_top - margin_bottom;
+	cols = (cell_w > 0) ? (avail_w / cell_w) : 1;
+	rows = (cell_h > 0) ? (avail_h / cell_h) : 1;
 	if (cols < 1) cols = 1;
 	if (rows < 1) rows = 1;
 }
@@ -482,35 +662,6 @@ void CConBox::OnSize(UINT type, int cx, int cy)
 	Invalidate();
 }
 
-void CConBox::OnTimer(UINT_PTR id)
-{
-	if (id == CURSOR_TIMER) {
-		// 커서 표시 상태를 뒤집고 커서 자리만 다시 그린다.
-		cursor_on = !cursor_on;
-
-		// IME 조합 중에는 조합 언더바(여러 칸 폭)가 커서 역할을 하므로
-		// 그 영역 전체를 무효화해 깜빡임이 한 칸만 갱신되지 않게 한다.
-		if (!ime_comp.empty()) {
-			int row, vx;
-			if (cursor_screen_pos(row, vx) && row >= 0 && row < rows) {
-				int vw = 0;
-				for (size_t k = 0; k < ime_comp.size(); ++k)
-					vw += IsWideChar(ime_comp[k]) ? 2 : 1;
-				CRect rc(vx * cell_w, row * cell_h,
-					(vx + vw) * cell_w, (row + 1) * cell_h);
-				InvalidateRect(&rc, FALSE);
-			}
-			return;
-		}
-
-		CRect rc;
-		if (get_cursor_rect(rc))
-			InvalidateRect(&rc, FALSE);
-		return;
-	}
-	CWnd::OnTimer(id);
-}
-
 UINT CConBox::OnGetDlgCode()
 {
 	// 부모 대화상자가 가로채지 않도록, 방향키/Tab/Enter/일반문자를 모두 직접 받는다.
@@ -581,8 +732,8 @@ LRESULT CConBox::OnImeStart(WPARAM w, LPARAM l)
 			COMPOSITIONFORM cf;
 			ZeroMemory(&cf, sizeof(cf));
 			cf.dwStyle = CFS_POINT;
-			cf.ptCurrentPos.x = vx * cell_w;
-			cf.ptCurrentPos.y = row * cell_h;
+			cf.ptCurrentPos.x = margin_left + vx * cell_w;
+			cf.ptCurrentPos.y = margin_top + row * cell_h;
 			ImmSetCompositionWindow(himc, &cf);
 
 			// 후보 목록 창은 커서 바로 아래에 뜨도록 한다.
@@ -590,8 +741,8 @@ LRESULT CConBox::OnImeStart(WPARAM w, LPARAM l)
 			ZeroMemory(&caf, sizeof(caf));
 			caf.dwIndex = 0;
 			caf.dwStyle = CFS_CANDIDATEPOS;
-			caf.ptCurrentPos.x = vx * cell_w;
-			caf.ptCurrentPos.y = (row + 1) * cell_h;
+			caf.ptCurrentPos.x = margin_left + vx * cell_w;
+			caf.ptCurrentPos.y = margin_top + (row + 1) * cell_h;
 			ImmSetCandidateWindow(himc, &caf);
 
 			ImmSetCompositionFontW(himc, &kfont_lf);
@@ -601,13 +752,38 @@ LRESULT CConBox::OnImeStart(WPARAM w, LPARAM l)
 	return 0;
 }
 
+void CConBox::clear_ime_comp()
+{
+	// 조합 중인 글자가 없으면 할 일이 없다.
+	if (ime_comp.empty())
+		return;
+
+	// 조합 글자들은 ime_anchor 부터 ime_comp 길이만큼 버퍼에 삽입되어 있다. 이를 제거하고
+	// 커서를 조합 시작점으로 되돌린다. (확정 문자 삽입 또는 취소 복구의 공통 전처리)
+	if (cur_log >= 0 && cur_log < (int)log_buf.size()) {
+		LogLine& line = log_buf[cur_log];
+		int start = ime_anchor;
+		int end = ime_anchor + (int)ime_comp.size();
+		if (start < 0) start = 0;
+		if (end > (int)line.chars.size()) end = (int)line.chars.size();
+		if (end > start)
+			line.chars.erase(line.chars.begin() + start, line.chars.begin() + end);
+	}
+	cur_col = ime_anchor;
+	ime_comp.clear();
+}
+
 LRESULT CConBox::OnImeComp(WPARAM w, LPARAM l)
 {
 	HIMC himc = ImmGetContext(m_hWnd);
 	if (himc == NULL)
 		return Default();
 
-	// 확정된 결과 문자열은 곧바로 버퍼에 삽입한다.
+	// 현재 조합 중(미확정)인 글자들을 버퍼에서 제거하고 커서를 조합 시작점으로 되돌린다.
+	// ime_comp 가 비어있지 않은 동안 조합 글자는 ime_anchor 부터 그 길이만큼 실제 버퍼에 들어가 있다.
+	clear_ime_comp();
+
+	// 확정된 결과 문자열은 조합 시작점(현재 cur_col == ime_anchor)에 끼워 넣는다.
 	if (l & GCS_RESULTSTR) {
 		LONG bytes = ImmGetCompositionStringW(himc, GCS_RESULTSTR, NULL, 0);
 		int n = bytes / (int)sizeof(wchar_t);
@@ -618,21 +794,36 @@ LRESULT CConBox::OnImeComp(WPARAM w, LPARAM l)
 			for (int i = 0; i < n; ++i)
 				insert_wchar(r[i]);
 		}
-		ime_comp.clear();
 	}
 
-	// 조합 중(미확정) 문자열은 따로 보관해 두었다가 커서 위치에 그린다.
+	// 조합 중(미확정) 문자열은 커서 위치에 실제 글자로 삽입해 둔다. 그러면 뒤 글자들이
+	// 자연스럽게 한 칸씩 밀리고, OnPaint 에서 이 구간만 조합 블록색으로 칠해 조합 중임을 표시한다.
 	if (l & GCS_COMPSTR) {
 		LONG bytes = ImmGetCompositionStringW(himc, GCS_COMPSTR, NULL, 0);
 		int n = bytes / (int)sizeof(wchar_t);
-		ime_comp.resize(n > 0 ? n : 0);
-		if (n > 0)
-			ImmGetCompositionStringW(himc, GCS_COMPSTR, &ime_comp[0], bytes);
+		if (n > 0) {
+			std::wstring comp;
+			comp.resize(n);
+			ImmGetCompositionStringW(himc, GCS_COMPSTR, &comp[0], bytes);
+
+			// 조합 시작점을 현재 커서 위치로 잡고, 그 자리에 조합 글자들을 끼워 넣는다.
+			// (cur_col 은 조합 시작점에 그대로 두어 다음 갱신/확정의 기준으로 삼는다.)
+			ime_anchor = cur_col;
+			LogLine& line = log_buf[cur_log];
+			for (int i = 0; i < n; ++i) {
+				CharInfo c;
+				c.ch = comp[i];
+				c.fg = cur_fg;
+				c.bg = cur_bg;
+				c.wide = IsWideChar(comp[i]);
+				line.chars.insert(line.chars.begin() + ime_anchor + i, c);
+			}
+			ime_comp = comp;
+		}
 	}
 
 	ImmReleaseContext(m_hWnd, himc);
 
-	cursor_on = true;
 	rebuild_scr_lines();
 	scroll_to_bottom();
 	update_scrollbar();
@@ -642,10 +833,32 @@ LRESULT CConBox::OnImeComp(WPARAM w, LPARAM l)
 
 LRESULT CConBox::OnImeEnd(WPARAM w, LPARAM l)
 {
-	// 조합이 끝나면 미확정 문자열을 비운다.
-	ime_comp.clear();
+	// 조합이 결과 없이 끝난 경우(ESC 취소 등) 삽입해 두었던 조합 글자를 제거해 원상 복구한다.
+	// 정상 확정 시엔 직전 GCS_RESULTSTR 처리에서 이미 비워졌으므로 여기서는 할 일이 없다.
+	if (!ime_comp.empty()) {
+		clear_ime_comp();
+		rebuild_scr_lines();
+		update_scrollbar();
+	}
 	Invalidate();
 	return 0;
+}
+
+LRESULT CConBox::OnImeNotify(WPARAM w, LPARAM l)
+{
+	// 한/영 키 등으로 변환 모드가 바뀌면 통지가 온다. 이때 커서 영역을 다시 그려
+	// 한글/영문 모드에 맞는 폭(긴/짧은 언더바)을 즉시 반영한다.
+	// 모드 변경 외의 통지(후보창 등)는 기본 처리에 맡긴다.
+	LRESULT res = Default();
+	if (w == IMN_SETCONVERSIONMODE) {
+		CRect rc;
+		if (get_cursor_rect(rc)) {
+			// 폭이 한 칸에서 두 칸으로(또는 반대로) 바뀌므로 두 칸 영역을 모두 갱신한다.
+			rc.right = rc.left + cell_w * 2;
+			InvalidateRect(rc);
+		}
+	}
+	return res;
 }
 
 void CConBox::hit_test(CPoint pt, int& out_log, int& out_col) const
@@ -655,8 +868,14 @@ void CConBox::hit_test(CPoint pt, int& out_log, int& out_col) const
 	if (scr_lines.empty())
 		return;
 
+	// 안쪽 여백을 뺀 좌표로 변환한다. (여백 영역을 클릭하면 0 으로 막는다.)
+	int local_y = pt.y - margin_top;
+	int local_x = pt.x - margin_left;
+	if (local_y < 0) local_y = 0;
+	if (local_x < 0) local_x = 0;
+
 	// 픽셀 y -> 화면 줄 -> 화면 줄 목록 인덱스
-	int row = (cell_h > 0) ? (pt.y / cell_h) : 0;
+	int row = (cell_h > 0) ? (local_y / cell_h) : 0;
 	int sidx = scroll_top + row;
 	if (sidx < 0) sidx = 0;
 	if (sidx >= (int)scr_lines.size()) sidx = (int)scr_lines.size() - 1;
@@ -665,7 +884,7 @@ void CConBox::hit_test(CPoint pt, int& out_log, int& out_col) const
 	const LogLine& line = log_buf[sl.log_idx];
 
 	// 픽셀 x -> 줄 안에서의 글자 인덱스 (칸 절반을 기준으로 앞/뒤를 가른다)
-	int target = (cell_w > 0) ? (pt.x / cell_w) : 0;
+	int target = (cell_w > 0) ? (local_x / cell_w) : 0;
 	int x = 0;
 	for (int i = sl.char_start; i < sl.char_end; ++i) {
 		if (line.chars[i].ch == L'\n')
@@ -789,7 +1008,6 @@ void CConBox::paste_from_clipboard()
 	CloseClipboard();
 
 	sel_valid = false;
-	cursor_on = true;
 	rebuild_scr_lines();
 	scroll_to_bottom();
 	update_scrollbar();
@@ -808,6 +1026,60 @@ void CConBox::OnLButtonDown(UINT f, CPoint p)
 	sel_valid = false;   // 아직 드래그 전이므로 선택 없음
 	selecting = true;
 	SetCapture();
+	Invalidate();
+}
+
+void CConBox::OnLButtonDblClk(UINT f, CPoint p)
+{
+	// 더블클릭한 위치의 단어를 선택해 클립보드로 복사한다.
+	// 단어는 공백으로 끊되, 영문/한글/특수문자가 섞이지 않도록 같은 부류끼리만 묶는다.
+	SetFocus();
+
+	int log, col;
+	hit_test(p, log, col);
+	if (log < 0 || log >= (int)log_buf.size())
+		return;
+
+	const LogLine& line = log_buf[log];
+	int len = (int)line.chars.size();
+	if (len == 0)
+		return;
+
+	// hit_test 는 삽입 위치(글자 경계)를 주므로 실제 클릭된 글자 인덱스로 보정한다.
+	int idx = col;
+	if (idx >= len)
+		idx = len - 1;
+
+	// 칸 우측 절반을 눌러 다음 글자로 반올림된 경우, 바로 앞 글자가 단어이면 그쪽을 택한다.
+	if (CharClass(line.chars[idx].ch) == 0 && idx > 0 && CharClass(line.chars[idx - 1].ch) != 0)
+		idx--;
+
+	// 공백 등 구분자를 더블클릭하면 선택할 단어가 없다.
+	int cls = CharClass(line.chars[idx].ch);
+	if (cls == 0)
+		return;
+
+	// 같은 부류가 연속되는 구간을 좌우로 넓힌다. (구분자/다른 부류에서 자동으로 멈춘다.)
+	int start = idx;
+	while (start > 0 && CharClass(line.chars[start - 1].ch) == cls)
+		start--;
+	int end = idx + 1;   // [start, end) 가 선택 범위
+	while (end < len && CharClass(line.chars[end].ch) == cls)
+		end++;
+
+	// 선택 영역을 설정한다. (렌더링/복사는 기존 선택 경로를 그대로 쓴다.)
+	sel_a_log = sel_c_log = log;
+	sel_a_col = start;
+	sel_c_col = end;
+	sel_valid = true;
+
+	// 더블클릭의 첫 클릭에서 켜진 드래그 상태가 이후 마우스 이동으로 단어 선택을 덮어쓰지
+	// 않도록 해제한다.
+	selecting = false;
+	if (GetCapture() == this)
+		ReleaseCapture();
+
+	copy_selection_to_clipboard();
 	Invalidate();
 }
 
@@ -847,6 +1119,9 @@ void CConBox::OnRButtonDown(UINT f, CPoint p)
 
 void CConBox::insert_wchar(wchar_t wc)
 {
+	// 글자가 들어오면 세로 이동의 끈적 열 기억을 초기화한다. (타이핑/IME 확정/붙여넣기/Tab 공백 포괄)
+	desired_vx = -1;
+
 	// 커서 위치에 글자를 끼워 넣는다. (덮어쓰지 않는다)
 	CharInfo c;
 	c.ch = wc;
@@ -875,7 +1150,6 @@ void CConBox::OnChar(UINT ch, UINT rep, UINT flags)
 	for (UINT k = 0; k < rep; ++k)
 		insert_wchar((wchar_t)ch);
 
-	cursor_on = true;
 	rebuild_scr_lines();
 	scroll_to_bottom();
 	update_scrollbar();
@@ -905,6 +1179,11 @@ void CConBox::OnKeyDown(UINT vk, UINT rep, UINT flags)
 	// 그 밖의 키 조작은 선택 표시를 해제한다.
 	sel_valid = false;
 
+	// 위/아래 화살표가 아닌 동작은 세로 이동의 끈적 열 기억을 초기화한다.
+	// (좌/우, Home/End, Back/Delete, Tab, Enter, 그 밖의 키 모두 포함)
+	if (vk != VK_UP && vk != VK_DOWN)
+		desired_vx = -1;
+
 	LogLine& line = log_buf[cur_log];
 	int len = (int)line.chars.size();
 
@@ -919,6 +1198,16 @@ void CConBox::OnKeyDown(UINT vk, UINT rep, UINT flags)
 		if (cur_col < len)
 			cur_col++;
 		break;
+
+	case VK_UP:
+		// 위 화면 줄로 이동한다. (switch 뒤의 맨 아래 강제 스크롤을 타지 않도록 return)
+		move_cursor_row(-1);
+		return;
+
+	case VK_DOWN:
+		// 아래 화면 줄로 이동한다.
+		move_cursor_row(+1);
+		return;
 
 	case VK_HOME:
 		if (ctrl) {
@@ -977,7 +1266,6 @@ void CConBox::OnKeyDown(UINT vk, UINT rep, UINT flags)
 		return;
 	}
 
-	cursor_on = true;
 	rebuild_scr_lines();
 	scroll_to_bottom();
 	update_scrollbar();
@@ -1017,13 +1305,86 @@ void CConBox::commit_input()
 	}
 }
 
+void CConBox::move_cursor_row(int dir)
+{
+	// 커서가 보이는 화면 줄과 그 안에서의 가로 칸(vx)을 구한다.
+	int row, vx;
+	if (!cursor_screen_pos(row, vx))
+		return;
+	int sidx = row + scroll_top;
+
+	// 목표 화면 줄. 범위를 벗어나거나 현재 입력 중인 논리 줄(cur_log)이 아니면 이동하지 않는다.
+	// (이미 확정된 윗줄이나 다른 논리 줄로는 넘어가지 않는다.)
+	int tidx = sidx + dir;
+	if (tidx < 0 || tidx >= (int)scr_lines.size())
+		return;
+	const ScreenLine& t = scr_lines[tidx];
+	if (t.log_idx != cur_log)
+		return;
+	// 목표 줄이 전부 편집 경계 이전(읽기전용)이면 이동하지 않는다.
+	if (t.char_end <= edit_col)
+		return;
+
+	// 끈적 열: 세로 이동을 처음 시작할 때의 가로 칸을 기억해 그대로 목표로 쓴다.
+	if (desired_vx < 0)
+		desired_vx = vx;
+	int want = desired_vx;
+
+	// 목표 줄에서 want 칸에 해당하는 글자 인덱스를 찾는다. (마우스 클릭의 hit_test 와 같은 규칙)
+	// 줄 끝(소프트 줄바꿈 마커 또는 줄 끝)을 넘으면 줄 끝으로 보정한다.
+	const LogLine& line = log_buf[t.log_idx];
+	int col = t.char_end;
+	int x = 0;
+	for (int i = t.char_start; i < t.char_end; ++i) {
+		if (line.chars[i].ch == L'\n') {
+			col = i;
+			break;
+		}
+		int w = line.chars[i].wide ? 2 : 1;
+		if (want < x + w) {
+			col = (want < x + (w + 1) / 2) ? i : i + 1;
+			break;
+		}
+		x += w;
+	}
+
+	// 편집 경계 이전으로는 갈 수 없다.
+	if (col < edit_col)
+		col = edit_col;
+
+	cur_col = col;   // 논리 줄(cur_log)은 그대로다.
+
+	// 목표 줄이 화면 밖이면 보이도록 스크롤을 맞춘다.
+	if (tidx < scroll_top)
+		scroll_top = tidx;
+	else if (tidx >= scroll_top + rows)
+		scroll_top = tidx - rows + 1;
+
+	update_scrollbar();
+	Invalidate();
+}
+
 void CConBox::OnPaint()
 {
-	CPaintDC dc(this);
+	CPaintDC paintDC(this);
 
-	// 클라이언트 영역 전체를 현재 배경색으로 채운다.
+	// 클라이언트 영역 크기를 구한다.
 	CRect rc;
 	GetClientRect(&rc);
+
+	// 더블 버퍼링: 화면에 직접 그리면 "전체 배경 칠 -> 글자 그리기" 의 중간 상태가 잠깐
+	// 보여, 빠른 키 입력으로 매번 전체를 다시 그릴 때 화면이 깜빡인다. 그래서 메모리 DC 에
+	// 한 프레임을 모두 그린 뒤 마지막에 화면으로 한 번에 복사한다.
+	CDC mem;
+	mem.CreateCompatibleDC(&paintDC);
+	CBitmap bmp;
+	bmp.CreateCompatibleBitmap(&paintDC, rc.Width(), rc.Height());
+	CBitmap* old_bmp = mem.SelectObject(&bmp);
+
+	// 이하 기존 그리기 코드는 모두 메모리 DC(dc)에 그린다.
+	CDC& dc = mem;
+
+	// 클라이언트 영역 전체를 현재 배경색으로 채운다.
 	dc.FillSolidRect(rc, cur_bg);
 
 	// 글자는 칸의 배경을 칠한 뒤 투명 모드로 그린다.
@@ -1051,8 +1412,8 @@ void CConBox::OnPaint()
 
 			int w = c.wide ? 2 : 1;
 
-			int px = x * cell_w;
-			int py = row * cell_h;
+			int px = margin_left + x * cell_w;
+			int py = margin_top + row * cell_h;
 
 			// 선택된 글자는 전경색과 배경색을 뒤집어 강조한다.
 			COLORREF fg = c.fg;
@@ -1076,47 +1437,79 @@ void CConBox::OnPaint()
 		}
 	}
 
-	// IME 로 조합 중인(미확정) 문자열을 커서 위치에 임시로 그린다.
-	// 조합 중임을 나타내기 위해 글자 아래에 두꺼운 언더바를 깐다.
-	// 이 언더바가 곧 조합 중의 커서 역할을 하므로, 글자는 항상 보이되
-	// 언더바는 cursor_on 상태에 맞춰 깜빡인다.
-	if (!ime_comp.empty()) {
-		int row, vx;
-		if (cursor_screen_pos(row, vx) && row >= 0 && row < rows) {
-			// 조합 언더바 두께. 일반 커서보다 살짝 얇게 잡되 최소 2px 는 보장한다.
-			int uth = cell_h * cursor_pct / 100;
-			if (uth < 2) uth = 2;
-
-			int x = vx;
-			for (size_t k = 0; k < ime_comp.size(); ++k) {
-				wchar_t c = ime_comp[k];
-				bool wide = IsWideChar(c);
-				int w = wide ? 2 : 1;
-				int px = x * cell_w;
-				int py = row * cell_h;
-
-				dc.FillSolidRect(px, py, w * cell_w, cell_h, cur_bg);
-				dc.SelectObject(wide ? &kfont : &efont);
-				dc.SetTextColor(cur_fg);
-				dc.TextOutW(px, py + cell_base, &c, 1);
-
-				// 조합 언더바는 깜빡임 상태일 때만 그린다.
-				if (cursor_on)
-					dc.FillSolidRect(px, py + cell_h - uth, w * cell_w, uth, cur_fg);
-
-				x += w;
-			}
-		}
-	}
-
 	dc.SelectObject(old_font);
 	dc.SetTextAlign(old_align);
 
-	// 커서(언더바)를 그린다. 깜빡임으로 꺼진 상태이거나 화면 밖이면 그리지 않는다.
-	// IME 조합 중에는 위에서 조합 언더바가 커서 역할을 하므로 일반 커서는 생략한다.
-	if (cursor_on && ime_comp.empty()) {
+	// 커서를 그린다.
+	// IME 조합 중이 아니면(영문/평상시) 칸을 꽉 채우는 블록 커서를 그린다. 화면 밖이면
+	// 그리지 않는다. 커서 칸에 이미 글자가 있으면(방향키/Home 으로 기존 입력 위에 커서가 온
+	// 경우) 블록 위에 전경색으로 글자를 다시 그려 가려지지 않게 한다.
+	// IME 조합 중이면 채우지 않고, 조합 글자 영역을 두께 2픽셀의 속이 빈 사각형(커서색)으로
+	// 감싼다. 속은 배경색이 보이고 조합 글자는 본문과 같은 색으로 그대로 보인다.
+	if (ime_comp.empty()) {
 		CRect cur;
-		if (get_cursor_rect(cur))
-			dc.FillSolidRect(cur, cur_fg);
+		if (get_cursor_rect(cur)) {
+			COLORREF cblk = blend_cursor_color();
+			dc.FillSolidRect(cur, cblk);
+
+			if (cur_log >= 0 && cur_log < (int)log_buf.size()) {
+				const LogLine& line = log_buf[cur_log];
+
+				// 블록이 덮는 영역에 걸친 글자들을 cur_col 부터 차례로 다시 그려 가려지지 않게 한다.
+				// 한글 입력 모드의 2칸 블록은 다음 칸의 글자(또는 한글의 왼쪽 절반)까지 덮으므로
+				// cur_col 한 글자만이 아니라 블록 폭에 걸친 글자들을 모두 그려야 한다.
+				// 블록 밖으로 삐져나온 부분(두 번째 칸 한글의 오른쪽 절반 등)은 본문이 이미 제
+				// 색으로 그려 두었으므로, 블록 사각형으로 클리핑해 블록 안쪽만 전경색으로 덮는다.
+				int saved = dc.SaveDC();
+				dc.IntersectClipRect(&cur);
+				// 글자 그리기는 본문과 같은 기준선(TA_BASELINE) 정렬로 맞춘다.
+				dc.SetTextAlign(TA_LEFT | TA_BASELINE);
+				dc.SetBkMode(TRANSPARENT);
+				dc.SetTextColor(cur_fg);
+
+				int x = cur.left;
+				for (int idx = cur_col; idx < (int)line.chars.size() && x < cur.right; ++idx) {
+					const CharInfo& cc = line.chars[idx];
+					// 소프트 줄바꿈 마커는 글자가 아니므로 그리지 않고 멈춘다.
+					if (cc.ch == L'\n')
+						break;
+					dc.SelectObject(cc.wide ? &kfont : &efont);
+					dc.TextOutW(x, cur.top + cell_base, &cc.ch, 1);
+					x += (cc.wide ? 2 : 1) * cell_w;
+				}
+
+				// SaveDC 이전 상태(폰트/정렬/클립)로 한 번에 원복한다.
+				dc.RestoreDC(saved);
+			}
+		}
 	}
+	else {
+		// IME 조합 중: 조합 글자 영역을 속이 빈 사각형(테두리만)으로 표시한다.
+		// 커서는 조합 시작점(cur_col == ime_anchor)에 있으므로 그 위치에서 조합 글자
+		// 전체의 시각 폭만큼을 감싼다.
+		int row, vx;
+		if (cursor_screen_pos(row, vx) && row >= 0 && row < rows) {
+			int cw = 0;
+			for (size_t k = 0; k < ime_comp.size(); ++k)
+				cw += IsWideChar(ime_comp[k]) ? 2 : 1;
+			if (cw < 1)
+				cw = 1;
+
+			int px = margin_left + vx * cell_w;
+			int py = margin_top + row * cell_h;
+			int rw = cw * cell_w;
+			int rh = cell_h;
+
+			COLORREF cblk = blend_cursor_color();
+			const int t = 2;   // 테두리 두께(픽셀)
+			dc.FillSolidRect(px, py, rw, t, cblk);            // 위
+			dc.FillSolidRect(px, py + rh - t, rw, t, cblk);   // 아래
+			dc.FillSolidRect(px, py, t, rh, cblk);            // 왼쪽
+			dc.FillSolidRect(px + rw - t, py, t, rh, cblk);   // 오른쪽
+		}
+	}
+
+	// 메모리 DC 에 완성된 한 프레임을 화면으로 한 번에 복사한다. (깜빡임 제거)
+	paintDC.BitBlt(0, 0, rc.Width(), rc.Height(), &mem, 0, 0, SRCCOPY);
+	mem.SelectObject(old_bmp);
 }

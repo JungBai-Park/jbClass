@@ -4,14 +4,15 @@
 
 #include "Accessories.h"
 
-LOGFONTW ParseFontOpts(const char* name, int size_pt, const char* opts, int dpi_y)
+LOGFONTW ParseFontOpts(const char* name, float size_pt, const char* opts, int dpi_y)
 {
 	LOGFONTW lf;
 	ZeroMemory(&lf, sizeof(lf));
 
-	// 포인트 크기를 픽셀 높이로 환산한다.
+	// 포인트 크기를 픽셀 높이로 환산한다. (픽셀 = 포인트 x DPI / 72, 가장 가까운 정수로 반올림)
+	// 소수점 포인트(예: 10.5)도 받지만 최종 높이는 정수 픽셀로 양자화된다.
 	// 음수 높이는 글자 셀(em) 높이를 기준으로 한다는 의미이다.
-	lf.lfHeight = -MulDiv(size_pt, dpi_y, 72);
+	lf.lfHeight = -(LONG)(size_pt * dpi_y / 72.0f + 0.5f);
 	lf.lfWeight = FW_NORMAL;
 	lf.lfCharSet = DEFAULT_CHARSET;
 
