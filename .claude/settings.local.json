@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(& \"C:\\\\Program Files\\\\Microsoft Visual Studio\\\\2022\\\\Community\\\\MSBuild\\\\Current\\\\Bin\\\\MSBuild.exe\" \"D:\\\\Work\\\\Study\\\\ConBox\\\\Project\\\\ConBox.sln\" /t:Rebuild /p:Configuration=Debug /p:Platform=x64 /v:minimal /nologo)",
+      "PowerShell(& \"C:\\\\Program Files\\\\Microsoft Visual Studio\\\\2022\\\\Community\\\\MSBuild\\\\Current\\\\Bin\\\\MSBuild.exe\" \"D:\\\\Work\\\\Study\\\\ConBox\\\\Project\\\\ConBox.sln\" /t:Build /p:Configuration=Debug /p:Platform=x64 /v:minimal /nologo)",
+      "PowerShell(git *)"
+    ]
+  }
+}

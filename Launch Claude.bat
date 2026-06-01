@@ -1,0 +1,15 @@
+@echo off
+setlocal EnableDelayedExpansion
+cd /d "%~dp0"
+
+if /i "%~1" == "up" goto :upgrade
+
+:claude
+    sudo "D:\ETC\Programs\Node.js\node_modules\@anthropic-ai\claude-code\bin\claude.exe" --allow-dangerously-skip-permissions %*
+    goto quit
+
+:upgrade
+    npm install -g @anthropic-ai/claude-code
+    goto quit
+
+:quit
