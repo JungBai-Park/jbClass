@@ -83,6 +83,16 @@ public:
 	// emin_ratio: 영문을 자연 폭의 이 비율 밑으로는 좁히지 않는 가독성 하한(기본 0.7).
 	void set_kfont_fill(float fill_ratio, float emin_ratio);
 
+	// 박스/블록 그리기 문자를 폰트 글리프 대신 ConBox 가 도형으로 직접 그리는 수준을 정한다.
+	// 폰트의 블록 글리프는 칸을 가로/세로로 꽉 채우지 않아(특히 세로) 인접 칸 사이에 틈이
+	// 생기는데, 칸을 직접 칠하면 틈 없이 이어지고 폰트에 의존하지 않는다.
+	//   0 = 끔(전부 폰트로 그림)
+	//   1 = 블록 요소(U+2580~259F: 반칸/사분면/풀블록)만 직접 그림 (기본값)
+	//   2 = 1 에 더해 박스선도 직접 그림: 단선 직교/정션(─│┌┐└┘├┤┬┴┼),
+	//       둥근 모서리(╭╮╰╯, 직각으로 대체), 대각선(╱╲╳), 순수 이중선(═║╔╗╚╝╠╣╦╩╬).
+	// 단/이중 혼합선·점선·굵은선·음영은 어느 수준에서도 폰트로 그린다.
+	void set_builtin_glyphs(int level);
+
 	// 텍스트를 출력한다. 항상 버퍼 끝(현재 출력 위치)에 이어서 쓴다.
 	// text 는 UTF-8 이며 특수문자를 다음과 같이 처리한다.
 	//   \n : 다음 줄 맨 처음으로 이동, \r : 현재 줄 맨 처음으로 이동(덮어쓰기), \t : 4칸 탭
@@ -112,6 +122,12 @@ public:
 	// 예: set_margin(5) -> 사방 5,  set_margin(5,8) -> 상하 5 / 좌우 8.
 	// 기본값은 사방 10 이며, open 이후 호출하면 resize 처럼 칸 수/줄 수를 재계산한다.
 	void set_margin(int top, int left = -1, int bottom = -1, int right = -1);
+
+	// 가로 cols 칸(영문 기준) x 세로 rows 줄을 모두 담는 데 필요한 클라이언트 영역
+	// 픽셀 크기를 w/h 로 돌려준다. 안쪽 여백(set_margin)도 포함한 값이다.
+	// 호스트가 "80x24 로 띄우기" 처럼 그리드 기준으로 창 크기를 정할 때 쓴다.
+	// 한 칸 픽셀은 폰트/DPI 로 정해지므로 open() 이후(셀 크기 확정 후) 호출해야 정확하다.
+	void client_size_for_grid(int cols, int rows, int& w, int& h) const;
 
 	// Enter 로 입력이 확정되면 호출되는 콜백.
 	// input 은 확정된 입력 전체(UTF-8)이며, Shift+Enter 로 넣은 줄바꿈은 \n 으로 포함된다.
@@ -221,6 +237,11 @@ private:
 	// 클립보드의 텍스트를 커서 위치에 붙여 넣는다.
 	void paste_from_clipboard();
 
+	// 더블 버퍼링용 메모리 DC/비트맵을 (필요하면) 만들어 둔다. 클라이언트 크기가
+	// 바뀐 경우에만 비트맵을 다시 만들어, 잦은 다시그리기에서 매번 GDI 객체를
+	// 할당/해제하지 않게 한다. ref 는 호환 기준이 되는 화면 DC, w/h 는 필요한 크기.
+	void ensure_back_buffer(CDC* ref, int w, int h);
+
 	COLORREF cur_fg;   // 현재 전경색 (기본 흰색)
 	COLORREF cur_bg;   // 현재 배경색 (기본 검정)
 
@@ -239,6 +260,8 @@ private:
 
 	float kfill_ratio;     // match 모드 칸 폭: 한글이 두 칸을 채우는 비율 (기본 0.92)
 	float emin_ratio;      // match 모드 칸 폭: 영문을 자연 폭의 이 비율 밑으로 좁히지 않는 하한 (기본 0.7)
+
+	int glyph_level;       // 박스/블록 문자 직접 렌더 수준 (0=끔, 1=블록요소만(기본), 2=+직선/정션 박스선)
 
 	int cell_w;        // 영문 한 글자 칸의 가로 픽셀 (한글은 2배)
 	int cell_h;        // 한 줄 칸의 세로 픽셀
@@ -271,4 +294,11 @@ private:
 	bool sel_valid;        // 유효한 선택 영역이 있는지
 	int sel_a_log, sel_a_col;  // 선택 고정점(드래그 시작)
 	int sel_c_log, sel_c_col;  // 선택 이동점(드래그 현재)
+
+	// 더블 버퍼링용 캐시. OnPaint 가 매 프레임 새로 만들지 않고 재사용한다.
+	CDC back_dc;            // 영속 메모리 DC (한 번 만들어 계속 쓴다)
+	CBitmap back_bmp;       // 백버퍼 비트맵 (클라이언트 크기와 같다)
+	CBitmap* back_old_bmp;  // back_dc 에 원래 들어있던 비트맵 (정리 시 되돌리기용)
+	int back_w;             // 현재 back_bmp 의 가로 픽셀 (크기 변경 감지용)
+	int back_h;             // 현재 back_bmp 의 세로 픽셀
 };

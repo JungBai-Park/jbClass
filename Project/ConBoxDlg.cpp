@@ -75,38 +75,63 @@ BOOL CConBoxDlg::OnInitDialog()
 
 	// 폰트는 창 생성 전에 지정한다. (기본값과 동일하지만 API 사용 예시를 겸한다.)
 	// 한글은 크기를 0 으로 주어 영문 높이에 맞추는 match 모드로 둔다(기본 동작).
-	con_box.set_efont("Consolas", 13, "B");
+	// 영문 폰트로 Cascadia Mono 를 쓴다. (둥근 모서리 ╭╮╰╯ 와 로고의 사분면 블록
+	//  ▛▜▘▝ 글리프를 가져 도표가 깨지지 않는다. Consolas 에는 이 글리프들이 없다.)
+	con_box.set_efont("Cascadia Mono", 13, "B");
 	con_box.set_kfont("Malgun Gothic", 0, "B");
 
 	// match 모드의 칸 폭(장평) 비율. 기본값과 동일하지만 API 사용 예시를 겸한다.
 	con_box.set_kfont_fill(0.92f, 0.7f);
 
-	// ConBox 를 자식 창으로 만든 뒤 현재 창 크기에 맞춰 배치한다.
-	// (실제 위치/크기는 layout_children() 이 정한다.)
+	// ConBox 를 자식 창으로 만든다. (위치/크기는 아래 resize_to_grid 가 정한다.)
 	con_box.open(this, 0, 0, 10, 10);
-	layout_children();
+
+	// 위에서 지정한 폰트 설정 기준으로 ConBox 가 96x32 칸(영문)이 되도록 메인 창
+	// 크기를 다시 잡고 화면 중앙으로 옮긴다. (셀 크기는 open 에서 확정되었다.)
+	resize_to_grid(96, 32);
 
 	// Enter 콜백을 연결한다. (데모: 입력을 되울려 줌)
 	demoBox = &con_box;
 	con_box.on_enter = OnConBoxEnter;
 
-	// 초기 안내 문구를 출력한다. (UTF-8 바이트로 전달한다.)
+	// 초기 화면: ConBox 개요/특징 도표 (둥근 모서리). 로고 칸만 살구색.
 	// C++20 에서 u8 리터럴은 char8_t 형이므로 const char* 로 캐스팅한다.
+	// (도표 문자열은 한글=2칸 폭을 계산해 정렬되어 있다. Temp/gen_box.py 로 생성.)
+	const COLORREF c_fg   = RGB(255, 255, 255);   // 본문/테두리: 흰색
+	const COLORREF c_logo = RGB(214, 112, 84);    // 로고: 살구색(PNG 색감)
+
+	con_box.set_color(c_fg);
+	con_box.print(reinterpret_cast<const char*>(u8"╭───────────────────────────────────────────────────────────╮\n"));
+
+	// 로고 헤더 3줄: 흰색 여백 + 살구색 로고 + 흰색 타이틀
+	con_box.set_color(c_fg);   con_box.print(reinterpret_cast<const char*>(u8"│ "));
+	con_box.set_color(c_logo); con_box.print(reinterpret_cast<const char*>(u8" ▐▛███▜▌ "));
+	con_box.set_color(c_fg);   con_box.print(reinterpret_cast<const char*>(u8"  ConBox                                         │\n"));
+	con_box.set_color(c_fg);   con_box.print(reinterpret_cast<const char*>(u8"│ "));
+	con_box.set_color(c_logo); con_box.print(reinterpret_cast<const char*>(u8"▝▜█████▛▘"));
+	con_box.set_color(c_fg);   con_box.print(reinterpret_cast<const char*>(u8"  이식 가능한 커스텀 터미널 컨트롤               │\n"));
+	con_box.set_color(c_fg);   con_box.print(reinterpret_cast<const char*>(u8"│ "));
+	con_box.set_color(c_logo); con_box.print(reinterpret_cast<const char*>(u8"  ▘▘ ▝▝  "));
+	con_box.set_color(c_fg);   con_box.print(reinterpret_cast<const char*>(u8"  MFC CWnd 파생 · UTF-8 문자열 API               │\n"));
+
+	// 본문(표 + 안내) 은 모두 흰색이라 한 덩어리로 출력한다.
+	con_box.set_color(c_fg);
 	con_box.print(reinterpret_cast<const char*>(
-		u8"이 창은 ConBox의 초기 화면입니다.\n\n타이프(Type) 쳐서 동작을 확인해 보세요.\n"));
-
-	// 글자별 색상 데모: set_color/set_bg_color 로 색을 바꾼 뒤 print 하면 그 색으로 찍힌다.
-	con_box.print(reinterpret_cast<const char*>(u8"\n[색상 데모] "));
-	con_box.set_color(RGB(255, 80, 80));   con_box.print(reinterpret_cast<const char*>(u8"빨강 "));
-	con_box.set_color(RGB(80, 220, 80));   con_box.print(reinterpret_cast<const char*>(u8"초록 "));
-	con_box.set_color(RGB(90, 170, 255));  con_box.print(reinterpret_cast<const char*>(u8"파랑 "));
-	con_box.set_bg_color(RGB(70, 70, 70));
-	con_box.set_color(RGB(255, 230, 0));   con_box.print(reinterpret_cast<const char*>(u8"노랑글자+회색배경"));
-
-	// 색상을 기본값(검은 바탕에 흰 글씨)으로 되돌린다. 이후 사용자 입력은 기본색으로 표시된다.
-	con_box.set_bg_color(RGB(0, 0, 0));
-	con_box.set_color(RGB(255, 255, 255));
-	con_box.print("\n");
+		u8"├──────────┬────────────────────────────────────────────────┤\n"
+		u8"│ 렌더링   │ 고정 그리드 · 한글 2배폭 · 자동 줄바꿈/스크롤  │\n"
+		u8"├──────────┼────────────────────────────────────────────────┤\n"
+		u8"│ 폰트     │ 영문/한글 개별 설정 · 한글 높이 영문에 맞춤    │\n"
+		u8"├──────────┼────────────────────────────────────────────────┤\n"
+		u8"│ 입력     │ IME 한글 조합(삽입) · 한/영 커서폭 전환        │\n"
+		u8"├──────────┼────────────────────────────────────────────────┤\n"
+		u8"│ 편집     │ 커서 이동 · 선택/클립보드 · 화살표 입력영역    │\n"
+		u8"├──────────┼────────────────────────────────────────────────┤\n"
+		u8"│ 색상     │ 문자 단위 전경색·배경색 지정                   │\n"
+		u8"├──────────┼────────────────────────────────────────────────┤\n"
+		u8"│ 커서     │ 블록 커서 깜빡임 · 조합 중 테두리 커서         │\n"
+		u8"├──────────┴────────────────────────────────────────────────┤\n"
+		u8"│ 타이프(Type) 쳐서 동작을 확인해 보세요.                   │\n"
+		u8"╰───────────────────────────────────────────────────────────╯\n"));
 
 	// 키보드 입력을 받도록 ConBox 에 포커스를 준다.
 	con_box.SetFocus();
@@ -130,6 +155,42 @@ void CConBoxDlg::layout_children()
 	if (box_w < 10) box_w = 10;
 	if (box_h < 10) box_h = 10;
 	con_box.MoveWindow(margin, margin, box_w, box_h);
+}
+
+void CConBoxDlg::resize_to_grid(int cols, int rows)
+{
+	if (con_box.GetSafeHwnd() == NULL)
+		return;
+
+	// 가로 cols 칸 x 세로 rows 줄을 담는 데 필요한 ConBox 클라이언트 픽셀(안쪽 여백 포함).
+	int bw = 0, bh = 0;
+	con_box.client_size_for_grid(cols, rows, bw, bh);
+
+	// ConBox 는 세로 스크롤바를 가진 자식 창이라, 스크롤바가 보일 때는 그 폭만큼
+	// 클라이언트가 줄어 칸 수가 모자란다. 스크롤바 폭을 미리 더해 칸 수를 보장한다.
+	bw += ::GetSystemMetrics(SM_CXVSCROLL);
+
+	// 데모는 ConBox 를 사방 20px 마진으로 배치하므로(layout_children 과 같은 값),
+	// 대화상자 클라이언트는 그만큼 더 크다.
+	const int margin = 20;
+	CRect want(0, 0, bw + 2 * margin, bh + 2 * margin);
+
+	// 클라이언트 사각형을 현재 창 스타일 기준의 창 사각형(테두리/타이틀바 포함)으로 키운다.
+	CalcWindowRect(&want, CWnd::adjustBorder);
+	int ww = want.Width();
+	int wh = want.Height();
+
+	// 주 모니터의 작업 영역(작업표시줄 제외) 중앙으로 옮긴다.
+	RECT wa = { 0 };
+	::SystemParametersInfo(SPI_GETWORKAREA, 0, &wa, 0);
+	int x = wa.left + ((wa.right - wa.left) - ww) / 2;
+	int y = wa.top + ((wa.bottom - wa.top) - wh) / 2;
+
+	SetWindowPos(NULL, x, y, ww, wh, SWP_NOZORDER);
+
+	// 크기가 우연히 그대로여서 OnSize 가 오지 않더라도 ConBox 가 새 크기에 맞도록
+	// 한 번 더 배치해 둔다. (중복 호출은 무해하다.)
+	layout_children();
 }
 
 void CConBoxDlg::OnSize(UINT type, int cx, int cy)

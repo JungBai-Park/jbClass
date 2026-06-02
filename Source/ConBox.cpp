@@ -4,13 +4,14 @@
 // 이 파일은 동작을 "수정"할 때만 본다. 아래 목차로 필요한 함수만 찾아(Grep) 부분만 읽는다.
 //
 // === 파일 구성 (대략 이 순서) ===
-//   보조(static)   : IsWideChar, ParseFontOpts(폰트 opts 파서), CharClass(단어 분류)
+//   보조(static)   : IsWideChar, ParseFontOpts(폰트 opts 파서), CharClass(단어 분류),
+//                    DrawBlockElement(블록 요소 직접 칠), DrawBoxLine(직선/정션/대각선/이중선 직접 칠)
 //   메시지 맵      : BEGIN_MESSAGE_MAP ... END_MESSAGE_MAP
 //   창/폰트        : open, make_font, apply_default_fonts, calc_cell_size,
-//                    set_efont, set_kfont, set_kfont_fill
+//                    set_efont, set_kfont, set_kfont_fill, set_builtin_glyphs
 //   색상/커서 설정 : set_color, set_bg_color, set_cursor_blend, set_cursor_blink,
 //                    bump_cursor, OnTimer
-//   여백           : set_margin
+//   여백           : set_margin, client_size_for_grid
 //   커서 기하      : blend_cursor_color, cursor_screen_pos, get_cursor_rect, is_hangul_mode
 //   메트릭/버퍼    : update_metrics, visual_col, put_wchar, print, rebuild_scr_lines,
 //                    scroll_to_bottom, update_scrollbar
@@ -20,7 +21,7 @@
 //                    copy_selection_to_clipboard, paste_from_clipboard,
 //                    OnLButtonDown, OnLButtonDblClk, OnMouseMove, OnLButtonUp, OnRButtonDown
 //   입력 편집      : insert_wchar, OnChar, OnKeyDown, commit_input, move_cursor_row
-//   그리기         : OnPaint
+//   그리기         : ensure_back_buffer, OnPaint
 
 #include "ConBox.h"
 #include <string>
@@ -148,6 +149,185 @@ static int CharClass(wchar_t ch)
 	return 3;
 }
 
+// 블록 요소 문자(U+2580~259F)를 폰트 글리프 대신 도형으로 칸 안에 직접 칠한다.
+// 이 글자들은 칸을 정수분할한 사각형이라 4사분면(좌상/우상/좌하/우하) 채움 조합으로
+// 정확히 표현된다. 폰트 글리프는 칸을 가로/세로로 꽉 채우지 않아 인접 칸 사이에 틈이
+// 생기지만, 사분면을 직접 칠하면 경계가 맞물려 틈이 없다.
+// ch 가 대상이면 fg 로 해당 사분면을 칠하고 true, 아니면 false 를 돌려준다.
+// (부분 1/8 블록 2581~2587/2589~258F 와 음영 2591~2593 은 사분면으로 표현되지 않으므로
+//  false 로 두어 폰트가 그리게 한다.)
+static bool DrawBlockElement(CDC& dc, wchar_t ch, int px, int py, int cw, int chh, COLORREF fg)
+{
+	// 각 글자를 4비트 사분면 마스크로 바꾼다. (UL=1, UR=2, LL=4, LR=8)
+	int mask;
+	switch (ch) {
+	case 0x2580: mask = 1 | 2;         break;  // UPPER HALF
+	case 0x2584: mask = 4 | 8;         break;  // LOWER HALF
+	case 0x2588: mask = 1 | 2 | 4 | 8; break;  // FULL BLOCK
+	case 0x258C: mask = 1 | 4;         break;  // LEFT HALF
+	case 0x2590: mask = 2 | 8;         break;  // RIGHT HALF
+	case 0x2596: mask = 4;             break;  // QUADRANT LOWER LEFT
+	case 0x2597: mask = 8;             break;  // QUADRANT LOWER RIGHT
+	case 0x2598: mask = 1;             break;  // QUADRANT UPPER LEFT
+	case 0x2599: mask = 1 | 4 | 8;     break;  // UL + LL + LR
+	case 0x259A: mask = 1 | 8;         break;  // UL + LR
+	case 0x259B: mask = 1 | 2 | 4;     break;  // UL + UR + LL
+	case 0x259C: mask = 1 | 2 | 8;     break;  // UL + UR + LR
+	case 0x259D: mask = 2;             break;  // QUADRANT UPPER RIGHT
+	case 0x259E: mask = 2 | 4;         break;  // UR + LL
+	case 0x259F: mask = 2 | 4 | 8;     break;  // UR + LL + LR
+	default:     return false;                 // 사분면으로 표현 못 하면 폰트에 맡긴다.
+	}
+
+	// 칸을 가로/세로 중앙에서 나눈다. 인접 칸도 같은 공식을 쓰므로 경계가 정확히 맞물린다.
+	int midx = px + cw / 2;
+	int midy = py + chh / 2;
+	int rx = px + cw;    // 칸 오른쪽 끝
+	int by = py + chh;   // 칸 아래쪽 끝
+
+	if (mask & 1) dc.FillSolidRect(px,   py,   midx - px, midy - py, fg);  // 좌상
+	if (mask & 2) dc.FillSolidRect(midx, py,   rx - midx, midy - py, fg);  // 우상
+	if (mask & 4) dc.FillSolidRect(px,   midy, midx - px, by - midy, fg);  // 좌하
+	if (mask & 8) dc.FillSolidRect(midx, midy, rx - midx, by - midy, fg);  // 우하
+	return true;
+}
+
+// 직선/정션/대각선/이중선 박스 드로잉 문자를 폰트 대신 직접 그린다.
+// 칸 중앙을 기준으로 선을 칠하며, 인접 칸이 같은 중앙 공식을 쓰므로 칸 경계에서 끊김 없이
+// 이어진다. ch 가 대상이면 fg 로 칠하고 true, 아니면 false 를 돌려준다.
+// 지원: 단선 직교/정션(─│┌┐└┘├┤┬┴┼), 둥근 모서리(╭╮╰╯, 직각으로 대체),
+//       대각선(╱╲╳), 순수 이중선(═║╔╗╚╝╠╣╦╩╬).
+// (단/이중 혼합선, 점선, 굵은선은 대상이 아니며 폰트에 맡긴다.)
+static bool DrawBoxLine(CDC& dc, wchar_t ch, int px, int py, int cw, int chh, COLORREF fg)
+{
+	// 선 두께는 칸 높이에 비례한 근사값(최소 1px)이다.
+	int t = chh / 12;
+	if (t < 1) t = 1;
+
+	int midx = px + cw / 2;
+	int midy = py + chh / 2;
+	int rx = px + cw;   // 칸 오른쪽 끝
+	int by = py + chh;  // 칸 아래쪽 끝
+
+	// 대각선은 사선이라 사각형으로 못 그리므로 펜으로 칸 모서리끼리 긋는다.
+	// 칸 모서리 좌표를 끝점으로 써 인접 칸과 모서리에서 이어진다.
+	if (ch == 0x2571 || ch == 0x2572 || ch == 0x2573) {
+		CPen pen(PS_SOLID, t, fg);
+		CPen* oldpen = dc.SelectObject(&pen);
+		if (ch != 0x2572) { dc.MoveTo(px, by); dc.LineTo(rx, py); }  // ╱ (╳ 포함)
+		if (ch != 0x2571) { dc.MoveTo(px, py); dc.LineTo(rx, by); }  // ╲ (╳ 포함)
+		dc.SelectObject(oldpen);
+		return true;
+	}
+
+	int top = midy - t / 2;   // 단선 가로띠 위쪽 y
+	int lft = midx - t / 2;   // 단선 세로띠 왼쪽 x
+
+	// 단선 직교/정션 + 둥근 모서리(직각으로 대체). 4방향 비트(N=1 위, E=2 오른쪽, S=4 아래, W=8 왼쪽).
+	int dir = -1;
+	switch (ch) {
+	case 0x2500: dir = 2 | 8;         break;  // ─
+	case 0x2502: dir = 1 | 4;         break;  // │
+	case 0x250C: dir = 2 | 4;         break;  // ┌
+	case 0x2510: dir = 4 | 8;         break;  // ┐
+	case 0x2514: dir = 1 | 2;         break;  // └
+	case 0x2518: dir = 1 | 8;         break;  // ┘
+	case 0x251C: dir = 1 | 2 | 4;     break;  // ├
+	case 0x2524: dir = 1 | 4 | 8;     break;  // ┤
+	case 0x252C: dir = 2 | 4 | 8;     break;  // ┬
+	case 0x2534: dir = 1 | 2 | 8;     break;  // ┴
+	case 0x253C: dir = 1 | 2 | 4 | 8; break;  // ┼
+	case 0x256D: dir = 2 | 4;         break;  // ╭ 좌상 -> ┌ (둥근 모서리를 직각으로)
+	case 0x256E: dir = 4 | 8;         break;  // ╮ 우상 -> ┐
+	case 0x256F: dir = 1 | 8;         break;  // ╯ 우하 -> ┘
+	case 0x2570: dir = 1 | 2;         break;  // ╰ 좌하 -> └
+	default:     break;
+	}
+	if (dir >= 0) {
+		if (dir & 8) dc.FillSolidRect(px,   top,  midx - px, t,         fg);  // 왼쪽 가로
+		if (dir & 2) dc.FillSolidRect(midx, top,  rx - midx, t,         fg);  // 오른쪽 가로
+		if (dir & 1) dc.FillSolidRect(lft,  py,   t,         midy - py, fg);  // 위 세로
+		if (dir & 4) dc.FillSolidRect(lft,  midy, t,         by - midy, fg);  // 아래 세로
+		return true;
+	}
+
+	// 순수 이중선. 두 평행선을 중심에서 ±g 떨어뜨려 그린다. 코너/정션에서는 두 평행선이
+	// ㄱ자로 닫히도록(바깥 평행선은 바깥 교차점, 안쪽 평행선은 안쪽 교차점까지) 각 획의
+	// 중심측 끝을 맞춘다. 가로획은 top0(위)/top1(아래), 세로획은 lft0(좌)/lft1(우) 위치.
+	int g = t + 1;
+	int top0 = midy - g - t / 2;   // 가로 위획 y
+	int top1 = midy + g - t / 2;   // 가로 아래획 y
+	int lft0 = midx - g - t / 2;   // 세로 좌획 x
+	int lft1 = midx + g - t / 2;   // 세로 우획 x
+
+	switch (ch) {
+	case 0x2550:  // ═  가로 이중선
+		dc.FillSolidRect(px, top0, cw, t, fg);
+		dc.FillSolidRect(px, top1, cw, t, fg);
+		return true;
+	case 0x2551:  // ║  세로 이중선
+		dc.FillSolidRect(lft0, py, t, chh, fg);
+		dc.FillSolidRect(lft1, py, t, chh, fg);
+		return true;
+	case 0x2554:  // ╔  E+S (좌상 코너)
+		dc.FillSolidRect(midx - g, top0, rx - (midx - g), t, fg);  // 위가로 [midx-g, rx]
+		dc.FillSolidRect(midx + g, top1, rx - (midx + g), t, fg);  // 아래가로 [midx+g, rx]
+		dc.FillSolidRect(lft0, midy - g, t, by - (midy - g), fg);  // 좌세로 [midy-g, by]
+		dc.FillSolidRect(lft1, midy + g, t, by - (midy + g), fg);  // 우세로 [midy+g, by]
+		return true;
+	case 0x2557:  // ╗  S+W (우상 코너)
+		dc.FillSolidRect(px, top0, (midx + g) - px, t, fg);        // 위가로 [px, midx+g]
+		dc.FillSolidRect(px, top1, (midx - g) - px, t, fg);        // 아래가로 [px, midx-g]
+		dc.FillSolidRect(lft1, midy - g, t, by - (midy - g), fg);  // 우세로 [midy-g, by]
+		dc.FillSolidRect(lft0, midy + g, t, by - (midy + g), fg);  // 좌세로 [midy+g, by]
+		return true;
+	case 0x255A:  // ╚  N+E (좌하 코너)
+		dc.FillSolidRect(midx + g, top0, rx - (midx + g), t, fg);  // 위가로 [midx+g, rx]
+		dc.FillSolidRect(midx - g, top1, rx - (midx - g), t, fg);  // 아래가로 [midx-g, rx]
+		dc.FillSolidRect(lft0, py, t, (midy + g) - py, fg);        // 좌세로 [py, midy+g]
+		dc.FillSolidRect(lft1, py, t, (midy - g) - py, fg);        // 우세로 [py, midy-g]
+		return true;
+	case 0x255D:  // ╝  N+W (우하 코너)
+		dc.FillSolidRect(px, top0, (midx - g) - px, t, fg);        // 위가로 [px, midx-g]
+		dc.FillSolidRect(px, top1, (midx + g) - px, t, fg);        // 아래가로 [px, midx+g]
+		dc.FillSolidRect(lft0, py, t, (midy - g) - py, fg);        // 좌세로 [py, midy-g]
+		dc.FillSolidRect(lft1, py, t, (midy + g) - py, fg);        // 우세로 [py, midy+g]
+		return true;
+	case 0x2560:  // ╠  N+E+S (좌측 T)
+		dc.FillSolidRect(lft0, py, t, chh, fg);                    // 좌세로 full
+		dc.FillSolidRect(lft1, py, t, chh, fg);                    // 우세로 full
+		dc.FillSolidRect(midx + g, top0, rx - (midx + g), t, fg);  // 위가로 [midx+g, rx]
+		dc.FillSolidRect(midx + g, top1, rx - (midx + g), t, fg);  // 아래가로 [midx+g, rx]
+		return true;
+	case 0x2563:  // ╣  N+S+W (우측 T)
+		dc.FillSolidRect(lft0, py, t, chh, fg);                    // 좌세로 full
+		dc.FillSolidRect(lft1, py, t, chh, fg);                    // 우세로 full
+		dc.FillSolidRect(px, top0, (midx - g) - px, t, fg);        // 위가로 [px, midx-g]
+		dc.FillSolidRect(px, top1, (midx - g) - px, t, fg);        // 아래가로 [px, midx-g]
+		return true;
+	case 0x2566:  // ╦  E+S+W (상단 T)
+		dc.FillSolidRect(px, top0, cw, t, fg);                     // 위가로 full
+		dc.FillSolidRect(px, top1, cw, t, fg);                     // 아래가로 full
+		dc.FillSolidRect(lft0, midy + g, t, by - (midy + g), fg);  // 좌세로 [midy+g, by]
+		dc.FillSolidRect(lft1, midy + g, t, by - (midy + g), fg);  // 우세로 [midy+g, by]
+		return true;
+	case 0x2569:  // ╩  N+E+W (하단 T)
+		dc.FillSolidRect(px, top0, cw, t, fg);                     // 위가로 full
+		dc.FillSolidRect(px, top1, cw, t, fg);                     // 아래가로 full
+		dc.FillSolidRect(lft0, py, t, (midy - g) - py, fg);        // 좌세로 [py, midy-g]
+		dc.FillSolidRect(lft1, py, t, (midy - g) - py, fg);        // 우세로 [py, midy-g]
+		return true;
+	case 0x256C:  // ╬  N+E+S+W (십자, 가운데 비움)
+		dc.FillSolidRect(px, top0, cw, t, fg);                     // 위가로 full
+		dc.FillSolidRect(px, top1, cw, t, fg);                     // 아래가로 full
+		dc.FillSolidRect(lft0, py, t, chh, fg);                    // 좌세로 full
+		dc.FillSolidRect(lft1, py, t, chh, fg);                    // 우세로 full
+		return true;
+	default:
+		return false;
+	}
+}
+
 CConBox::CConBox()
 {
 	// 색상 기본값: 검은 바탕에 흰 글씨.
@@ -190,6 +370,9 @@ CConBox::CConBox()
 	kfill_ratio = 0.92f;
 	emin_ratio = 0.7f;
 
+	// 박스/블록 문자 직접 렌더는 기본적으로 블록 요소만 켠다(로고 등의 칸 틈 방지).
+	glyph_level = 1;
+
 	// 커서 깜빡임. 표시 상태는 일단 켜 두고, 간격은 시스템 캐럿 깜빡임 속도를 따른다.
 	// GetCaretBlinkTime 이 INFINITE 를 돌려주면(시스템에서 깜빡임을 꺼 둔 경우) 0 으로
 	// 두어 깜빡이지 않고 항상 켜 둔다.
@@ -205,10 +388,19 @@ CConBox::CConBox()
 
 	ZeroMemory(&efont_lf, sizeof(efont_lf));
 	ZeroMemory(&kfont_lf, sizeof(kfont_lf));
+
+	// 더블 버퍼링 캐시는 첫 OnPaint 에서 만든다.
+	back_old_bmp = nullptr;
+	back_w = 0;
+	back_h = 0;
 }
 
 CConBox::~CConBox()
 {
+	// 메모리 DC 에 백버퍼 비트맵이 선택된 채로 CBitmap 이 파괴되지 않도록,
+	// 원래 비트맵을 되돌려 놓는다. (CDC/CBitmap 멤버 자체는 자동 정리된다.)
+	if (back_old_bmp)
+		back_dc.SelectObject(back_old_bmp);
 }
 
 void CConBox::open(CWnd* parent, int x0, int y0, int x1, int y1)
@@ -425,6 +617,18 @@ void CConBox::set_kfont_fill(float fill_ratio, float emin_floor)
 	}
 }
 
+void CConBox::set_builtin_glyphs(int level)
+{
+	// 범위를 벗어난 값은 가까운 끝으로 맞춘다. (0=끔, 1=블록요소, 2=+직선박스선)
+	if (level < 0) level = 0;
+	if (level > 2) level = 2;
+	glyph_level = level;
+
+	// 그리는 방식만 바뀌므로 칸 수/줄바꿈 재계산 없이 다시 그리기만 하면 된다.
+	if (::IsWindow(m_hWnd))
+		Invalidate();
+}
+
 void CConBox::set_color(COLORREF fg)
 {
 	cur_fg = fg;
@@ -525,6 +729,16 @@ void CConBox::set_margin(int top, int left, int bottom, int right)
 		update_scrollbar();
 		Invalidate();
 	}
+}
+
+void CConBox::client_size_for_grid(int cols, int rows, int& w, int& h) const
+{
+	// 글자 영역은 (칸 수 x 한 칸 픽셀)이고, 그 둘레로 안쪽 여백이 더해진 것이
+	// 클라이언트 영역이다. 한 칸 픽셀(cell_w/cell_h)은 open 에서 폰트/DPI 로 확정된다.
+	if (cols < 0) cols = 0;
+	if (rows < 0) rows = 0;
+	w = cols * cell_w + margin_left + margin_right;
+	h = rows * cell_h + margin_top + margin_bottom;
 }
 
 // 블록 커서 색을 계산한다.
@@ -1545,6 +1759,32 @@ void CConBox::move_cursor_row(int dir)
 	Invalidate();
 }
 
+// 더블 버퍼링용 메모리 DC/비트맵을 (필요하면) 준비한다.
+// 메모리 DC 는 한 번만 만들어 계속 재사용하고, 비트맵은 클라이언트 크기가 바뀐
+// 경우에만 다시 만든다. 커서 깜빡임처럼 잦은 다시그리기에서 매번 CreateCompatibleDC/
+// CreateCompatibleBitmap 을 하던 비용을 없앤다.
+void CConBox::ensure_back_buffer(CDC* ref, int w, int h)
+{
+	// 메모리 DC 는 처음 한 번만 만든다.
+	if (back_dc.GetSafeHdc() == nullptr)
+		back_dc.CreateCompatibleDC(ref);
+
+	// 비트맵이 아직 없거나 크기가 달라졌으면 다시 만든다.
+	if (back_bmp.GetSafeHandle() == nullptr || w != back_w || h != back_h) {
+		// 이전 비트맵을 DC 에서 떼어내고(원래 비트맵으로 되돌린 뒤) 버린다.
+		if (back_old_bmp) {
+			back_dc.SelectObject(back_old_bmp);
+			back_old_bmp = nullptr;
+		}
+		back_bmp.DeleteObject();
+
+		back_bmp.CreateCompatibleBitmap(ref, w, h);
+		back_old_bmp = back_dc.SelectObject(&back_bmp);
+		back_w = w;
+		back_h = h;
+	}
+}
+
 void CConBox::OnPaint()
 {
 	CPaintDC paintDC(this);
@@ -1555,15 +1795,12 @@ void CConBox::OnPaint()
 
 	// 더블 버퍼링: 화면에 직접 그리면 "전체 배경 칠 -> 글자 그리기" 의 중간 상태가 잠깐
 	// 보여, 빠른 키 입력으로 매번 전체를 다시 그릴 때 화면이 깜빡인다. 그래서 메모리 DC 에
-	// 한 프레임을 모두 그린 뒤 마지막에 화면으로 한 번에 복사한다.
-	CDC mem;
-	mem.CreateCompatibleDC(&paintDC);
-	CBitmap bmp;
-	bmp.CreateCompatibleBitmap(&paintDC, rc.Width(), rc.Height());
-	CBitmap* old_bmp = mem.SelectObject(&bmp);
+	// 한 프레임을 모두 그린 뒤 마지막에 화면으로 한 번에 복사한다. 메모리 DC/비트맵은
+	// 멤버로 캐싱해 두고 크기가 바뀔 때만 다시 만든다.
+	ensure_back_buffer(&paintDC, rc.Width(), rc.Height());
 
 	// 이하 기존 그리기 코드는 모두 메모리 DC(dc)에 그린다.
-	CDC& dc = mem;
+	CDC& dc = back_dc;
 
 	// 클라이언트 영역 전체를 현재 배경색으로 채운다.
 	dc.FillSolidRect(rc, cur_bg);
@@ -1608,11 +1845,19 @@ void CConBox::OnPaint()
 			CRect cell(px, py, px + w * cell_w, py + cell_h);
 			dc.FillSolidRect(cell, bg);
 
-			// 글자를 그린다. 2배 폭 글자는 한글 폰트, 그 외는 영문 폰트를 쓴다.
-			// 기준선 정렬이므로 세로 위치는 칸 위쪽 + 기준선만큼 내린 곳이다.
-			dc.SelectObject(c.wide ? &kfont : &efont);
-			dc.SetTextColor(fg);
-			dc.TextOutW(px, py + cell_base, &c.ch, 1);
+			// 블록/박스 문자는 (수준에 따라) 폰트 대신 도형으로 칸에 직접 칠해 칸 틈을 없앤다.
+			// 그 밖의 글자는 폰트로 그린다. 2배 폭 글자는 한글 폰트, 그 외는 영문 폰트.
+			bool drawn = false;
+			if (glyph_level >= 1)
+				drawn = DrawBlockElement(dc, c.ch, px, py, cell_w, cell_h, fg);
+			if (!drawn && glyph_level >= 2)
+				drawn = DrawBoxLine(dc, c.ch, px, py, cell_w, cell_h, fg);
+			if (!drawn) {
+				// 기준선 정렬이므로 세로 위치는 칸 위쪽 + 기준선만큼 내린 곳이다.
+				dc.SelectObject(c.wide ? &kfont : &efont);
+				dc.SetTextColor(fg);
+				dc.TextOutW(px, py + cell_base, &c.ch, 1);
+			}
 
 			x += w;
 		}
@@ -1657,7 +1902,12 @@ void CConBox::OnPaint()
 					if (cc.ch == L'\n')
 						break;
 					dc.SelectObject(cc.wide ? &kfont : &efont);
-					dc.TextOutW(x, cur.top + cell_base, &cc.ch, 1);
+					// 블록/박스 문자는 도형으로 직접 칠하고(폰트는 위에서 이미 선택되었지만 출력은 생략),
+						// 그 밖의 글자만 폰트로 출력한다.
+						bool cdrawn = (glyph_level >= 1 && DrawBlockElement(dc, cc.ch, x, cur.top, cell_w, cell_h, cur_fg))
+						           || (glyph_level >= 2 && DrawBoxLine(dc, cc.ch, x, cur.top, cell_w, cell_h, cur_fg));
+						if (!cdrawn)
+							dc.TextOutW(x, cur.top + cell_base, &cc.ch, 1);
 					x += (cc.wide ? 2 : 1) * cell_w;
 				}
 
@@ -1694,6 +1944,6 @@ void CConBox::OnPaint()
 	}
 
 	// 메모리 DC 에 완성된 한 프레임을 화면으로 한 번에 복사한다. (깜빡임 제거)
-	paintDC.BitBlt(0, 0, rc.Width(), rc.Height(), &mem, 0, 0, SRCCOPY);
-	mem.SelectObject(old_bmp);
+	// 비트맵은 멤버로 계속 살려 두므로 여기서 떼어내지 않는다. (소멸자에서 정리)
+	paintDC.BitBlt(0, 0, rc.Width(), rc.Height(), &back_dc, 0, 0, SRCCOPY);
 }

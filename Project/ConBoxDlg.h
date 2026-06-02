@@ -38,4 +38,8 @@ protected:
 
 	// ConBox 와 확인/취소 버튼을 현재 창 크기에 맞춰 다시 배치한다.
 	void layout_children();
+
+	// ConBox 가 가로 cols 칸 x 세로 rows 줄(영문 기준)이 되도록 메인 창 크기를
+	// 다시 잡고, 작업 영역 중앙으로 옮긴다. open() 이후(셀 크기 확정 후) 호출한다.
+	void resize_to_grid(int cols, int rows);
 };
