@@ -13,21 +13,6 @@
 #endif
 
 
-// 데모용: Enter 콜백에서 ConBox 에 접근하기 위한 전역 포인터.
-static CConBox* demoBox = nullptr;
-
-// 데모용 Enter 콜백. 입력한 내용을 그대로 되울려(echo) 동작을 확인한다.
-static void OnConBoxEnter(const char* input)
-{
-	if (demoBox == nullptr)
-		return;
-	// "입력: " 안내는 UTF-8 바이트로 전달한다. input 은 이미 UTF-8 이다.
-	demoBox->print(reinterpret_cast<const char*>(u8"입력하신 내용: "));
-	demoBox->print(input);
-	demoBox->print("\n");
-}
-
-
 // CConBoxDlg 대화 상자
 
 
@@ -90,10 +75,6 @@ BOOL CConBoxDlg::OnInitDialog()
 	// 크기를 다시 잡고 화면 중앙으로 옮긴다. (셀 크기는 open 에서 확정되었다.)
 	resize_to_grid(96, 32);
 
-	// Enter 콜백을 연결한다. (데모: 입력을 되울려 줌)
-	demoBox = &con_box;
-	con_box.on_enter = OnConBoxEnter;
-
 	// 초기 화면: ConBox 개요/특징 도표 (둥근 모서리). 로고 칸만 살구색.
 	// C++20 에서 u8 리터럴은 char8_t 형이므로 const char* 로 캐스팅한다.
 	// (도표 문자열은 한글=2칸 폭을 계산해 정렬되어 있다. Temp/gen_box.py 로 생성.)
@@ -133,9 +114,31 @@ BOOL CConBoxDlg::OnInitDialog()
 		u8"│ 타이프(Type) 쳐서 동작을 확인해 보세요.                   │\n"
 		u8"╰───────────────────────────────────────────────────────────╯\n"));
 
+	// M2 검증: ConExe 로 상호작용 셸(cmd)을 ConPTY 로 실행해 입출력 왕복을 확인한다.
+	// attach() 가 출력(자식->ConBox)과 입력(ConBox->자식)을 모두 연결하므로, 이후 ConBox 에
+	// 타이핑하면 cmd 로 전달되고 결과가 ConBox 에 표시된다. 로컬 에코는 자동으로 꺼진다.
+	// (이 단계에서는 VT 시퀀스 미해석 - 일부 제어문자가 그대로 보일 수 있다. VT 파서/셀
+	//  그리드는 이후 M3 에서 도입한다.)
+	con_box.print("\n");
+	con_exe.attach(&con_box);
+	// 자식이 종료되면(예: powershell 에서 exit) ConBox 에 안내를 출력하도록 콜백을 건다(M5).
+	con_exe.set_exit_callback(&CConBoxDlg::on_child_exit, this);
+	con_exe.start("powershell -NoLogo", con_box.grid_cols(), con_box.grid_rows());
+
 	// 키보드 입력을 받도록 ConBox 에 포커스를 준다.
 	con_box.SetFocus();
 	return FALSE;  // 포커스를 직접 설정했으므로 FALSE 를 반환한다.
+}
+
+void CConBoxDlg::on_child_exit(void* user)
+{
+	// ConExe 자식(powershell)이 종료되면 호출된다. 호출 시점에는 이미 ConExe 정리가 끝나
+	// is_running()==false 다. 데모에서는 ConBox 에 종료 안내만 출력한다(원하면 여기서 재시작
+	// 하거나 창을 닫을 수도 있다).
+	CConBoxDlg* self = (CConBoxDlg*)user;
+	if (self != nullptr)
+		self->con_box.print(reinterpret_cast<const char*>(
+			u8"\r\n\x1b[33m[프로세스가 종료되었습니다. 창을 닫아 주세요.]\x1b[m\r\n"));
 }
 
 void CConBoxDlg::layout_children()

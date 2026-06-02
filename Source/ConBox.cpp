@@ -4,7 +4,7 @@
 // 이 파일은 동작을 "수정"할 때만 본다. 아래 목차로 필요한 함수만 찾아(Grep) 부분만 읽는다.
 //
 // === 파일 구성 (대략 이 순서) ===
-//   보조(static)   : IsWideChar, ParseFontOpts(폰트 opts 파서), CharClass(단어 분류),
+//   보조(static)   : IsWideChar, ParseFontOpts(폰트 opts 파서),
 //                    DrawBlockElement(블록 요소 직접 칠), DrawBoxLine(직선/정션/대각선/이중선 직접 칠)
 //   메시지 맵      : BEGIN_MESSAGE_MAP ... END_MESSAGE_MAP
 //   창/폰트        : open, make_font, apply_default_fonts, calc_cell_size,
@@ -13,14 +13,15 @@
 //                    bump_cursor, OnTimer
 //   여백           : set_margin, client_size_for_grid
 //   커서 기하      : blend_cursor_color, cursor_screen_pos, get_cursor_rect, is_hangul_mode
-//   메트릭/버퍼    : update_metrics, visual_col, put_wchar, print, rebuild_scr_lines,
-//                    scroll_to_bottom, update_scrollbar
+//   그리드/출력    : update_metrics, blank_row, reset_screen, line_at, clamp_cursor, erase_cells,
+//                    scroll_lines_up/down, scroll_up_region, scroll_down_region, line_feed,
+//                    insert_lines, delete_lines, insert_chars, delete_chars,
+//                    enter_alt_screen, leave_alt_screen, put_char, print, scroll_to_bottom, update_scrollbar
+//   VT 파서        : Xterm256ToRgb(static), vt_feed, dispatch_csi
 //   창 메시지      : OnEraseBkgnd, OnSize, OnGetDlgCode, OnVScroll, OnMouseWheel
-//   IME(한글)      : OnImeStart, clear_ime_comp, OnImeComp, OnImeEnd, OnImeNotify
-//   마우스/선택    : hit_test, get_sel_range, pos_selected, collect_selection,
-//                    copy_selection_to_clipboard, paste_from_clipboard,
-//                    OnLButtonDown, OnLButtonDblClk, OnMouseMove, OnLButtonUp, OnRButtonDown
-//   입력 편집      : insert_wchar, OnChar, OnKeyDown, commit_input, move_cursor_row
+//   IME(한글)      : OnImeStart, OnImeComp, OnImeEnd, OnImeNotify
+//   입력           : set_input_sink, set_resize_sink, send_input_bytes, send_input_wide,
+//                    terminal_keydown, paste_clipboard, finalize_composition, OnChar, OnKeyDown
 //   그리기         : ensure_back_buffer, OnPaint
 
 #include "ConBox.h"
@@ -30,6 +31,16 @@
 
 // 커서 깜빡임 타이머 ID.
 static const UINT_PTR CURSOR_TIMER = 1;
+
+// VT 기본 색. SGR 0(리셋)과 39/49 가 복귀하는 색이며, 요구사양 기본값(흰 글자/검은 바탕)과 같다.
+static const COLORREF DEFAULT_FG = RGB(255, 255, 255);
+static const COLORREF DEFAULT_BG = RGB(0, 0, 0);
+
+// VT 파서 상태값. (vt_state)
+enum { VT_GROUND = 0, VT_ESC = 1, VT_CSI = 2, VT_OSC = 3 };
+
+// 스크롤백 줄 수 상한.
+static const int MAX_SCROLLBACK = 5000;
 
 // 메시지 맵: 그리기/배경/크기/키보드/스크롤/IME 를 처리한다.
 BEGIN_MESSAGE_MAP(CConBox, CWnd)
@@ -46,11 +57,6 @@ BEGIN_MESSAGE_MAP(CConBox, CWnd)
 	ON_MESSAGE(WM_IME_COMPOSITION, &CConBox::OnImeComp)
 	ON_MESSAGE(WM_IME_ENDCOMPOSITION, &CConBox::OnImeEnd)
 	ON_MESSAGE(WM_IME_NOTIFY, &CConBox::OnImeNotify)
-	ON_WM_LBUTTONDOWN()
-	ON_WM_LBUTTONDBLCLK()
-	ON_WM_MOUSEMOVE()
-	ON_WM_LBUTTONUP()
-	ON_WM_RBUTTONDOWN()
 END_MESSAGE_MAP()
 
 // 한 글자가 2배 폭(한글, CJK 등)인지 판정한다.
@@ -121,32 +127,6 @@ static LOGFONTW ParseFontOpts(const char* name, float size_pt, const char* opts,
 	}
 
 	return lf;
-}
-
-// 더블클릭 단어 선택에서 쓰는 문자 부류 판정.
-// 단어는 공백으로 끊되, 영문/한글/특수문자가 섞이지 않도록 같은 부류끼리만 묶는다.
-//   0 = 구분자(공백/탭/소프트 줄바꿈), 1 = 한글, 2 = 영문(영숫자), 3 = 특수문자(그 외 비구분자)
-static int CharClass(wchar_t ch)
-{
-	if (ch == L' ' || ch == L'\t' || ch == L'\n')
-		return 0;
-
-	// 한글: 완성형 음절, 자모, 호환 자모, 확장 자모 영역.
-	if ((ch >= 0xAC00 && ch <= 0xD7A3)
-		|| (ch >= 0x1100 && ch <= 0x11FF)
-		|| (ch >= 0x3130 && ch <= 0x318F)
-		|| (ch >= 0xA960 && ch <= 0xA97F)
-		|| (ch >= 0xD7B0 && ch <= 0xD7FF))
-		return 1;
-
-	// 영문: ASCII 영문자와 숫자. (숫자는 영문 부류로 함께 묶는다.)
-	if ((ch >= L'0' && ch <= L'9')
-		|| (ch >= L'A' && ch <= L'Z')
-		|| (ch >= L'a' && ch <= L'z'))
-		return 2;
-
-	// 그 밖의 비구분자는 특수문자로 본다.
-	return 3;
 }
 
 // 블록 요소 문자(U+2580~259F)를 폰트 글리프 대신 도형으로 칸 안에 직접 칠한다.
@@ -351,16 +331,41 @@ CConBox::CConBox()
 	margin_left = 10;
 	margin_right = 10;
 
-	scroll_top = 0;
-	cur_log = 0;
+	view_top = 0;
+	cur_row = 0;
 	cur_col = 0;
-	edit_log = 0;
-	edit_col = 0;
-	ime_anchor = 0;
-	desired_vx = -1;
+	cursor_visible = true;
+	saved_row = 0;
+	saved_col = 0;
 
-	// Enter 콜백은 기본적으로 없다. 사용 측에서 대입한다.
-	on_enter = nullptr;
+	// 스크롤 영역은 화면 전체로 시작한다. scroll_bot 은 reset_screen/update_metrics 에서 rows-1 로 맞춰진다.
+	scroll_top = 0;
+	scroll_bot = 0;
+
+	// 대체 화면은 처음엔 비활성(주 화면).
+	alt_active = false;
+	saved_main_row = 0;
+	saved_main_col = 0;
+
+	// VT 파서 초기 상태(GROUND)와 SGR 속성.
+	vt_state = VT_GROUND;
+	vt_nparam = 0;
+	vt_priv = false;
+	vt_gtlt = false;
+	cur_bold = false;
+	cur_reverse = false;
+
+	// 입력 모드 기본값: 일반 커서 키(앱 모드 꺼짐), 붙여넣기 감싸기 꺼짐. 자식이 켠다.
+	app_cursor_keys = false;
+	bracketed_paste = false;
+
+	// 입력 싱크는 기본적으로 없다(읽기 전용 뷰어). ConExe 등이 set_input_sink 로 등록한다.
+	input_sink = nullptr;
+	input_sink_user = nullptr;
+
+	// 리사이즈 싱크도 기본적으로 없다. ConExe 가 attach() 에서 set_resize_sink 로 등록한다.
+	resize_sink = nullptr;
+	resize_sink_user = nullptr;
 
 	// 블록 커서 색 혼합 비율 기본값: 배경:전경 = 6:4 (배경에 가까운 중간색).
 	cursor_bg_weight = 6;
@@ -379,12 +384,6 @@ CConBox::CConBox()
 	cursor_on = true;
 	UINT caret = ::GetCaretBlinkTime();
 	cursor_blink_ms = (caret == INFINITE) ? 0 : (int)caret;
-
-	// 선택 상태 초기화
-	selecting = false;
-	sel_valid = false;
-	sel_a_log = sel_a_col = 0;
-	sel_c_log = sel_c_col = 0;
 
 	ZeroMemory(&efont_lf, sizeof(efont_lf));
 	ZeroMemory(&kfont_lf, sizeof(kfont_lf));
@@ -426,7 +425,6 @@ void CConBox::open(CWnd* parent, int x0, int y0, int x1, int y1)
 	apply_default_fonts();
 	calc_cell_size();
 	update_metrics();
-	rebuild_scr_lines();
 	update_scrollbar();
 
 	// 윈도우 핸들이 만들어졌으니 커서 깜빡임 타이머를 시작한다.
@@ -581,12 +579,11 @@ void CConBox::set_kfont(const char* name, float size, const char* opts)
 	if (::IsWindow(m_hWnd)) {
 		calc_cell_size();
 		update_metrics();
-		rebuild_scr_lines();
 
 		// 스크롤 위치가 범위를 벗어나면 맞춰 준다.
-		int maxtop = (int)scr_lines.size() - rows;
+		int maxtop = (int)scrollback.size();
 		if (maxtop < 0) maxtop = 0;
-		if (scroll_top > maxtop) scroll_top = maxtop;
+		if (view_top > maxtop) view_top = maxtop;
 
 		update_scrollbar();
 		Invalidate();
@@ -605,12 +602,11 @@ void CConBox::set_kfont_fill(float fill_ratio, float emin_floor)
 	if (::IsWindow(m_hWnd)) {
 		calc_cell_size();
 		update_metrics();
-		rebuild_scr_lines();
 
 		// 스크롤 위치가 범위를 벗어나면 맞춰 준다.
-		int maxtop = (int)scr_lines.size() - rows;
+		int maxtop = (int)scrollback.size();
 		if (maxtop < 0) maxtop = 0;
-		if (scroll_top > maxtop) scroll_top = maxtop;
+		if (view_top > maxtop) view_top = maxtop;
 
 		update_scrollbar();
 		Invalidate();
@@ -688,17 +684,11 @@ void CConBox::bump_cursor()
 void CConBox::OnTimer(UINT_PTR id)
 {
 	if (id == CURSOR_TIMER) {
-		// IME 조합 중에는 조합 글자에 시선이 모이도록 커서를 깜빡이지 않고 항상 켜 둔다.
-		// 그 외에는 표시 상태를 뒤집고 커서 자리만 다시 그린다.
-		if (!ime_comp.empty()) {
-			cursor_on = true;
-		}
-		else {
-			cursor_on = !cursor_on;
-			CRect rc;
-			if (get_cursor_rect(rc))
-				InvalidateRect(&rc, FALSE);
-		}
+		// 표시 상태를 뒤집고 커서 자리만 다시 그린다.
+		cursor_on = !cursor_on;
+		CRect rc;
+		if (get_cursor_rect(rc))
+			InvalidateRect(&rc, FALSE);
 		return;
 	}
 	CWnd::OnTimer(id);
@@ -719,12 +709,11 @@ void CConBox::set_margin(int top, int left, int bottom, int right)
 	// open 이후라면 resize 와 마찬가지로 칸 수/줄 수와 줄바꿈을 다시 계산한다.
 	if (::IsWindow(m_hWnd)) {
 		update_metrics();
-		rebuild_scr_lines();
 
 		// 스크롤 위치가 범위를 벗어나면 맞춰 준다.
-		int maxtop = (int)scr_lines.size() - rows;
+		int maxtop = (int)scrollback.size();
 		if (maxtop < 0) maxtop = 0;
-		if (scroll_top > maxtop) scroll_top = maxtop;
+		if (view_top > maxtop) view_top = maxtop;
 
 		update_scrollbar();
 		Invalidate();
@@ -761,37 +750,15 @@ COLORREF CConBox::blend_cursor_color() const
 
 bool CConBox::cursor_screen_pos(int& row_out, int& vx_out) const
 {
-	if (log_buf.empty())
+	if (screen.empty())
 		return false;
 
-	// 커서가 속한 화면 줄을 찾는다.
-	for (int sidx = 0; sidx < (int)scr_lines.size(); ++sidx) {
-		const ScreenLine& sl = scr_lines[sidx];
-		if (sl.log_idx != cur_log)
-			continue;
-		if (cur_col < sl.char_start || cur_col > sl.char_end)
-			continue;
-
-		// 줄바꿈 경계(구간 끝)에 걸쳐 있고 같은 논리 줄의 다음 구간이 이어지면,
-		// 커서를 다음 줄 맨 앞에 놓기 위해 이 구간은 건너뛴다.
-		if (cur_col == sl.char_end
-			&& sidx + 1 < (int)scr_lines.size()
-			&& scr_lines[sidx + 1].log_idx == cur_log
-			&& scr_lines[sidx + 1].char_start == cur_col) {
-			continue;
-		}
-
-		// 구간 시작부터 커서 직전까지의 시각적 칸 수를 더한다.
-		const LogLine& line = log_buf[sl.log_idx];
-		int vx = 0;
-		for (int i = sl.char_start; i < cur_col; ++i)
-			vx += line.chars[i].wide ? 2 : 1;
-
-		row_out = sidx - scroll_top;
-		vx_out = vx;
-		return true;
-	}
-	return false;
+	// 커서의 통합 인덱스(scrollback 다음이 화면)에서 보기 맨 위(view_top)를 빼 화면 줄 번호를
+	// 얻는다. 가로는 칸 좌표(cur_col)라 그대로 쓴다. (화면 밖 여부는 호출 측에서 row 로 판정)
+	int abs_idx = (int)scrollback.size() + cur_row;
+	row_out = abs_idx - view_top;
+	vx_out = cur_col;
+	return true;
 }
 
 bool CConBox::get_cursor_rect(CRect& rc) const
@@ -835,6 +802,8 @@ void CConBox::update_metrics()
 {
 	// 클라이언트 크기에서 안쪽 여백을 뺀 영역을 한 칸 크기로 나누어
 	// 가로 칸 수와 세로 줄 수를 구한다.
+	int old_cols = cols, old_rows = rows;
+
 	CRect rc;
 	GetClientRect(&rc);
 
@@ -844,34 +813,292 @@ void CConBox::update_metrics()
 	rows = (cell_h > 0) ? (avail_h / cell_h) : 1;
 	if (cols < 1) cols = 1;
 	if (rows < 1) rows = 1;
+
+	// 새 cols/rows 에 맞춰 화면 그리드를 재구성한다(행 수/줄 폭 맞춤, 커서 clamp).
+	reset_screen();
+
+	// 그리드 크기가 실제로 바뀌었고 리사이즈 싱크가 있으면 새 크기를 통지한다(자식 PTY 크기 동기화).
+	if ((cols != old_cols || rows != old_rows) && resize_sink != nullptr)
+		resize_sink(cols, rows, resize_sink_user);
 }
 
-int CConBox::visual_col() const
+Row CConBox::blank_row() const
 {
-	// 현재 줄에서 cur_col 직전까지의 글자들이 차지하는 시각적 칸 수를 합산한다.
-	int vc = 0;
-	const LogLine& line = log_buf[cur_log];
-	for (int i = 0; i < cur_col && i < (int)line.chars.size(); ++i)
-		vc += line.chars[i].wide ? 2 : 1;
-	return vc;
-}
-
-void CConBox::put_wchar(wchar_t wc)
-{
-	// 현재 출력 위치에 글자 하나를 쓴다.
-	// cur_col 이 줄 끝이면 추가하고, 중간이면 덮어쓴다(\r 이후의 덮어쓰기 등).
+	// cols 칸의 빈 줄(공백 셀, 현재 배경색). 현재 SGR 배경(cur_bg)으로 채워 지우기/스크롤이
+	// 배경색을 따르게 한다.
 	CharInfo c;
-	c.ch = wc;
+	c.ch = L' ';
 	c.fg = cur_fg;
 	c.bg = cur_bg;
-	c.wide = IsWideChar(wc);
+	c.wide = false;
+	return Row(cols < 1 ? 1 : cols, c);
+}
 
-	LogLine& line = log_buf[cur_log];
-	if (cur_col < (int)line.chars.size())
-		line.chars[cur_col] = c;
-	else
-		line.chars.push_back(c);
-	cur_col++;
+void CConBox::reset_screen()
+{
+	// 화면(screen)을 현재 rows x cols 크기로 맞춘다. 기존 줄은 보존하되 cols 로 패딩/자르고,
+	// 행 수를 rows 로 맞춘다. (정교한 reflow/PTY 동기화는 M3c)
+	CharInfo blank;
+	blank.ch = L' ';
+	blank.fg = cur_fg;
+	blank.bg = cur_bg;
+	blank.wide = false;
+
+	for (size_t r = 0; r < screen.size(); ++r) {
+		Row& line = screen[r];
+		if ((int)line.size() > cols)
+			line.resize(cols);
+		else if ((int)line.size() < cols)
+			line.resize(cols, blank);
+	}
+	if ((int)screen.size() < rows) {
+		while ((int)screen.size() < rows)
+			screen.push_back(blank_row());
+	}
+	else if ((int)screen.size() > rows) {
+		screen.resize(rows);
+	}
+	clamp_cursor();
+
+	// 스크롤 영역이 새 화면 크기를 벗어나지 않게 맞춘다. 범위가 깨지면 화면 전체로 되돌린다.
+	// (창 리사이즈 시 풀스크린 앱이 SIGWINCH 로 영역을 다시 설정하므로 여기선 안전하게 clamp 만 한다.)
+	if (scroll_top < 0) scroll_top = 0;
+	if (scroll_bot > rows - 1 || scroll_bot < 0) scroll_bot = rows - 1;
+	if (scroll_top >= scroll_bot) { scroll_top = 0; scroll_bot = rows - 1; }
+}
+
+const Row& CConBox::line_at(int idx) const
+{
+	// (scrollback + screen) 통합 인덱스. 앞부분은 scrollback, 그 다음이 현재 화면이다.
+	int sb = (int)scrollback.size();
+	if (idx < sb)
+		return scrollback[idx];
+	return screen[idx - sb];
+}
+
+void CConBox::clamp_cursor()
+{
+	if (cur_row < 0) cur_row = 0;
+	if (cur_row > rows - 1) cur_row = rows - 1;
+	if (cur_col < 0) cur_col = 0;
+	if (cur_col > cols) cur_col = cols;   // cols 는 "줄 끝 다음"(다음 글자에서 줄바꿈) 위치 허용
+}
+
+void CConBox::erase_cells(int row, int c0, int c1)
+{
+	// screen[row] 의 [c0, c1) 칸을 공백 셀(현재 배경색)로 지운다.
+	if (row < 0 || row >= (int)screen.size())
+		return;
+	Row& line = screen[row];
+	if (c0 < 0) c0 = 0;
+	if (c1 > (int)line.size()) c1 = (int)line.size();
+	for (int c = c0; c < c1; ++c) {
+		line[c].ch = L' ';
+		line[c].fg = cur_fg;
+		line[c].bg = cur_bg;
+		line[c].wide = false;
+	}
+}
+
+void CConBox::scroll_lines_up(int top, int bot, int n)
+{
+	// 줄 범위 [top, bot] 안에서 위로 n줄 회전한다(윗줄 n개 제거, 아래에 빈 줄 n개).
+	// scrollback 에는 관여하지 않는 순수 줄 이동이다(보존이 필요하면 호출 측이 미리 push 한다).
+	if (top < 0) top = 0;
+	if (bot > (int)screen.size() - 1) bot = (int)screen.size() - 1;
+	if (top > bot) return;
+	int region = bot - top + 1;
+	if (n < 1) return;
+	if (n > region) n = region;
+
+	for (int i = 0; i < n; ++i) {
+		screen.erase(screen.begin() + top);
+		screen.insert(screen.begin() + bot, blank_row());
+	}
+}
+
+void CConBox::scroll_lines_down(int top, int bot, int n)
+{
+	// 줄 범위 [top, bot] 안에서 아래로 n줄 회전한다(아래줄 n개 제거, 위에 빈 줄 n개).
+	if (top < 0) top = 0;
+	if (bot > (int)screen.size() - 1) bot = (int)screen.size() - 1;
+	if (top > bot) return;
+	int region = bot - top + 1;
+	if (n < 1) return;
+	if (n > region) n = region;
+
+	for (int i = 0; i < n; ++i) {
+		screen.erase(screen.begin() + bot);
+		screen.insert(screen.begin() + top, blank_row());
+	}
+}
+
+void CConBox::scroll_up_region(int n)
+{
+	// 스크롤 영역 [scroll_top, scroll_bot] 을 위로 n줄 스크롤한다.
+	// 주 화면이고 영역 상단이 화면 맨 위(scroll_top==0)일 때만, 밀려나는 윗줄을 scrollback 으로
+	// 보존한다(과거 출력 보기용). 대체 화면이거나 부분 스크롤 영역이면 보존하지 않고 버린다.
+	if (n < 1) return;
+	int region = scroll_bot - scroll_top + 1;
+	if (n > region) n = region;
+
+	if (!alt_active && scroll_top == 0) {
+		for (int i = 0; i < n; ++i)
+			scrollback.push_back(screen[i]);
+
+		// 스크롤백 상한 트림.
+		int over = (int)scrollback.size() - MAX_SCROLLBACK;
+		if (over > 0)
+			scrollback.erase(scrollback.begin(), scrollback.begin() + over);
+	}
+
+	scroll_lines_up(scroll_top, scroll_bot, n);
+}
+
+void CConBox::scroll_down_region(int n)
+{
+	// 스크롤 영역을 아래로 n줄 스크롤한다(RI/SD). scrollback 에는 관여하지 않는다.
+	scroll_lines_down(scroll_top, scroll_bot, n);
+}
+
+void CConBox::line_feed()
+{
+	// 커서가 스크롤 영역 하단에 있으면 영역을 한 줄 위로 스크롤한다(커서는 그 줄에 머문다).
+	// 그 밖에는 화면 끝을 넘지 않는 선에서 한 줄 내린다.
+	if (cur_row == scroll_bot)
+		scroll_up_region(1);
+	else if (cur_row < rows - 1)
+		cur_row++;
+}
+
+void CConBox::insert_lines(int n)
+{
+	// IL: 커서가 스크롤 영역 안에 있을 때만 동작한다. 커서 줄부터 빈 줄을 n개 삽입하고
+	// 아래 줄들을 영역 하단(scroll_bot)으로 밀어낸다. 커서는 1열로 이동한다.
+	if (cur_row < scroll_top || cur_row > scroll_bot)
+		return;
+	if (n < 1) n = 1;
+	scroll_lines_down(cur_row, scroll_bot, n);
+	cur_col = 0;
+}
+
+void CConBox::delete_lines(int n)
+{
+	// DL: 커서가 스크롤 영역 안에 있을 때만 동작한다. 커서 줄부터 n줄 삭제하고 아래 줄들을
+	// 끌어올리며 영역 하단에 빈 줄을 채운다. 커서는 1열로 이동한다.
+	if (cur_row < scroll_top || cur_row > scroll_bot)
+		return;
+	if (n < 1) n = 1;
+	scroll_lines_up(cur_row, scroll_bot, n);
+	cur_col = 0;
+}
+
+void CConBox::insert_chars(int n)
+{
+	// ICH: 커서 칸부터 같은 줄에서 빈 칸을 n개 삽입한다. 오른쪽 칸들은 밀려나며 줄 폭(cols)을
+	// 넘친 칸은 버린다. 커서 위치는 그대로 둔다.
+	if (cur_row < 0 || cur_row >= (int)screen.size())
+		return;
+	Row& line = screen[cur_row];
+	int c = cur_col;
+	if (c < 0) c = 0;
+	if (c >= (int)line.size())
+		return;
+	if (n < 1) n = 1;
+	if (n > (int)line.size() - c) n = (int)line.size() - c;
+
+	CharInfo blank;
+	blank.ch = L' '; blank.fg = cur_fg; blank.bg = cur_bg; blank.wide = false;
+	line.insert(line.begin() + c, n, blank);
+	line.resize(cols, blank);   // 오른쪽으로 밀려 넘친 칸은 버려 줄 폭을 cols 로 유지한다.
+}
+
+void CConBox::delete_chars(int n)
+{
+	// DCH: 커서 칸부터 같은 줄에서 n칸을 삭제하고 오른쪽 칸들을 끌어당긴 뒤 끝에 빈 칸을 채운다.
+	if (cur_row < 0 || cur_row >= (int)screen.size())
+		return;
+	Row& line = screen[cur_row];
+	int c = cur_col;
+	if (c < 0) c = 0;
+	if (c >= (int)line.size())
+		return;
+	if (n < 1) n = 1;
+	if (n > (int)line.size() - c) n = (int)line.size() - c;
+
+	CharInfo blank;
+	blank.ch = L' '; blank.fg = cur_fg; blank.bg = cur_bg; blank.wide = false;
+	line.erase(line.begin() + c, line.begin() + c + n);
+	line.resize(cols, blank);   // 끌어당겨 줄어든 만큼 끝에 빈 칸을 채워 줄 폭을 cols 로 유지한다.
+}
+
+void CConBox::enter_alt_screen()
+{
+	// 대체 화면 진입: 주 화면과 커서를 백업하고 빈 대체 화면으로 바꾼다.
+	// 스크롤백은 그대로 남지만 alt_active 동안은 보이지 않게(동결) 한다.
+	if (alt_active)
+		return;
+	main_saved.swap(screen);          // 주 화면을 백업(screen 은 비워짐)
+	saved_main_row = cur_row;
+	saved_main_col = cur_col;
+
+	screen.assign(rows, blank_row()); // 빈 대체 화면
+	cur_row = 0;
+	cur_col = 0;
+	scroll_top = 0;
+	scroll_bot = rows - 1;
+	alt_active = true;
+}
+
+void CConBox::leave_alt_screen()
+{
+	// 대체 화면 복귀: 백업한 주 화면과 커서를 되돌린다.
+	if (!alt_active)
+		return;
+	screen.swap(main_saved);
+	main_saved.clear();
+	alt_active = false;
+
+	// 복귀한 주 화면을 현재 cols/rows 에 맞추고(리사이즈가 있었을 수 있다) 커서/영역을 되돌린다.
+	cur_row = saved_main_row;
+	cur_col = saved_main_col;
+	scroll_top = 0;
+	scroll_bot = rows - 1;
+	reset_screen();
+}
+
+void CConBox::put_char(wchar_t wc)
+{
+	// 현재 커서 칸에 글자 하나를 쓴다. 이 글자를 넣으면 칸이 화면 폭(cols)을 넘는 경우 먼저
+	// 자동 줄바꿈(autowrap)한다. 2배 폭 글자는 lead 칸에 쓰고 다음 칸을 trail(ch=0)로 둔다.
+	if (cur_row < 0 || cur_row >= (int)screen.size())
+		return;
+
+	int w = IsWideChar(wc) ? 2 : 1;
+	if (cur_col + w > cols) {
+		cur_col = 0;
+		line_feed();
+	}
+
+	// reverse 속성이면 전경/배경을 스왑해 셀에 저장한다.
+	COLORREF fg = cur_reverse ? cur_bg : cur_fg;
+	COLORREF bg = cur_reverse ? cur_fg : cur_bg;
+
+	Row& line = screen[cur_row];
+	if (cur_col >= 0 && cur_col < (int)line.size()) {
+		line[cur_col].ch = wc;
+		line[cur_col].fg = fg;
+		line[cur_col].bg = bg;
+		line[cur_col].wide = (w == 2);
+		// 2배 폭 글자의 trail 칸(다음 칸)을 비워 둔다(렌더는 lead 가 두 칸을 그린다).
+		if (w == 2 && cur_col + 1 < (int)line.size()) {
+			line[cur_col + 1].ch = 0;
+			line[cur_col + 1].fg = fg;
+			line[cur_col + 1].bg = bg;
+			line[cur_col + 1].wide = false;
+		}
+	}
+	cur_col += w;
 }
 
 void CConBox::print(const char* text)
@@ -887,100 +1114,307 @@ void CConBox::print(const char* text)
 	std::vector<wchar_t> ws(wlen);
 	::MultiByteToWideChar(CP_UTF8, 0, text, -1, ws.data(), wlen);
 
-	// 버퍼가 비어 있으면 첫 논리 줄을 만든다.
-	if (log_buf.empty()) {
-		log_buf.push_back(LogLine());
-		cur_log = 0;
-		cur_col = 0;
-	}
+	// 화면이 아직 없으면(폰트/창 확정 전) 만들어 둔다.
+	if (screen.empty())
+		reset_screen();
 
-	// 변환된 문자열을 한 글자씩 처리한다. (마지막 원소는 널 종료라 제외)
-	for (int i = 0; i < wlen - 1; ++i) {
-		wchar_t wc = ws[i];
+	// 변환된 문자열을 한 글자씩 VT 파서에 넣는다. (마지막 원소는 널 종료라 제외)
+	for (int i = 0; i < wlen - 1; ++i)
+		vt_feed(ws[i]);
 
-		if (wc == L'\r') {
-			// 현재 줄 맨 처음으로 이동 (이후 출력은 덮어쓰기)
-			cur_col = 0;
-		}
-		else if (wc == L'\n') {
-			// 다음 줄 맨 처음으로 이동. 새 논리 줄을 버퍼 끝에 만든다.
-			log_buf.push_back(LogLine());
-			cur_log = (int)log_buf.size() - 1;
-			cur_col = 0;
-		}
-		else if (wc == L'\t') {
-			// 다음 4칸 탭 정지 위치까지 공백으로 채운다.
-			int adv = 4 - (visual_col() % 4);
-			for (int k = 0; k < adv; ++k)
-				put_wchar(L' ');
-		}
-		else {
-			put_wchar(wc);
-		}
-	}
-
-	// 출력이 끝난 위치가 곧 편집 경계가 된다. (이전 내용은 읽기전용)
-	edit_log = cur_log;
-	edit_col = cur_col;
-
-	// 줄바꿈을 다시 계산하고 강제로 맨 아래까지 스크롤한 뒤 화면을 갱신한다.
-	rebuild_scr_lines();
+	// 강제로 맨 아래까지 스크롤한 뒤 화면을 갱신한다.
 	scroll_to_bottom();
 	update_scrollbar();
 	bump_cursor();
 	Invalidate();
 }
 
-void CConBox::rebuild_scr_lines()
+void CConBox::scroll_to_bottom()
 {
-	// 모든 논리 줄을 가로폭(cols) 기준으로 잘라 화면 줄 목록을 만든다.
-	// 2배 폭 글자가 줄 끝에서 잘리지 않도록, 들어가지 않으면 통째로 다음 줄로 넘긴다.
-	scr_lines.clear();
+	int total = (int)scrollback.size() + rows;
+	int maxtop = total - rows;
+	view_top = (maxtop > 0) ? maxtop : 0;
+}
 
-	for (int li = 0; li < (int)log_buf.size(); ++li) {
-		const LogLine& line = log_buf[li];
-		int n = (int)line.chars.size();
+// xterm 256색 인덱스를 COLORREF 로 변환한다.
+// 0-15 기본 16색, 16-231 6x6x6 컬러 큐브, 232-255 24단계 그레이스케일.
+static COLORREF Xterm256ToRgb(int n)
+{
+	static const COLORREF base16[16] = {
+		RGB(0, 0, 0),       RGB(205, 0, 0),     RGB(0, 205, 0),     RGB(205, 205, 0),
+		RGB(0, 0, 238),     RGB(205, 0, 205),   RGB(0, 205, 205),   RGB(229, 229, 229),
+		RGB(127, 127, 127), RGB(255, 0, 0),     RGB(0, 255, 0),     RGB(255, 255, 0),
+		RGB(92, 92, 255),   RGB(255, 0, 255),   RGB(0, 255, 255),   RGB(255, 255, 255)
+	};
+	if (n < 0) n = 0;
+	if (n > 255) n = 255;
+	if (n < 16)
+		return base16[n];
+	if (n < 232) {
+		int i = n - 16;
+		int r = i / 36, g = (i / 6) % 6, b = i % 6;
+		// 큐브 단계: 0 -> 0, 1..5 -> 55 + 40*v
+		int rr = r ? 55 + 40 * r : 0;
+		int gg = g ? 55 + 40 * g : 0;
+		int bb = b ? 55 + 40 * b : 0;
+		return RGB(rr, gg, bb);
+	}
+	int v = 8 + 10 * (n - 232);   // 232..255 -> 8, 18, ..., 238
+	return RGB(v, v, v);
+}
 
-		if (n == 0) {
-			// 빈 줄도 화면에서 한 줄을 차지한다.
-			ScreenLine sl = { li, 0, 0 };
-			scr_lines.push_back(sl);
-			continue;
+void CConBox::vt_feed(wchar_t wc)
+{
+	// VT 파서 상태기계. 한 글자(또는 제어문자)를 받아 현재 상태에 따라 처리한다.
+	// 파서 상태(vt_state 등)는 멤버라 print 가 청크로 여러 번 불려도 시퀀스가 이어진다.
+	switch (vt_state) {
+	case VT_GROUND:
+		if (wc == 0x1B) { vt_state = VT_ESC; return; }   // ESC
+		if (wc == L'\r') { cur_col = 0; return; }          // CR
+		if (wc == L'\n') { line_feed(); return; }          // LF
+		if (wc == 0x08) { if (cur_col > 0) cur_col--; return; }  // BS
+		if (wc == L'\t') {
+			// 다음 8칸 탭 정지 위치로 이동한다(마지막 칸을 넘지 않는다).
+			int next = (cur_col / 8 + 1) * 8;
+			if (next > cols - 1) next = cols - 1;
+			cur_col = next;
+			return;
 		}
+		if (wc == 0x07) return;   // BEL 무시
+		if (wc < 0x20) return;    // 그 밖의 C0 제어문자 무시
+		put_char(wc);
+		return;
 
-		int start = 0;
-		int x = 0;
-		for (int i = 0; i < n; ++i) {
-			// Shift+Enter 로 넣은 소프트 줄바꿈 마커(L'\n')는 강제로 줄을 끊는다.
-			// 마커 자체는 어느 화면 줄에도 포함하지 않아 그려지지 않는다.
-			if (line.chars[i].ch == L'\n') {
-				ScreenLine sl = { li, start, i };
-				scr_lines.push_back(sl);
-				start = i + 1;
-				x = 0;
-				continue;
-			}
-
-			int w = line.chars[i].wide ? 2 : 1;
-			if (x + w > cols && i > start) {
-				// 이번 글자를 넣으면 폭을 넘으므로 여기서 줄을 끊는다.
-				ScreenLine sl = { li, start, i };
-				scr_lines.push_back(sl);
-				start = i;
-				x = 0;
-			}
-			x += w;
+	case VT_ESC:
+		if (wc == L'[') {
+			// CSI 진입: 파라미터 초기화.
+			vt_state = VT_CSI;
+			vt_nparam = 0;
+			vt_priv = false;
+			vt_gtlt = false;
+			for (int k = 0; k < 16; ++k) vt_params[k] = 0;
+			return;
 		}
-		// 남은 마지막 구간을 추가한다. (소프트 줄바꿈으로 끝났다면 빈 구간이 된다.)
-		ScreenLine sl = { li, start, n };
-		scr_lines.push_back(sl);
+		if (wc == L']') { vt_state = VT_OSC; return; }   // OSC: 내용 버림(창 제목 등)
+		if (wc == L'7') { saved_row = cur_row; saved_col = cur_col; vt_state = VT_GROUND; return; }   // DECSC
+		if (wc == L'8') { cur_row = saved_row; cur_col = saved_col; clamp_cursor(); vt_state = VT_GROUND; return; }  // DECRC
+		if (wc == L'M') {   // RI(역 인덱스): 커서가 영역 상단이면 영역을 아래로 스크롤, 아니면 한 줄 위로
+			if (cur_row == scroll_top) scroll_down_region(1);
+			else if (cur_row > 0) cur_row--;
+			vt_state = VT_GROUND; return;
+		}
+		// 그 밖의 ESC 시퀀스(독립/2바이트)는 무시한다.
+		vt_state = VT_GROUND;
+		return;
+
+	case VT_CSI:
+		if (wc >= L'0' && wc <= L'9') {
+			if (vt_nparam == 0) vt_nparam = 1;
+			int idx = vt_nparam - 1;
+			if (idx < 16)
+				vt_params[idx] = vt_params[idx] * 10 + (int)(wc - L'0');
+			return;
+		}
+		if (wc == L';') {
+			if (vt_nparam == 0) vt_nparam = 1;   // 비어 있던 첫 파라미터는 0
+			if (vt_nparam < 16) { vt_params[vt_nparam] = 0; vt_nparam++; }
+			return;
+		}
+		if (wc == L'?') { vt_priv = true; return; }
+		// '<' '=' '>' 는 2차 DA/kitty keyboard/XTMODKEYS 등 프라이빗 시퀀스의 접두다. 표시만 해 두고
+		// (dispatch_csi 가 통째로 무시) 최종 바이트(u/m/q 등)를 표준 명령으로 오인하지 않게 한다.
+		if (wc == L'<' || wc == L'=' || wc == L'>') { vt_gtlt = true; return; }
+		if (wc >= 0x40 && wc <= 0x7E) {
+			dispatch_csi(wc);
+			vt_state = VT_GROUND;
+			return;
+		}
+		// 중간 바이트(0x20-0x2F 등)는 무시하되 시퀀스는 계속 이어진다.
+		return;
+
+	case VT_OSC:
+		// OSC 문자열(창 제목 설정 등)은 표시하지 않고 종료자까지 버린다.
+		// 종료자: BEL(0x07) 또는 ST(ESC '\'). ESC 가 오면 ESC 상태로 보내 다음 글자에서 끝낸다.
+		if (wc == 0x07) { vt_state = VT_GROUND; return; }
+		if (wc == 0x1B) { vt_state = VT_ESC; return; }
+		return;
+
+	default:
+		vt_state = VT_GROUND;
+		return;
 	}
 }
 
-void CConBox::scroll_to_bottom()
+void CConBox::dispatch_csi(wchar_t fin)
 {
-	int maxtop = (int)scr_lines.size() - rows;
-	scroll_top = (maxtop > 0) ? maxtop : 0;
+	// '<' '=' '>' 접두로 시작한 시퀀스(2차 DA, kitty keyboard 프로토콜, XTMODKEYS 등)는
+	// 우리가 지원하지 않는다. 최종 바이트(u/m/q 등)를 표준 명령(커서 복원/SGR 등)으로 오인하면
+	// 안 되므로(예: ESC[<u 를 커서 복원으로 처리해 커서가 0,0 으로 튀던 버그) 통째로 무시한다.
+	if (vt_gtlt)
+		return;
+
+	// 첫 파라미터(없으면 0). 각 명령이 기본값 규칙(보통 없으면 1)을 따로 적용한다.
+	int n = (vt_nparam >= 1) ? vt_params[0] : 0;
+
+	switch (fin) {
+	case L'A': { int d = n ? n : 1; cur_row -= d; clamp_cursor(); break; }   // CUU
+	case L'B': { int d = n ? n : 1; cur_row += d; clamp_cursor(); break; }   // CUD
+	case L'C': { int d = n ? n : 1; cur_col += d; if (cur_col > cols - 1) cur_col = cols - 1; break; }  // CUF
+	case L'D': { int d = n ? n : 1; cur_col -= d; if (cur_col < 0) cur_col = 0; break; }   // CUB
+
+	case L'H':
+	case L'f': {   // CUP / HVP (1-based -> 0-based)
+		int r = (vt_nparam >= 1 && vt_params[0]) ? vt_params[0] : 1;
+		int c = (vt_nparam >= 2 && vt_params[1]) ? vt_params[1] : 1;
+		cur_row = r - 1;
+		cur_col = c - 1;
+		clamp_cursor();
+		break;
+	}
+	case L'G':
+	case L'`': { int c = n ? n : 1; cur_col = c - 1; clamp_cursor(); break; }   // CHA
+	case L'd': { int r = n ? n : 1; cur_row = r - 1; clamp_cursor(); break; }   // VPA
+
+	case L'J':   // ED (화면 지우기)
+		if (n == 0) {
+			erase_cells(cur_row, cur_col, cols);
+			for (int r = cur_row + 1; r < rows; ++r) erase_cells(r, 0, cols);
+		} else if (n == 1) {
+			for (int r = 0; r < cur_row; ++r) erase_cells(r, 0, cols);
+			erase_cells(cur_row, 0, cur_col + 1);
+		} else {   // 2, 3: 화면 전체
+			for (int r = 0; r < rows; ++r) erase_cells(r, 0, cols);
+		}
+		break;
+
+	case L'K':   // EL (줄 지우기)
+		if (n == 0) erase_cells(cur_row, cur_col, cols);
+		else if (n == 1) erase_cells(cur_row, 0, cur_col + 1);
+		else erase_cells(cur_row, 0, cols);
+		break;
+
+	case L'X': {   // ECH (커서 칸부터 n칸을 빈 칸으로, 밀지 않음)
+		int d = n ? n : 1;
+		erase_cells(cur_row, cur_col, cur_col + d);
+		break;
+	}
+	case L'@': insert_chars(n ? n : 1); break;   // ICH (문자 삽입)
+	case L'P': delete_chars(n ? n : 1); break;   // DCH (문자 삭제)
+	case L'L': insert_lines(n ? n : 1); break;   // IL  (줄 삽입)
+	case L'M': delete_lines(n ? n : 1); break;   // DL  (줄 삭제)
+	case L'S': scroll_up_region(n ? n : 1); break;     // SU (영역 위로 스크롤)
+	case L'T': scroll_down_region(n ? n : 1); break;   // SD (영역 아래로 스크롤)
+
+	case L'r': {   // DECSTBM (스크롤 영역 상/하단 설정). 프라이빗(?r=DEC 모드 복원)은 무시한다.
+		if (vt_priv) break;
+		int t = (vt_nparam >= 1 && vt_params[0]) ? vt_params[0] : 1;
+		int b = (vt_nparam >= 2 && vt_params[1]) ? vt_params[1] : rows;
+		t--; b--;   // 1-based -> 0-based
+		if (t < 0) t = 0;
+		if (b > rows - 1) b = rows - 1;
+		if (t < b) {
+			scroll_top = t;
+			scroll_bot = b;
+			// DECSTBM 설정 후 커서는 홈(화면 좌상단)으로 이동한다.
+			cur_row = 0;
+			cur_col = 0;
+		}
+		break;
+	}
+
+	case L'm': {   // SGR (색/속성)
+		if (vt_nparam == 0) {
+			// 파라미터 없음 = 리셋(SGR 0).
+			cur_fg = DEFAULT_FG; cur_bg = DEFAULT_BG;
+			cur_bold = false; cur_reverse = false;
+			break;
+		}
+		for (int i = 0; i < vt_nparam; ++i) {
+			int p = vt_params[i];
+			if (p == 0) { cur_fg = DEFAULT_FG; cur_bg = DEFAULT_BG; cur_bold = false; cur_reverse = false; }
+			else if (p == 1) cur_bold = true;
+			else if (p == 22) cur_bold = false;
+			else if (p == 7) cur_reverse = true;
+			else if (p == 27) cur_reverse = false;
+			else if (p >= 30 && p <= 37) cur_fg = Xterm256ToRgb((cur_bold ? 8 : 0) + (p - 30));
+			else if (p >= 40 && p <= 47) cur_bg = Xterm256ToRgb(p - 40);
+			else if (p >= 90 && p <= 97) cur_fg = Xterm256ToRgb(8 + (p - 90));
+			else if (p >= 100 && p <= 107) cur_bg = Xterm256ToRgb(8 + (p - 100));
+			else if (p == 39) cur_fg = DEFAULT_FG;
+			else if (p == 49) cur_bg = DEFAULT_BG;
+			else if (p == 38 || p == 48) {
+				// 확장 색: 38;5;n (256색) 또는 38;2;r;g;b (트루컬러). 48 은 배경.
+				COLORREF col = (p == 38) ? cur_fg : cur_bg;
+				if (i + 1 < vt_nparam && vt_params[i + 1] == 5) {
+					if (i + 2 < vt_nparam) col = Xterm256ToRgb(vt_params[i + 2]);
+					i += 2;
+				}
+				else if (i + 1 < vt_nparam && vt_params[i + 1] == 2) {
+					if (i + 4 < vt_nparam) col = RGB(vt_params[i + 2], vt_params[i + 3], vt_params[i + 4]);
+					i += 4;
+				}
+				if (p == 38) cur_fg = col; else cur_bg = col;
+			}
+		}
+		break;
+	}
+
+	case L'h':
+	case L'l': {   // 모드 설정(h)/해제(l)
+		bool set = (fin == L'h');
+		if (vt_priv) {
+			if (n == 25) {
+				cursor_visible = set;   // DECTCEM: 커서 표시
+			}
+			else if (n == 1) {
+				app_cursor_keys = set;  // DECCKM: 앱 커서 키 모드(방향키를 ESC O x 로)
+			}
+			else if (n == 2004) {
+				bracketed_paste = set;  // bracketed paste 모드
+			}
+			else if (n == 1049 || n == 1047 || n == 47) {
+				// 대체 화면(alt screen) 전환. vim/htop 등 풀스크린 TUI 가 쓴다.
+				// (?1049 는 커서 저장/복원까지 묶지만, 우리는 진입/복귀에서 커서를 함께 다룬다.)
+				if (set) enter_alt_screen();
+				else leave_alt_screen();
+			}
+			else if (n == 1048) {
+				// 커서 저장(h)/복원(l). DECSC/DECRC 와 같은 동작.
+				if (set) { saved_row = cur_row; saved_col = cur_col; }
+				else { cur_row = saved_row; cur_col = saved_col; clamp_cursor(); }
+			}
+			// 그 밖의 프라이빗 모드(?7 autowrap=항상 켬, ?2004 bracketed paste=M5 등)는 무시한다.
+		}
+		break;
+	}
+	case L's': saved_row = cur_row; saved_col = cur_col; break;                 // 커서 저장
+	case L'u': cur_row = saved_row; cur_col = saved_col; clamp_cursor(); break; // 커서 복원
+
+	case L'n':   // DSR (디바이스 상태 보고) — 자식의 질의에 입력 싱크로 응답한다.
+		if (!vt_priv && input_sink != nullptr) {
+			if (n == 6) {
+				// CPR: 커서 위치를 ESC[{row};{col}R 로 보고한다(1-based, 화면 기준).
+				char buf[32];
+				int len = wsprintfA(buf, "\x1b[%d;%dR", cur_row + 1, cur_col + 1);
+				send_input_bytes(buf, len);
+			}
+			else if (n == 5) {
+				// 단말 상태 OK 보고.
+				send_input_bytes("\x1b[0n", 4);
+			}
+		}
+		break;
+
+	case L'c':   // DA (디바이스 속성) — Primary DA 질의에 VT102 호환으로 응답한다.
+		if (input_sink != nullptr && (n == 0)) {
+			// ESC[?6c = VT102. 자식이 단말 능력을 식별하는 용도다.
+			send_input_bytes("\x1b[?6c", 5);
+		}
+		break;
+
+	default:
+		break;   // 그 밖의 미지원 CSI 는 무시한다.
+	}
 }
 
 void CConBox::update_scrollbar()
@@ -988,11 +1422,19 @@ void CConBox::update_scrollbar()
 	if (!::IsWindow(m_hWnd))
 		return;
 
-	int total = (int)scr_lines.size();
-	if (total <= rows) {
-		// 내용이 한 화면에 다 들어오면 스크롤바를 숨기고 맨 위로 맞춘다.
+	// 대체 화면(alt screen)에서는 스크롤백이 동결되어 보이지 않는다. 스크롤바를 숨기고
+	// 보기를 화면 시작(scrollback 다음)에 고정한다.
+	if (alt_active) {
 		ShowScrollBar(SB_VERT, FALSE);
-		scroll_top = 0;
+		view_top = (int)scrollback.size();
+		return;
+	}
+
+	int total = (int)scrollback.size() + rows;
+	if (total <= rows) {
+		// 스크롤백이 없으면(화면만) 스크롤바를 숨기고 맨 위로 맞춘다.
+		ShowScrollBar(SB_VERT, FALSE);
+		view_top = 0;
 		return;
 	}
 
@@ -1006,7 +1448,7 @@ void CConBox::update_scrollbar()
 	si.nMin = 0;
 	si.nMax = total - 1;       // 마지막 화면 줄 인덱스
 	si.nPage = rows;           // 한 번에 보이는 줄 수
-	si.nPos = scroll_top;
+	si.nPos = view_top;
 	SetScrollInfo(SB_VERT, &si, TRUE);
 }
 
@@ -1021,14 +1463,13 @@ void CConBox::OnSize(UINT type, int cx, int cy)
 {
 	CWnd::OnSize(type, cx, cy);
 
-	// 창 크기가 바뀌면 화면 칸 수와 줄바꿈을 다시 계산한다.
+	// 창 크기가 바뀌면 화면 칸 수를 다시 계산한다.
 	update_metrics();
-	rebuild_scr_lines();
 
 	// 스크롤 위치가 범위를 벗어나면 맞춰 준다.
-	int maxtop = (int)scr_lines.size() - rows;
+	int maxtop = (int)scrollback.size();
 	if (maxtop < 0) maxtop = 0;
-	if (scroll_top > maxtop) scroll_top = maxtop;
+	if (view_top > maxtop) view_top = maxtop;
 
 	update_scrollbar();
 	Invalidate();
@@ -1042,10 +1483,14 @@ UINT CConBox::OnGetDlgCode()
 
 void CConBox::OnVScroll(UINT code, UINT pos, CScrollBar* sb)
 {
-	int maxtop = (int)scr_lines.size() - rows;
+	// 대체 화면에서는 스크롤백 보기가 동결되므로 스크롤 입력을 무시한다.
+	if (alt_active)
+		return;
+
+	int maxtop = (int)scrollback.size();
 	if (maxtop < 0) maxtop = 0;
 
-	int nt = scroll_top;
+	int nt = view_top;
 	switch (code) {
 	case SB_LINEUP:   nt -= 1;    break;
 	case SB_LINEDOWN: nt += 1;    break;
@@ -1069,8 +1514,8 @@ void CConBox::OnVScroll(UINT code, UINT pos, CScrollBar* sb)
 
 	if (nt < 0) nt = 0;
 	if (nt > maxtop) nt = maxtop;
-	if (nt != scroll_top) {
-		scroll_top = nt;
+	if (nt != view_top) {
+		view_top = nt;
 		update_scrollbar();
 		Invalidate();
 	}
@@ -1078,15 +1523,19 @@ void CConBox::OnVScroll(UINT code, UINT pos, CScrollBar* sb)
 
 BOOL CConBox::OnMouseWheel(UINT flags, short zDelta, CPoint pt)
 {
+	// 대체 화면에서는 스크롤백 보기가 동결되므로 휠 스크롤을 무시한다(자식이 화면을 점유).
+	if (alt_active)
+		return TRUE;
+
 	// 휠 한 칸(120)당 세 줄씩 스크롤한다. 위로 굴리면 위쪽(이전 내용)으로 간다.
-	int maxtop = (int)scr_lines.size() - rows;
+	int maxtop = (int)scrollback.size();
 	if (maxtop < 0) maxtop = 0;
 
-	int nt = scroll_top - (zDelta / 120) * 3;
+	int nt = view_top - (zDelta / 120) * 3;
 	if (nt < 0) nt = 0;
 	if (nt > maxtop) nt = maxtop;
-	if (nt != scroll_top) {
-		scroll_top = nt;
+	if (nt != view_top) {
+		view_top = nt;
 		update_scrollbar();
 		Invalidate();
 	}
@@ -1121,104 +1570,57 @@ LRESULT CConBox::OnImeStart(WPARAM w, LPARAM l)
 		}
 		ImmReleaseContext(m_hWnd, himc);
 	}
-	// 조합 시작 시 깜빡임 상태를 켜 둔다. (조합 중 커서는 깜빡이지 않고 항상 표시된다.)
+	// 조합 시작 시 깜빡임 상태를 켜 둔다.
 	bump_cursor();
-	return 0;
-}
-
-void CConBox::clear_ime_comp()
-{
-	// 조합 중인 글자가 없으면 할 일이 없다.
-	if (ime_comp.empty())
-		return;
-
-	// 조합 글자들은 ime_anchor 부터 ime_comp 길이만큼 버퍼에 삽입되어 있다. 이를 제거하고
-	// 커서를 조합 시작점으로 되돌린다. (확정 문자 삽입 또는 취소 복구의 공통 전처리)
-	if (cur_log >= 0 && cur_log < (int)log_buf.size()) {
-		LogLine& line = log_buf[cur_log];
-		int start = ime_anchor;
-		int end = ime_anchor + (int)ime_comp.size();
-		if (start < 0) start = 0;
-		if (end > (int)line.chars.size()) end = (int)line.chars.size();
-		if (end > start)
-			line.chars.erase(line.chars.begin() + start, line.chars.begin() + end);
-	}
-	cur_col = ime_anchor;
-	ime_comp.clear();
+	// 조합 글자는 시스템 기본 인라인 표시에 맡긴다(ConBox 직접 조합 렌더는 이후 단계 M5).
+	// 위에서 조합/후보 창만 커서 위치로 옮겨 두었다.
+	return Default();
 }
 
 LRESULT CConBox::OnImeComp(WPARAM w, LPARAM l)
 {
-	HIMC himc = ImmGetContext(m_hWnd);
-	if (himc == NULL)
-		return Default();
-
-	// 현재 조합 중(미확정)인 글자들을 버퍼에서 제거하고 커서를 조합 시작점으로 되돌린다.
-	// ime_comp 가 비어있지 않은 동안 조합 글자는 ime_anchor 부터 그 길이만큼 실제 버퍼에 들어가 있다.
-	clear_ime_comp();
-
-	// 확정된 결과 문자열은 조합 시작점(현재 cur_col == ime_anchor)에 끼워 넣는다.
-	if (l & GCS_RESULTSTR) {
-		LONG bytes = ImmGetCompositionStringW(himc, GCS_RESULTSTR, NULL, 0);
-		int n = bytes / (int)sizeof(wchar_t);
-		if (n > 0) {
-			std::wstring r;
-			r.resize(n);
-			ImmGetCompositionStringW(himc, GCS_RESULTSTR, &r[0], bytes);
-			for (int i = 0; i < n; ++i)
-				insert_wchar(r[i]);
-		}
-	}
-
-	// 조합 중(미확정) 문자열은 커서 위치에 실제 글자로 삽입해 둔다. 그러면 뒤 글자들이
-	// 자연스럽게 한 칸씩 밀리고, OnPaint 에서 이 구간만 조합 블록색으로 칠해 조합 중임을 표시한다.
-	if (l & GCS_COMPSTR) {
-		LONG bytes = ImmGetCompositionStringW(himc, GCS_COMPSTR, NULL, 0);
-		int n = bytes / (int)sizeof(wchar_t);
-		if (n > 0) {
-			std::wstring comp;
-			comp.resize(n);
-			ImmGetCompositionStringW(himc, GCS_COMPSTR, &comp[0], bytes);
-
-			// 조합 시작점을 현재 커서 위치로 잡고, 그 자리에 조합 글자들을 끼워 넣는다.
-			// (cur_col 은 조합 시작점에 그대로 두어 다음 갱신/확정의 기준으로 삼는다.)
-			ime_anchor = cur_col;
-			LogLine& line = log_buf[cur_log];
-			for (int i = 0; i < n; ++i) {
-				CharInfo c;
-				c.ch = comp[i];
-				c.fg = cur_fg;
-				c.bg = cur_bg;
-				c.wide = IsWideChar(comp[i]);
-				line.chars.insert(line.chars.begin() + ime_anchor + i, c);
+	// 터미널(raw) 모드: 확정(GCS_RESULTSTR)된 글자만 UTF-8 로 자식에 보내고, 미완성 조합은
+	// 시스템 기본 인라인 표시에 맡긴다(로컬 버퍼에 삽입하지 않는다).
+	// (조합 중 방향키 등으로 글자가 옮겨진 칸에서 완성되는 순서 문제의 근본 해결은 M5 에서
+	//  강제 확정 후 전송 순서를 보장하는 방식으로 다룬다 - 요구사양서 3.1 참조.)
+	if (input_sink != nullptr) {
+		HIMC himc = ImmGetContext(m_hWnd);
+		if (himc == NULL)
+			return Default();
+		if (l & GCS_RESULTSTR) {
+			// 확정분을 추출해 자식으로 보낸다. 기본 처리(Default)를 부르지 않고 메시지를
+			// 소비(return 0)해, 시스템이 같은 확정분을 WM_CHAR/WM_IME_CHAR 로 또 보내는
+			// 중복을 막는다.
+			LONG bytes = ImmGetCompositionStringW(himc, GCS_RESULTSTR, NULL, 0);
+			int n = bytes / (int)sizeof(wchar_t);
+			if (n > 0) {
+				std::wstring r;
+				r.resize(n);
+				ImmGetCompositionStringW(himc, GCS_RESULTSTR, &r[0], bytes);
+				send_input_wide(r.c_str(), n);
 			}
-			ime_comp = comp;
+			ImmReleaseContext(m_hWnd, himc);
+			bump_cursor();
+			return 0;
 		}
+		// 미완성 조합(GCS_COMPSTR 등)은 시스템 기본 인라인 표시에 맡긴다.
+		ImmReleaseContext(m_hWnd, himc);
+		bump_cursor();
+		return Default();
 	}
 
-	ImmReleaseContext(m_hWnd, himc);
-
-	rebuild_scr_lines();
-	scroll_to_bottom();
-	update_scrollbar();
+	// 입력 싱크가 없는 읽기 전용 뷰어 모드에서는 로컬 조합 편집을 하지 않는다.
+	// 조합 표시는 시스템 기본 인라인에 맡긴다.
 	bump_cursor();
-	Invalidate();
-	return 0;   // 기본 인라인 조합 그리기를 막고 우리가 직접 그린다.
+	return Default();
 }
 
 LRESULT CConBox::OnImeEnd(WPARAM w, LPARAM l)
 {
-	// 조합이 결과 없이 끝난 경우(ESC 취소 등) 삽입해 두었던 조합 글자를 제거해 원상 복구한다.
-	// 정상 확정 시엔 직전 GCS_RESULTSTR 처리에서 이미 비워졌으므로 여기서는 할 일이 없다.
-	if (!ime_comp.empty()) {
-		clear_ime_comp();
-		rebuild_scr_lines();
-		update_scrollbar();
-	}
-	// 조합이 끝났으니 본문 블록 커서가 보이는 상태에서 깜빡임을 재개한다.
+	// 로컬 버퍼에 삽입한 조합 글자가 없으므로(조합 표시는 시스템 기본 인라인에 맡긴다)
+	// 정리할 것이 없다. 조합이 끝났으니 본문 블록 커서 깜빡임을 재개하고 기본 처리에 맡긴다.
 	bump_cursor();
-	Invalidate();
-	return 0;
+	return Default();
 }
 
 LRESULT CConBox::OnImeNotify(WPARAM w, LPARAM l)
@@ -1238,525 +1640,254 @@ LRESULT CConBox::OnImeNotify(WPARAM w, LPARAM l)
 	return res;
 }
 
-void CConBox::hit_test(CPoint pt, int& out_log, int& out_col) const
+// 입력 싱크(터미널/raw 모드)를 지정/해제한다.
+void CConBox::set_input_sink(void (*sink)(const char* bytes, int len, void* user), void* user)
 {
-	out_log = 0;
-	out_col = 0;
-	if (scr_lines.empty())
+	input_sink = sink;
+	input_sink_user = user;
+}
+
+// 리사이즈 싱크(터미널/raw 모드)를 지정/해제한다.
+void CConBox::set_resize_sink(void (*sink)(int cols, int rows, void* user), void* user)
+{
+	resize_sink = sink;
+	resize_sink_user = user;
+}
+
+// 터미널 모드에서 UTF-8 바이트열을 그대로 입력 싱크로 보낸다.
+void CConBox::send_input_bytes(const char* bytes, int len)
+{
+	if (input_sink != nullptr && bytes != nullptr && len > 0)
+		input_sink(bytes, len, input_sink_user);
+}
+
+// 터미널 모드에서 UTF-16 글자들을 UTF-8 로 변환해 입력 싱크로 보낸다. (문자/IME 확정 글자용)
+void CConBox::send_input_wide(const wchar_t* ws, int n)
+{
+	if (input_sink == nullptr || ws == nullptr || n <= 0)
 		return;
+	int bytes = ::WideCharToMultiByte(CP_UTF8, 0, ws, n, NULL, 0, NULL, NULL);
+	if (bytes <= 0)
+		return;
+	std::vector<char> buf(bytes);
+	::WideCharToMultiByte(CP_UTF8, 0, ws, n, buf.data(), bytes, NULL, NULL);
+	send_input_bytes(buf.data(), bytes);
+}
 
-	// 안쪽 여백을 뺀 좌표로 변환한다. (여백 영역을 클릭하면 0 으로 막는다.)
-	int local_y = pt.y - margin_top;
-	int local_x = pt.x - margin_left;
-	if (local_y < 0) local_y = 0;
-	if (local_x < 0) local_x = 0;
-
-	// 픽셀 y -> 화면 줄 -> 화면 줄 목록 인덱스
-	int row = (cell_h > 0) ? (local_y / cell_h) : 0;
-	int sidx = scroll_top + row;
-	if (sidx < 0) sidx = 0;
-	if (sidx >= (int)scr_lines.size()) sidx = (int)scr_lines.size() - 1;
-
-	const ScreenLine& sl = scr_lines[sidx];
-	const LogLine& line = log_buf[sl.log_idx];
-
-	// 픽셀 x -> 줄 안에서의 글자 인덱스 (칸 절반을 기준으로 앞/뒤를 가른다)
-	int target = (cell_w > 0) ? (local_x / cell_w) : 0;
-	int x = 0;
-	for (int i = sl.char_start; i < sl.char_end; ++i) {
-		if (line.chars[i].ch == L'\n')
-			break;
-		int w = line.chars[i].wide ? 2 : 1;
-		if (target < x + w) {
-			out_log = sl.log_idx;
-			out_col = (target < x + (w + 1) / 2) ? i : i + 1;
-			return;
-		}
-		x += w;
+// 터미널 모드에서 방향키/편집키 등 비문자 키를 VT 시퀀스로 인코딩해 자식에 보낸다.
+// 인쇄 가능 문자/Enter/Tab/Backspace/Esc/Ctrl+letter 는 WM_CHAR 경로(OnChar)에서 처리하므로
+// 여기서는 다루지 않는다(중복 방지). 여기서 보냈으면 true, 처리 안 했으면 false.
+bool CConBox::terminal_keydown(UINT vk, bool ctrl, bool shift)
+{
+	// Ctrl+C: 자식에 인터럽트(0x03)를 보낸다(터미널 관례).
+	// (선택 텍스트 복사는 3a-2 에서 그리드 좌표 선택을 복구할 때 함께 되살린다.)
+	if (ctrl && (vk == 'C')) {
+		send_input_bytes("\x03", 1);
+		return true;
+	}
+	// Ctrl+V: 클립보드 텍스트를 자식 stdin 으로 보낸다(bracketed paste 면 감싼다).
+	if (ctrl && (vk == 'V')) {
+		paste_clipboard();
+		return true;
+	}
+	// Shift+Tab: 역방향 탭(backtab). 보통 메뉴/포커스 역이동에 쓴다.
+	if (vk == VK_TAB && shift) {
+		send_input_bytes("\x1b[Z", 3);
+		return true;
 	}
 
-	// 줄 끝을 넘겨 클릭하면 그 화면 줄의 끝 위치로 둔다.
-	out_log = sl.log_idx;
-	out_col = sl.char_end;
-}
+	// 수정자 코드. xterm 규약은 파라미터로 1 + Shift(1) + Alt(2) + Ctrl(4) 를 보낸다.
+	// (여기서는 Shift/Ctrl 만 다룬다. 수정자가 있으면 ESC[1;{mod}{최종문자} 형식을 쓴다.)
+	int mod = (shift ? 1 : 0) + (ctrl ? 4 : 0);
 
-void CConBox::get_sel_range(int& slog, int& scol, int& elog, int& ecol) const
-{
-	// 두 끝점을 앞->뒤 순서로 정렬한다.
-	bool a_first = (sel_a_log < sel_c_log)
-		|| (sel_a_log == sel_c_log && sel_a_col <= sel_c_col);
-	if (a_first) {
-		slog = sel_a_log; scol = sel_a_col;
-		elog = sel_c_log; ecol = sel_c_col;
-	} else {
-		slog = sel_c_log; scol = sel_c_col;
-		elog = sel_a_log; ecol = sel_a_col;
+	// 방향키/Home/End 는 최종 문자(A/B/C/D/H/F)로 인코딩한다. 수정자가 없으면 앱 커서 키 모드
+	// (DECCKM)에 따라 ESC[ 또는 ESC O 접두사를 쓴다. 수정자가 있으면 ESC[1;{mod} 형식이다.
+	char fin = 0;
+	switch (vk) {
+	case VK_UP:    fin = 'A'; break;
+	case VK_DOWN:  fin = 'B'; break;
+	case VK_RIGHT: fin = 'C'; break;
+	case VK_LEFT:  fin = 'D'; break;
+	case VK_HOME:  fin = 'H'; break;
+	case VK_END:   fin = 'F'; break;
+	default: break;
 	}
-}
-
-bool CConBox::pos_selected(int log, int idx) const
-{
-	int slog, scol, elog, ecol;
-	get_sel_range(slog, scol, elog, ecol);
-
-	// (log, idx) 가 [시작, 끝) 범위에 드는지 (논리 줄, 글자) 순서로 비교한다.
-	bool after_start = (log > slog) || (log == slog && idx >= scol);
-	bool before_end = (log < elog) || (log == elog && idx < ecol);
-	return after_start && before_end;
-}
-
-std::wstring CConBox::collect_selection() const
-{
-	int slog, scol, elog, ecol;
-	get_sel_range(slog, scol, elog, ecol);
-
-	std::wstring out;
-	for (int li = slog; li <= elog && li < (int)log_buf.size(); ++li) {
-		const LogLine& line = log_buf[li];
-		int n = (int)line.chars.size();
-		int from = (li == slog) ? scol : 0;
-		int to = (li == elog) ? ecol : n;
-		if (from < 0) from = 0;
-		if (to > n) to = n;
-
-		for (int i = from; i < to; ++i)
-			out.push_back(line.chars[i].ch);   // 소프트 줄바꿈 마커(L'\n')도 그대로
-
-		// 논리 줄 사이에는 줄바꿈을 넣는다.
-		if (li != elog)
-			out.push_back(L'\n');
+	if (fin != 0) {
+		char buf[16];
+		int len;
+		if (mod != 0)
+			len = wsprintfA(buf, "\x1b[1;%d%c", mod + 1, fin);
+		else if (app_cursor_keys)
+			len = wsprintfA(buf, "\x1bO%c", fin);
+		else
+			len = wsprintfA(buf, "\x1b[%c", fin);
+		send_input_bytes(buf, len);
+		return true;
 	}
-	return out;
-}
 
-void CConBox::copy_selection_to_clipboard()
-{
-	if (!sel_valid)
-		return;
-
-	std::wstring s = collect_selection();
-	if (s.empty())
-		return;
-
-	if (!OpenClipboard())
-		return;
-	EmptyClipboard();
-
-	size_t bytes = (s.size() + 1) * sizeof(wchar_t);
-	HGLOBAL hmem = GlobalAlloc(GMEM_MOVEABLE, bytes);
-	if (hmem) {
-		void* dst = GlobalLock(hmem);
-		if (dst) {
-			memcpy(dst, s.c_str(), bytes);
-			GlobalUnlock(hmem);
-			SetClipboardData(CF_UNICODETEXT, hmem);
-		}
+	// 그 밖의 편집키/펑션키 -> 고정 VT 시퀀스. (수정자 조합은 claude 등에서 거의 쓰지 않아 단순화)
+	const char* seq = nullptr;
+	switch (vk) {
+	case VK_DELETE: seq = "\x1b[3~"; break;
+	case VK_INSERT: seq = "\x1b[2~"; break;
+	case VK_PRIOR:  seq = "\x1b[5~"; break;   // PageUp
+	case VK_NEXT:   seq = "\x1b[6~"; break;   // PageDown
+	case VK_F1:  seq = "\x1bOP";   break;
+	case VK_F2:  seq = "\x1bOQ";   break;
+	case VK_F3:  seq = "\x1bOR";   break;
+	case VK_F4:  seq = "\x1bOS";   break;
+	case VK_F5:  seq = "\x1b[15~"; break;
+	case VK_F6:  seq = "\x1b[17~"; break;
+	case VK_F7:  seq = "\x1b[18~"; break;
+	case VK_F8:  seq = "\x1b[19~"; break;
+	case VK_F9:  seq = "\x1b[20~"; break;
+	case VK_F10: seq = "\x1b[21~"; break;
+	case VK_F11: seq = "\x1b[23~"; break;
+	case VK_F12: seq = "\x1b[24~"; break;
+	default: break;
 	}
-	CloseClipboard();
+	if (seq != nullptr) {
+		send_input_bytes(seq, (int)strlen(seq));
+		return true;
+	}
+	return false;
 }
 
-void CConBox::paste_from_clipboard()
+void CConBox::paste_clipboard()
 {
-	if (log_buf.empty())
+	// 클립보드의 유니코드 텍스트를 자식 stdin 으로 보낸다. bracketed paste 모드면 앞뒤를
+	// ESC[200~ / ESC[201~ 로 감싸 자식이 "붙여넣기 덩어리"를 한 번에 처리하게 한다.
+	if (input_sink == nullptr)
 		return;
-	if (!IsClipboardFormatAvailable(CF_UNICODETEXT))
+	if (!::OpenClipboard(m_hWnd))
 		return;
-	if (!OpenClipboard())
-		return;
-
-	HANDLE hmem = GetClipboardData(CF_UNICODETEXT);
-	if (hmem) {
-		const wchar_t* src = (const wchar_t*)GlobalLock(hmem);
-		if (src) {
-			// 커서 위치(편집 영역)에 글자를 끼워 넣는다.
-			// 줄바꿈은 소프트 줄바꿈으로 넣어 현재 입력 줄 안에 머무르게 한다.
-			for (const wchar_t* p = src; *p != L'\0'; ++p) {
-				wchar_t c = *p;
-				if (c == L'\r')
-					continue;
-				if (c == L'\n')
-					insert_wchar(L'\n');
-				else
-					insert_wchar(c);
-			}
-			GlobalUnlock(hmem);
+	HANDLE h = ::GetClipboardData(CF_UNICODETEXT);
+	if (h != NULL) {
+		const wchar_t* p = (const wchar_t*)::GlobalLock(h);
+		if (p != NULL) {
+			if (bracketed_paste)
+				send_input_bytes("\x1b[200~", 6);
+			send_input_wide(p, (int)wcslen(p));
+			if (bracketed_paste)
+				send_input_bytes("\x1b[201~", 6);
+			::GlobalUnlock(h);
 		}
 	}
-	CloseClipboard();
-
-	sel_valid = false;
-	rebuild_scr_lines();
-	scroll_to_bottom();
-	update_scrollbar();
-	Invalidate();
+	::CloseClipboard();
 }
 
-void CConBox::OnLButtonDown(UINT f, CPoint p)
+bool CConBox::finalize_composition()
 {
-	// 클릭하면 포커스를 가져오고 선택의 고정점을 정한다.
-	SetFocus();
+	// 한글 IME 조합 중이면 강제로 확정(완성)시킨다. CPS_COMPLETE 는 동기적으로
+	// WM_IME_COMPOSITION(GCS_RESULTSTR)을 디스패치하므로, 이 함수가 반환하기 전에 OnImeComp 가
+	// 완성 글자의 UTF-8 을 자식에 먼저 보낸다. 그래서 트리거 키 전송 직전에 부르면 "제자리 완성
+	// 후 트리거" 순서가 보장된다(요구사양서 3.1).
+	//
+	// 한글 IME 가 방향키 등으로 조합을 스스로 먼저 확정하는 경우도 있는데(WM_IME_COMPOSITION 이
+	// WM_KEYDOWN 보다 먼저 옴), 그때는 이 함수 시점에 조합이 남아 있지 않아 no-op 이 된다(안전망).
+	// 어느 경로든 완성분이 트리거보다 먼저 전송된다. 중복 확정 메시지는 OnImeComp 가 빈
+	// RESULTSTR(n==0)을 걸러 이중 전송되지 않는다.
+	HIMC himc = ImmGetContext(m_hWnd);
+	if (himc == NULL)
+		return false;
 
-	int log, col;
-	hit_test(p, log, col);
-	sel_a_log = sel_c_log = log;
-	sel_a_col = sel_c_col = col;
-	sel_valid = false;   // 아직 드래그 전이므로 선택 없음
-	selecting = true;
-	SetCapture();
-	Invalidate();
-}
-
-void CConBox::OnLButtonDblClk(UINT f, CPoint p)
-{
-	// 더블클릭한 위치의 단어를 선택해 클립보드로 복사한다.
-	// 단어는 공백으로 끊되, 영문/한글/특수문자가 섞이지 않도록 같은 부류끼리만 묶는다.
-	SetFocus();
-
-	int log, col;
-	hit_test(p, log, col);
-	if (log < 0 || log >= (int)log_buf.size())
-		return;
-
-	const LogLine& line = log_buf[log];
-	int len = (int)line.chars.size();
-	if (len == 0)
-		return;
-
-	// hit_test 는 삽입 위치(글자 경계)를 주므로 실제 클릭된 글자 인덱스로 보정한다.
-	int idx = col;
-	if (idx >= len)
-		idx = len - 1;
-
-	// 칸 우측 절반을 눌러 다음 글자로 반올림된 경우, 바로 앞 글자가 단어이면 그쪽을 택한다.
-	if (CharClass(line.chars[idx].ch) == 0 && idx > 0 && CharClass(line.chars[idx - 1].ch) != 0)
-		idx--;
-
-	// 공백 등 구분자를 더블클릭하면 선택할 단어가 없다.
-	int cls = CharClass(line.chars[idx].ch);
-	if (cls == 0)
-		return;
-
-	// 같은 부류가 연속되는 구간을 좌우로 넓힌다. (구분자/다른 부류에서 자동으로 멈춘다.)
-	int start = idx;
-	while (start > 0 && CharClass(line.chars[start - 1].ch) == cls)
-		start--;
-	int end = idx + 1;   // [start, end) 가 선택 범위
-	while (end < len && CharClass(line.chars[end].ch) == cls)
-		end++;
-
-	// 선택 영역을 설정한다. (렌더링/복사는 기존 선택 경로를 그대로 쓴다.)
-	sel_a_log = sel_c_log = log;
-	sel_a_col = start;
-	sel_c_col = end;
-	sel_valid = true;
-
-	// 더블클릭의 첫 클릭에서 켜진 드래그 상태가 이후 마우스 이동으로 단어 선택을 덮어쓰지
-	// 않도록 해제한다.
-	selecting = false;
-	if (GetCapture() == this)
-		ReleaseCapture();
-
-	copy_selection_to_clipboard();
-	Invalidate();
-}
-
-void CConBox::OnMouseMove(UINT f, CPoint p)
-{
-	if (!selecting)
-		return;
-
-	int log, col;
-	hit_test(p, log, col);
-	sel_c_log = log;
-	sel_c_col = col;
-	// 고정점과 달라지면 유효한 선택으로 본다.
-	sel_valid = (sel_a_log != sel_c_log) || (sel_a_col != sel_c_col);
-	Invalidate();
-}
-
-void CConBox::OnLButtonUp(UINT f, CPoint p)
-{
-	if (!selecting)
-		return;
-	selecting = false;
-	ReleaseCapture();
-
-	if (sel_valid) {
-		// 드래그로 선택된 텍스트가 있으면 자동으로 클립보드에 복사한다. (커서는 옮기지 않는다)
-		copy_selection_to_clipboard();
+	bool had = false;
+	LONG bytes = ImmGetCompositionStringW(himc, GCS_COMPSTR, NULL, 0);
+	if (bytes > 0) {
+		// 조합 중인 글자가 있다 -> 강제 확정. (동기적으로 WM_IME_COMPOSITION 이 처리된다.)
+		ImmNotifyIME(himc, NI_COMPOSITIONSTR, CPS_COMPLETE, 0);
+		had = true;
 	}
-	else {
-		// 드래그 없는 단순 클릭: 입력(편집) 영역을 눌렀으면 커서를 그 위치로 옮긴다.
-		// 다운 시점 위치(sel_a_*)를 쓴다(드래그가 없었으므로 sel_c 와 같다).
-		// 편집 영역은 edit_log 논리 줄의 edit_col 부터 끝까지이며, Shift+Enter 로 생긴 여러
-		// 화면 줄도 모두 같은 edit_log 에 속한다. 읽기전용 출력 영역(다른 논리 줄) 클릭은
-		// 무시한다. 줄 끝을 지난 클릭은 hit_test 가 이미 그 줄 끝으로 잡아 두었다.
-		if (sel_a_log == edit_log) {
-			cur_log = edit_log;
-			cur_col = (sel_a_col < edit_col) ? edit_col : sel_a_col;  // 편집 경계 이전으로는 못 감
-			desired_vx = -1;                                         // 끈적 열 초기화
-			bump_cursor();                                           // 커서 즉시 표시
-		}
-	}
-	Invalidate();
-}
-
-void CConBox::OnRButtonDown(UINT f, CPoint p)
-{
-	// 우클릭: 포커스를 가져오고 커서 위치에 붙여넣는다.
-	SetFocus();
-	paste_from_clipboard();
-}
-
-void CConBox::insert_wchar(wchar_t wc)
-{
-	// 글자가 들어오면 세로 이동의 끈적 열 기억을 초기화한다. (타이핑/IME 확정/붙여넣기/Tab 공백 포괄)
-	desired_vx = -1;
-
-	// 커서 위치에 글자를 끼워 넣는다. (덮어쓰지 않는다)
-	CharInfo c;
-	c.ch = wc;
-	c.fg = cur_fg;
-	c.bg = cur_bg;
-	c.wide = IsWideChar(wc);
-
-	LogLine& line = log_buf[cur_log];
-	if (cur_col > (int)line.chars.size())
-		cur_col = (int)line.chars.size();
-	line.chars.insert(line.chars.begin() + cur_col, c);
-	cur_col++;
+	ImmReleaseContext(m_hWnd, himc);
+	return had;
 }
 
 void CConBox::OnChar(UINT ch, UINT rep, UINT flags)
 {
-	// 제어문자(Enter, Tab, Backspace 등)는 OnKeyDown 에서 처리하므로 무시한다.
-	if (ch < 0x20 || ch == 0x7F)
+	// 터미널(raw) 모드: 로컬 편집/에코 없이 문자/제어문자를 자식에게 바이트로 보낸다.
+	// (WM_CHAR 는 키보드 레이아웃/IME 를 거친 결과라 인쇄 문자·제어문자 전송에 알맞다.)
+	if (input_sink != nullptr) {
+		for (UINT k = 0; k < rep; ++k) {
+			if (ch == 0x08) {
+				// Backspace 는 DEL(0x7F)로 보낸다(readline/유닉스 계열 관례).
+				send_input_bytes("\x7f", 1);
+			}
+			else if (ch == L'\r' || ch == L'\n') {
+				// Enter 는 CR(0x0D)로 보낸다.
+				send_input_bytes("\r", 1);
+			}
+			else if (ch < 0x80) {
+				// 인쇄 가능 ASCII + 그 밖의 제어문자(Tab=0x09, Esc=0x1B, Ctrl+letter 등)는 1바이트로.
+				char b = (char)ch;
+				send_input_bytes(&b, 1);
+			}
+			else {
+				// 한글 등 비ASCII(완성형 글자, IME 확정분 포함)는 UTF-8 로 변환해 보낸다.
+				wchar_t wc = (wchar_t)ch;
+				send_input_wide(&wc, 1);
+			}
+		}
+		bump_cursor();
 		return;
-	if (log_buf.empty())
-		return;
+	}
 
-	// 글자를 입력하면 기존 선택 표시는 해제한다.
-	sel_valid = false;
-
-	for (UINT k = 0; k < rep; ++k)
-		insert_wchar((wchar_t)ch);
-
-	rebuild_scr_lines();
-	scroll_to_bottom();
-	update_scrollbar();
-	bump_cursor();
-	Invalidate();
+	// 입력 싱크가 없는 읽기 전용 뷰어 모드에서는 로컬 편집/에코를 하지 않는다.
 }
 
 void CConBox::OnKeyDown(UINT vk, UINT rep, UINT flags)
 {
-	if (log_buf.empty()) {
-		CWnd::OnKeyDown(vk, rep, flags);
+	// 터미널(raw) 모드: 방향키/편집키는 VT 시퀀스로 자식에 보내고, 인쇄 문자/Enter/Backspace/
+	// Tab/Esc 등은 WM_CHAR(OnChar) 경로에 맡긴다(중복 방지). 로컬 줄편집은 하지 않는다.
+	if (input_sink != nullptr) {
+		bool tctrl = (::GetKeyState(VK_CONTROL) & 0x8000) != 0;
+		bool tshift = (::GetKeyState(VK_SHIFT) & 0x8000) != 0;
+
+		// 조합 종료 트리거 키(방향키/Home/End/Delete/Insert/Page/Enter/Tab/Esc)면 먼저 IME
+		// 조합을 강제 확정해, 완성 글자가 트리거 키보다 먼저 자식에 전송되게 한다(요구사양서 3.1).
+		switch (vk) {
+		case VK_LEFT: case VK_RIGHT: case VK_UP: case VK_DOWN:
+		case VK_HOME: case VK_END: case VK_DELETE: case VK_INSERT:
+		case VK_PRIOR: case VK_NEXT: case VK_RETURN: case VK_TAB: case VK_ESCAPE:
+			finalize_composition();
+			break;
+		default:
+			break;
+		}
+
+		if (terminal_keydown(vk, tctrl, tshift))
+			bump_cursor();
 		return;
 	}
 
+	// 입력 싱크가 없는 읽기 전용 뷰어 모드: 로컬 줄편집은 없고 스크롤 단축키만 처리한다.
+	// (PageUp/PageDown, Ctrl+Home/End. 그 밖의 키는 기본 처리에 맡긴다.)
+	// 대체 화면에서는 스크롤백 보기가 동결되므로 스크롤 단축키도 기본 처리에 맡긴다.
+	if (alt_active) {
+		CWnd::OnKeyDown(vk, rep, flags);
+		return;
+	}
 	bool ctrl = (::GetKeyState(VK_CONTROL) & 0x8000) != 0;
-	bool shift = (::GetKeyState(VK_SHIFT) & 0x8000) != 0;
+	int maxtop = (int)scrollback.size();
+	if (maxtop < 0) maxtop = 0;
 
-	// Ctrl+C: 복사, Ctrl+V: 붙여넣기. (복사는 선택을 지우지 않는다.)
-	if (ctrl && (vk == 'C' || vk == 'c')) {
-		copy_selection_to_clipboard();
-		return;
-	}
-	if (ctrl && (vk == 'V' || vk == 'v')) {
-		paste_from_clipboard();
-		return;
-	}
-
-	// 그 밖의 키 조작은 선택 표시를 해제한다.
-	sel_valid = false;
-
-	// 위/아래 화살표가 아닌 동작은 세로 이동의 끈적 열 기억을 초기화한다.
-	// (좌/우, Home/End, Back/Delete, Tab, Enter, 그 밖의 키 모두 포함)
-	if (vk != VK_UP && vk != VK_DOWN)
-		desired_vx = -1;
-
-	LogLine& line = log_buf[cur_log];
-	int len = (int)line.chars.size();
-
+	int nt = view_top;
 	switch (vk) {
-	case VK_LEFT:
-		// 편집 경계 이전으로는 갈 수 없다.
-		if (cur_col > edit_col)
-			cur_col--;
-		break;
-
-	case VK_RIGHT:
-		if (cur_col < len)
-			cur_col++;
-		break;
-
-	case VK_UP:
-		// 위 화면 줄로 이동한다. (switch 뒤의 맨 아래 강제 스크롤을 타지 않도록 return)
-		move_cursor_row(-1);
-		return;
-
-	case VK_DOWN:
-		// 아래 화면 줄로 이동한다.
-		move_cursor_row(+1);
-		return;
-
-	case VK_HOME:
-		if (ctrl) {
-			// Ctrl+Home: 버퍼 맨 위로 스크롤만 한다. (커서는 그대로)
-			scroll_top = 0;
-			update_scrollbar();
-			Invalidate();
-			return;
-		}
-		cur_col = edit_col;
-		break;
-
-	case VK_END:
-		if (ctrl) {
-			// Ctrl+End: 맨 아래로 스크롤만 한다.
-			scroll_to_bottom();
-			update_scrollbar();
-			Invalidate();
-			return;
-		}
-		cur_col = len;
-		break;
-
-	case VK_BACK:
-		// 편집 경계 안에서만 앞 글자를 지운다.
-		if (cur_col > edit_col) {
-			line.chars.erase(line.chars.begin() + (cur_col - 1));
-			cur_col--;
-		}
-		break;
-
-	case VK_DELETE:
-		// 커서 위치의 글자를 지운다. (편집 영역 안에서만)
-		if (cur_col >= edit_col && cur_col < len)
-			line.chars.erase(line.chars.begin() + cur_col);
-		break;
-
-	case VK_TAB: {
-		// 다음 4칸 탭 정지 위치까지 공백을 끼워 넣는다.
-		int adv = 4 - (visual_col() % 4);
-		for (int k = 0; k < adv; ++k)
-			insert_wchar(L' ');
-		break;
-	}
-
-	case VK_RETURN:
-		if (shift)
-			insert_wchar(L'\n');   // Shift+Enter: 소프트 줄바꿈(미확정)
-		else
-			commit_input();        // Enter: 입력 확정 + 콜백
-		break;
-
+	case VK_PRIOR: nt -= rows; break;   // PageUp
+	case VK_NEXT:  nt += rows; break;   // PageDown
+	case VK_HOME:  if (!ctrl) { CWnd::OnKeyDown(vk, rep, flags); return; } nt = 0; break;
+	case VK_END:   if (!ctrl) { CWnd::OnKeyDown(vk, rep, flags); return; } nt = maxtop; break;
 	default:
-		// 그 밖의 키는 기본 처리에 맡긴다.
 		CWnd::OnKeyDown(vk, rep, flags);
 		return;
 	}
 
-	rebuild_scr_lines();
-	scroll_to_bottom();
-	update_scrollbar();
-	bump_cursor();
-	Invalidate();
-}
-
-void CConBox::commit_input()
-{
-	// 편집 영역(edit_col 부터 줄 끝까지)의 글자를 모아 콜백 문자열을 만든다.
-	// 소프트 줄바꿈 마커(L'\n')도 그대로 담아 \n 으로 전달한다.
-	std::wstring w;
-	{
-		LogLine& line = log_buf[edit_log];
-		for (int i = edit_col; i < (int)line.chars.size(); ++i)
-			w.push_back(line.chars[i].ch);
+	if (nt < 0) nt = 0;
+	if (nt > maxtop) nt = maxtop;
+	if (nt != view_top) {
+		view_top = nt;
+		update_scrollbar();
+		Invalidate();
 	}
-
-	// 입력 내용은 버퍼에 그대로 남아 읽기전용이 되고, 새 논리 줄로 이동한다.
-	log_buf.push_back(LogLine());
-	cur_log = (int)log_buf.size() - 1;
-	cur_col = 0;
-	edit_log = cur_log;
-	edit_col = 0;
-
-	rebuild_scr_lines();
-	scroll_to_bottom();
-	update_scrollbar();
-	bump_cursor();
-	Invalidate();
-
-	// 콜백을 호출한다. 콜백이 print() 를 불러도 안전하도록 모든 상태 갱신 뒤에 부른다.
-	if (on_enter != nullptr) {
-		int len = ::WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), NULL, 0, NULL, NULL);
-		std::vector<char> u8(len + 1, 0);
-		if (len > 0)
-			::WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), u8.data(), len, NULL, NULL);
-		on_enter(u8.data());
-	}
-}
-
-void CConBox::move_cursor_row(int dir)
-{
-	// 커서가 보이는 화면 줄과 그 안에서의 가로 칸(vx)을 구한다.
-	int row, vx;
-	if (!cursor_screen_pos(row, vx))
-		return;
-	int sidx = row + scroll_top;
-
-	// 목표 화면 줄. 범위를 벗어나거나 현재 입력 중인 논리 줄(cur_log)이 아니면 이동하지 않는다.
-	// (이미 확정된 윗줄이나 다른 논리 줄로는 넘어가지 않는다.)
-	int tidx = sidx + dir;
-	if (tidx < 0 || tidx >= (int)scr_lines.size())
-		return;
-	const ScreenLine& t = scr_lines[tidx];
-	if (t.log_idx != cur_log)
-		return;
-	// 목표 줄이 전부 편집 경계 이전(읽기전용)이면 이동하지 않는다.
-	if (t.char_end <= edit_col)
-		return;
-
-	// 끈적 열: 세로 이동을 처음 시작할 때의 가로 칸을 기억해 그대로 목표로 쓴다.
-	if (desired_vx < 0)
-		desired_vx = vx;
-	int want = desired_vx;
-
-	// 목표 줄에서 want 칸에 해당하는 글자 인덱스를 찾는다. (마우스 클릭의 hit_test 와 같은 규칙)
-	// 줄 끝(소프트 줄바꿈 마커 또는 줄 끝)을 넘으면 줄 끝으로 보정한다.
-	const LogLine& line = log_buf[t.log_idx];
-	int col = t.char_end;
-	int x = 0;
-	for (int i = t.char_start; i < t.char_end; ++i) {
-		if (line.chars[i].ch == L'\n') {
-			col = i;
-			break;
-		}
-		int w = line.chars[i].wide ? 2 : 1;
-		if (want < x + w) {
-			col = (want < x + (w + 1) / 2) ? i : i + 1;
-			break;
-		}
-		x += w;
-	}
-
-	// 편집 경계 이전으로는 갈 수 없다.
-	if (col < edit_col)
-		col = edit_col;
-
-	cur_col = col;   // 논리 줄(cur_log)은 그대로다.
-
-	// 목표 줄이 화면 밖이면 보이도록 스크롤을 맞춘다.
-	if (tidx < scroll_top)
-		scroll_top = tidx;
-	else if (tidx >= scroll_top + rows)
-		scroll_top = tidx - rows + 1;
-
-	update_scrollbar();
-	bump_cursor();
-	Invalidate();
 }
 
 // 더블 버퍼링용 메모리 DC/비트맵을 (필요하면) 준비한다.
@@ -1811,135 +1942,94 @@ void CConBox::OnPaint()
 	UINT old_align = dc.SetTextAlign(TA_LEFT | TA_BASELINE);
 	CFont* old_font = dc.SelectObject(&efont);
 
-	// 화면에 보이는 줄들을 위에서 아래로 그린다.
+	// 화면에 보이는 줄들을 위에서 아래로 그린다. (scrollback + screen 통합 인덱스 view_top+row)
+	int total = (int)scrollback.size() + rows;
 	for (int row = 0; row < rows; ++row) {
-		int sidx = scroll_top + row;
-		if (sidx < 0 || sidx >= (int)scr_lines.size())
+		int idx = view_top + row;
+		if (idx < 0 || idx >= total)
 			break;
 
-		const ScreenLine& sl = scr_lines[sidx];
-		const LogLine& line = log_buf[sl.log_idx];
+		const Row& line = line_at(idx);
 
-		int x = 0;   // 현재 줄에서의 가로 칸 위치
-		for (int i = sl.char_start; i < sl.char_end; ++i) {
-			const CharInfo& c = line.chars[i];
+		int ncell = (int)line.size();
+		if (ncell > cols) ncell = cols;
 
-			// 소프트 줄바꿈 마커는 그리지 않는다. (폭도 차지하지 않음)
-			if (c.ch == L'\n')
-				continue;
-
+		// 칸 인덱스(i)가 곧 가로 칸 좌표다. 2배 폭 글자는 다음 칸(trail)을 함께 칠하고 건너뛴다.
+		for (int i = 0; i < ncell; ++i) {
+			const CharInfo& c = line[i];
 			int w = c.wide ? 2 : 1;
 
-			int px = margin_left + x * cell_w;
+			int px = margin_left + i * cell_w;
 			int py = margin_top + row * cell_h;
 
-			// 선택된 글자는 전경색과 배경색을 뒤집어 강조한다.
 			COLORREF fg = c.fg;
 			COLORREF bg = c.bg;
-			if (sel_valid && pos_selected(sl.log_idx, i)) {
-				fg = c.bg;
-				bg = c.fg;
-			}
 
-			// 칸 배경을 칠한다. (기본 배경과 다를 수 있으므로 항상 칠한다.)
+			// 칸 배경을 칠한다. (2배 폭이면 두 칸을 함께 칠한다.)
 			CRect cell(px, py, px + w * cell_w, py + cell_h);
 			dc.FillSolidRect(cell, bg);
 
-			// 블록/박스 문자는 (수준에 따라) 폰트 대신 도형으로 칸에 직접 칠해 칸 틈을 없앤다.
-			// 그 밖의 글자는 폰트로 그린다. 2배 폭 글자는 한글 폰트, 그 외는 영문 폰트.
-			bool drawn = false;
-			if (glyph_level >= 1)
-				drawn = DrawBlockElement(dc, c.ch, px, py, cell_w, cell_h, fg);
-			if (!drawn && glyph_level >= 2)
-				drawn = DrawBoxLine(dc, c.ch, px, py, cell_w, cell_h, fg);
-			if (!drawn) {
-				// 기준선 정렬이므로 세로 위치는 칸 위쪽 + 기준선만큼 내린 곳이다.
-				dc.SelectObject(c.wide ? &kfont : &efont);
-				dc.SetTextColor(fg);
-				dc.TextOutW(px, py + cell_base, &c.ch, 1);
+			// 빈 칸(공백)과 2배 폭의 trail 칸(ch=0)은 글자를 그리지 않는다.
+			// 그 밖의 글자는 블록/박스면 도형으로, 아니면 폰트로 그린다(2배 폭은 한글 폰트).
+			if (c.ch != 0 && c.ch != L' ') {
+				bool drawn = false;
+				if (glyph_level >= 1)
+					drawn = DrawBlockElement(dc, c.ch, px, py, cell_w, cell_h, fg);
+				if (!drawn && glyph_level >= 2)
+					drawn = DrawBoxLine(dc, c.ch, px, py, cell_w, cell_h, fg);
+				if (!drawn) {
+					// 기준선 정렬이므로 세로 위치는 칸 위쪽 + 기준선만큼 내린 곳이다.
+					dc.SelectObject(c.wide ? &kfont : &efont);
+					dc.SetTextColor(fg);
+					dc.TextOutW(px, py + cell_base, &c.ch, 1);
+				}
 			}
 
-			x += w;
+			if (w == 2) ++i;   // trail 칸 건너뜀
 		}
 	}
 
 	dc.SelectObject(old_font);
 	dc.SetTextAlign(old_align);
 
-	// 커서를 그린다.
-	// IME 조합 중이 아니면(영문/평상시) 칸을 꽉 채우는 블록 커서를 그린다. 화면 밖이면
-	// 그리지 않는다. 커서 칸에 이미 글자가 있으면(방향키/Home 으로 기존 입력 위에 커서가 온
-	// 경우) 블록 위에 전경색으로 글자를 다시 그려 가려지지 않게 한다.
-	// IME 조합 중이면 채우지 않고, 조합 글자 영역을 두께 2픽셀의 속이 빈 사각형(커서색)으로
-	// 감싼다. 속은 배경색이 보이고 조합 글자는 본문과 같은 색으로 그대로 보인다.
-	// 본문(영문/평상시) 블록 커서는 cursor_on 이 true 인 동안에만 그려 깜빡인다. 깜빡임이
-	// 꺼진 프레임에서는 블록을 그리지 않으며, 본문 글자는 위에서 이미 정상으로 그려져 있다.
-	if (cursor_on && ime_comp.empty()) {
+	// 커서를 그린다. 칸을 꽉 채우는 블록 커서를 cursor_on 이고 커서가 표시 상태(cursor_visible)일
+	// 때만 그려 깜빡인다. 화면 밖이면 그리지 않는다. 커서 칸에 이미 글자가 있으면 블록 위에 전경색
+	// 으로 글자를 다시 그려 가려지지 않게 한다(한글 모드 2칸 블록이 다음 칸 글자까지 덮는 경우 포함).
+	if (cursor_on && cursor_visible) {
 		CRect cur;
 		if (get_cursor_rect(cur)) {
 			COLORREF cblk = blend_cursor_color();
 			dc.FillSolidRect(cur, cblk);
 
-			if (cur_log >= 0 && cur_log < (int)log_buf.size()) {
-				const LogLine& line = log_buf[cur_log];
+			if (cur_row >= 0 && cur_row < (int)screen.size()) {
+				const Row& line = screen[cur_row];
 
-				// 블록이 덮는 영역에 걸친 글자들을 cur_col 부터 차례로 다시 그려 가려지지 않게 한다.
-				// 한글 입력 모드의 2칸 블록은 다음 칸의 글자(또는 한글의 왼쪽 절반)까지 덮으므로
-				// cur_col 한 글자만이 아니라 블록 폭에 걸친 글자들을 모두 그려야 한다.
-				// 블록 밖으로 삐져나온 부분(두 번째 칸 한글의 오른쪽 절반 등)은 본문이 이미 제
-				// 색으로 그려 두었으므로, 블록 사각형으로 클리핑해 블록 안쪽만 전경색으로 덮는다.
+				// 블록이 덮는 칸의 글자를 cur_col 부터 차례로 다시 그려 가려지지 않게 한다.
+				// 블록 밖으로 삐져나온 부분은 본문이 이미 제 색으로 그렸으므로, 블록 사각형으로
+				// 클리핑해 블록 안쪽만 전경색으로 덮는다.
 				int saved = dc.SaveDC();
 				dc.IntersectClipRect(&cur);
-				// 글자 그리기는 본문과 같은 기준선(TA_BASELINE) 정렬로 맞춘다.
 				dc.SetTextAlign(TA_LEFT | TA_BASELINE);
 				dc.SetBkMode(TRANSPARENT);
 				dc.SetTextColor(cur_fg);
 
 				int x = cur.left;
-				for (int idx = cur_col; idx < (int)line.chars.size() && x < cur.right; ++idx) {
-					const CharInfo& cc = line.chars[idx];
-					// 소프트 줄바꿈 마커는 글자가 아니므로 그리지 않고 멈춘다.
-					if (cc.ch == L'\n')
-						break;
-					dc.SelectObject(cc.wide ? &kfont : &efont);
-					// 블록/박스 문자는 도형으로 직접 칠하고(폰트는 위에서 이미 선택되었지만 출력은 생략),
-						// 그 밖의 글자만 폰트로 출력한다.
+				for (int i = cur_col; i < (int)line.size() && x < cur.right; ++i) {
+					const CharInfo& cc = line[i];
+					int w = cc.wide ? 2 : 1;
+					if (cc.ch != 0 && cc.ch != L' ') {
+						dc.SelectObject(cc.wide ? &kfont : &efont);
 						bool cdrawn = (glyph_level >= 1 && DrawBlockElement(dc, cc.ch, x, cur.top, cell_w, cell_h, cur_fg))
 						           || (glyph_level >= 2 && DrawBoxLine(dc, cc.ch, x, cur.top, cell_w, cell_h, cur_fg));
 						if (!cdrawn)
 							dc.TextOutW(x, cur.top + cell_base, &cc.ch, 1);
-					x += (cc.wide ? 2 : 1) * cell_w;
+					}
+					x += w * cell_w;
 				}
 
 				// SaveDC 이전 상태(폰트/정렬/클립)로 한 번에 원복한다.
 				dc.RestoreDC(saved);
 			}
-		}
-	}
-	else if (!ime_comp.empty()) {
-		// IME 조합 중: 조합 글자 영역을 속이 빈 사각형(테두리만)으로 표시한다. 조합 중에는
-		// 깜빡이지 않으므로 cursor_on 과 무관하게 항상 그린다.
-		// 커서는 조합 시작점(cur_col == ime_anchor)에 있으므로 그 위치에서 조합 글자
-		// 전체의 시각 폭만큼을 감싼다.
-		int row, vx;
-		if (cursor_screen_pos(row, vx) && row >= 0 && row < rows) {
-			int cw = 0;
-			for (size_t k = 0; k < ime_comp.size(); ++k)
-				cw += IsWideChar(ime_comp[k]) ? 2 : 1;
-			if (cw < 1)
-				cw = 1;
-
-			int px = margin_left + vx * cell_w;
-			int py = margin_top + row * cell_h;
-			int rw = cw * cell_w;
-			int rh = cell_h;
-
-			COLORREF cblk = blend_cursor_color();
-			const int t = 2;   // 테두리 두께(픽셀)
-			dc.FillSolidRect(px, py, rw, t, cblk);            // 위
-			dc.FillSolidRect(px, py + rh - t, rw, t, cblk);   // 아래
-			dc.FillSolidRect(px, py, t, rh, cblk);            // 왼쪽
-			dc.FillSolidRect(px + rw - t, py, t, rh, cblk);   // 오른쪽
 		}
 	}
 

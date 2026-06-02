@@ -5,6 +5,7 @@
 #pragma once
 
 #include "../Source/ConBox.h"   // 데모에서 사용할 ConBox 컨트롤
+#include "../Source/ConExe.h"   // 데모에서 자식 프로그램을 실행할 ConExe 실행기
 
 
 // CConBoxDlg 대화 상자
@@ -28,6 +29,7 @@ protected:
 	HICON m_hIcon;
 
 	CConBox con_box;   // 데모용 ConBox 컨트롤 인스턴스
+	CConExe con_exe;   // 데모용 ConExe 실행기 (M1 검증: cmd /c dir 출력을 ConBox 로 흘림)
 
 	// 생성된 메시지 맵 함수
 	virtual BOOL OnInitDialog();
@@ -42,4 +44,8 @@ protected:
 	// ConBox 가 가로 cols 칸 x 세로 rows 줄(영문 기준)이 되도록 메인 창 크기를
 	// 다시 잡고, 작업 영역 중앙으로 옮긴다. open() 이후(셀 크기 확정 후) 호출한다.
 	void resize_to_grid(int cols, int rows);
+
+	// ConExe 자식(powershell)이 종료되면 호출되는 콜백(set_exit_callback 으로 등록).
+	// user 로 받은 다이얼로그 인스턴스의 ConBox 에 종료 안내를 출력한다.
+	static void on_child_exit(void* user);
 };
