@@ -74,8 +74,12 @@ BOOL CConBoxDlg::OnInitDialog()
 		cancel->DestroyWindow();
 
 	// 폰트는 창 생성 전에 지정한다. (기본값과 동일하지만 API 사용 예시를 겸한다.)
+	// 한글은 크기를 0 으로 주어 영문 높이에 맞추는 match 모드로 둔다(기본 동작).
 	con_box.set_efont("Consolas", 13, "B");
-	con_box.set_kfont("Malgun Gothic", 13, "B");
+	con_box.set_kfont("Malgun Gothic", 0, "B");
+
+	// match 모드의 칸 폭(장평) 비율. 기본값과 동일하지만 API 사용 예시를 겸한다.
+	con_box.set_kfont_fill(0.92f, 0.7f);
 
 	// ConBox 를 자식 창으로 만든 뒤 현재 창 크기에 맞춰 배치한다.
 	// (실제 위치/크기는 layout_children() 이 정한다.)

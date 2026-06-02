@@ -1,13 +1,34 @@
 ﻿// ConBox.cpp
 //
-// CConBox 의 구현. 단계적으로 기능을 채워 나간다.
-// 현재 구현 범위: 창 생성과 배경 채우기.
+// CConBox 의 구현. 사용법만 알면 되는 경우 ConBox.h 만 읽으면 충분하다.
+// 이 파일은 동작을 "수정"할 때만 본다. 아래 목차로 필요한 함수만 찾아(Grep) 부분만 읽는다.
+//
+// === 파일 구성 (대략 이 순서) ===
+//   보조(static)   : IsWideChar, ParseFontOpts(폰트 opts 파서), CharClass(단어 분류)
+//   메시지 맵      : BEGIN_MESSAGE_MAP ... END_MESSAGE_MAP
+//   창/폰트        : open, make_font, apply_default_fonts, calc_cell_size,
+//                    set_efont, set_kfont, set_kfont_fill
+//   색상/커서 설정 : set_color, set_bg_color, set_cursor_blend, set_cursor_blink,
+//                    bump_cursor, OnTimer
+//   여백           : set_margin
+//   커서 기하      : blend_cursor_color, cursor_screen_pos, get_cursor_rect, is_hangul_mode
+//   메트릭/버퍼    : update_metrics, visual_col, put_wchar, print, rebuild_scr_lines,
+//                    scroll_to_bottom, update_scrollbar
+//   창 메시지      : OnEraseBkgnd, OnSize, OnGetDlgCode, OnVScroll, OnMouseWheel
+//   IME(한글)      : OnImeStart, clear_ime_comp, OnImeComp, OnImeEnd, OnImeNotify
+//   마우스/선택    : hit_test, get_sel_range, pos_selected, collect_selection,
+//                    copy_selection_to_clipboard, paste_from_clipboard,
+//                    OnLButtonDown, OnLButtonDblClk, OnMouseMove, OnLButtonUp, OnRButtonDown
+//   입력 편집      : insert_wchar, OnChar, OnKeyDown, commit_input, move_cursor_row
+//   그리기         : OnPaint
 
 #include "ConBox.h"
-#include "Accessories.h"
 #include <string>
 #include <imm.h>            // 한글 IME (Input Method Manager)
 #pragma comment(lib, "imm32.lib")
+
+// 커서 깜빡임 타이머 ID.
+static const UINT_PTR CURSOR_TIMER = 1;
 
 // 메시지 맵: 그리기/배경/크기/키보드/스크롤/IME 를 처리한다.
 BEGIN_MESSAGE_MAP(CConBox, CWnd)
@@ -19,6 +40,7 @@ BEGIN_MESSAGE_MAP(CConBox, CWnd)
 	ON_WM_GETDLGCODE()
 	ON_WM_VSCROLL()
 	ON_WM_MOUSEWHEEL()
+	ON_WM_TIMER()
 	ON_MESSAGE(WM_IME_STARTCOMPOSITION, &CConBox::OnImeStart)
 	ON_MESSAGE(WM_IME_COMPOSITION, &CConBox::OnImeComp)
 	ON_MESSAGE(WM_IME_ENDCOMPOSITION, &CConBox::OnImeEnd)
@@ -44,6 +66,60 @@ static bool IsWideChar(wchar_t ch)
 		|| (ch >= 0xF900 && ch <= 0xFAFF)   // CJK 호환 한자
 		|| (ch >= 0xFF00 && ch <= 0xFF60)   // 전각 영숫자/기호
 		|| (ch >= 0xFFE0 && ch <= 0xFFE6);  // 전각 통화기호 등
+}
+
+// 폰트 추가설정 문자열(opts)과 이름/크기를 LOGFONTW 로 변환한다. (make_font 전용 보조)
+//
+// name    : 폰트 이름 (UTF-8)
+// size_pt : 글자 크기 (포인트)
+// opts    : 추가설정 문자열. B=Bold, I=Italic, U=Underline, S=Strikeout, 숫자+W=Weight.
+//           숫자는 바로 뒤에 오는 속성의 값(정도)으로 쓰인다.
+// dpi_y   : 세로 방향 DPI (포인트를 픽셀 높이로 환산할 때 사용, 보통 96)
+static LOGFONTW ParseFontOpts(const char* name, float size_pt, const char* opts, int dpi_y)
+{
+	LOGFONTW lf;
+	ZeroMemory(&lf, sizeof(lf));
+
+	// 포인트 크기를 픽셀 높이로 환산한다. (픽셀 = 포인트 x DPI / 72, 가장 가까운 정수로 반올림)
+	// 소수점 포인트(예: 10.5)도 받지만 최종 높이는 정수 픽셀로 양자화된다.
+	// 음수 높이는 글자 셀(em) 높이를 기준으로 한다는 의미이다.
+	lf.lfHeight = -(LONG)(size_pt * dpi_y / 72.0f + 0.5f);
+	lf.lfWeight = FW_NORMAL;
+	lf.lfCharSet = DEFAULT_CHARSET;
+
+	// 폰트 이름(UTF-8)을 와이드 문자로 변환해 채운다.
+	if (name != nullptr)
+		::MultiByteToWideChar(CP_UTF8, 0, name, -1, lf.lfFaceName, LF_FACESIZE);
+
+	// 추가설정 문자열을 왼쪽부터 한 글자씩 해석한다.
+	// 숫자가 나오면 누적해 두었다가 바로 뒤 속성의 값으로 사용한다.
+	// 현재 값을 사용하는 속성은 W(Weight) 뿐이다.
+	int num = 0;
+	bool has_num = false;
+	for (const char* p = opts; p != nullptr && *p != '\0'; ++p) {
+		char c = *p;
+
+		if (c >= '0' && c <= '9') {
+			num = num * 10 + (c - '0');
+			has_num = true;
+			continue;
+		}
+
+		switch (c) {
+		case 'B': case 'b': lf.lfWeight = FW_BOLD; break;
+		case 'I': case 'i': lf.lfItalic = 1; break;
+		case 'U': case 'u': lf.lfUnderline = 1; break;
+		case 'S': case 's': lf.lfStrikeOut = 1; break;
+		case 'W': case 'w': if (has_num) lf.lfWeight = num; break;
+		default: break;   // 알 수 없는 기호는 무시한다.
+		}
+
+		// 한 속성을 처리했으면 누적 숫자를 비운다.
+		num = 0;
+		has_num = false;
+	}
+
+	return lf;
 }
 
 // 더블클릭 단어 선택에서 쓰는 문자 부류 판정.
@@ -110,6 +186,17 @@ CConBox::CConBox()
 	cursor_bg_weight = 6;
 	cursor_fg_weight = 4;
 
+	// match 모드에서 한 칸 폭(장평)을 정하는 비율 기본값.
+	kfill_ratio = 0.92f;
+	emin_ratio = 0.7f;
+
+	// 커서 깜빡임. 표시 상태는 일단 켜 두고, 간격은 시스템 캐럿 깜빡임 속도를 따른다.
+	// GetCaretBlinkTime 이 INFINITE 를 돌려주면(시스템에서 깜빡임을 꺼 둔 경우) 0 으로
+	// 두어 깜빡이지 않고 항상 켜 둔다.
+	cursor_on = true;
+	UINT caret = ::GetCaretBlinkTime();
+	cursor_blink_ms = (caret == INFINITE) ? 0 : (int)caret;
+
 	// 선택 상태 초기화
 	selecting = false;
 	sel_valid = false;
@@ -149,6 +236,12 @@ void CConBox::open(CWnd* parent, int x0, int y0, int x1, int y1)
 	update_metrics();
 	rebuild_scr_lines();
 	update_scrollbar();
+
+	// 윈도우 핸들이 만들어졌으니 커서 깜빡임 타이머를 시작한다.
+	// 간격이 0 이면(시스템에서 깜빡임을 끈 경우 등) 타이머 없이 항상 켜 둔다.
+	cursor_on = true;
+	if (cursor_blink_ms > 0)
+		SetTimer(CURSOR_TIMER, cursor_blink_ms, NULL);
 }
 
 void CConBox::make_font(CFont& font, LOGFONTW& lf_out, const char* name, float size, const char* opts)
@@ -165,11 +258,13 @@ void CConBox::make_font(CFont& font, LOGFONTW& lf_out, const char* name, float s
 
 void CConBox::apply_default_fonts()
 {
-	// 명세의 기본값: 영문 Consolas 13pt Bold, 한글 맑은 고딕 13pt Bold.
+	// 기본값: 영문 Consolas 13pt Bold, 한글 맑은 고딕 Bold.
+	// 한글 크기는 0(=영문 높이에 맞추는 match 모드, 생성자에서 kfont_match_efont=true)으로
+	// 두어 "size<=0 이면 match" 규칙과 일관되게 한다.
 	if (efont.GetSafeHandle() == NULL)
 		make_font(efont, efont_lf, "Consolas", 13, "B");
 	if (kfont.GetSafeHandle() == NULL)
-		make_font(kfont, kfont_lf, "Malgun Gothic", 13, "B");
+		make_font(kfont, kfont_lf, "Malgun Gothic", 0, "B");
 }
 
 void CConBox::calc_cell_size()
@@ -199,8 +294,6 @@ void CConBox::calc_cell_size()
 		// 핵심: 한글은 가로로 찌그러뜨리지 않고(자연 폭 유지, 압축하면 획이 깨진다)
 		// 높이만 영문에 맞춘다. 그런 다음 그 한글 폭에 맞춰 한 칸 폭(cell_w)을 좁혀,
 		// 한글이 두 칸을 거의 채우게 한다. 영문은 그 cell_w 로 장평(약간 좁아짐)한다.
-		const double KFILL_RATIO = 0.92;   // 한글이 채울 두 칸 폭 비율(약간의 여백)
-		const double EMIN_RATIO  = 0.7;    // 영문을 이보다 더 좁히지는 않는다(가독성 하한)
 
 		// 한글 높이 맞춤: 영문과 같은 em 으로 만들어 실제 높이를 재고, 영문 높이(eh)와
 		// 같아지도록 em 을 비례 보정한다. 폭은 자연 폭(lfWidth=0) 그대로 둔다.
@@ -230,10 +323,10 @@ void CConBox::calc_cell_size()
 		int kh = tm.tmHeight + tm.tmExternalLeading;
 		int ka = tm.tmAscent;
 
-		// 한 칸 폭을 한글 자연 폭 기준으로 정한다(두 칸이 한글의 KFILL_RATIO 만큼이 되도록).
-		// 영문은 원본보다 넓히지 않고(<=natw), 가독성 하한(EMIN_RATIO) 밑으로 좁히지도 않는다.
-		int cw = (int)(kwid / (2.0 * KFILL_RATIO) + 0.5);
-		int emin = (int)(natw * EMIN_RATIO + 0.5);
+		// 한 칸 폭을 한글 자연 폭 기준으로 정한다(두 칸이 한글의 kfill_ratio 만큼이 되도록).
+		// 영문은 원본보다 넓히지 않고(<=natw), 가독성 하한(emin_ratio) 밑으로 좁히지도 않는다.
+		int cw = (int)(kwid / (2.0 * kfill_ratio) + 0.5);
+		int emin = (int)(natw * emin_ratio + 0.5);
 		if (cw > natw) cw = natw;
 		if (cw < emin) cw = emin;
 		if (cw < 1) cw = 1;
@@ -288,17 +381,35 @@ void CConBox::set_kfont(const char* name, float size, const char* opts)
 {
 	make_font(kfont, kfont_lf, name, size, opts);
 
+	// size 가 0 이하이면 한글을 영문 높이에 맞추는 match 모드를 켜고(이때 size 는 무시된다),
+	// 양수이면 끈다. match 모드는 줄 높이(cell_h)를 바꾸므로 아래에서 그리드를 다시 잡는다.
+	kfont_match_efont = (size <= 0.0f);
+
+	// 창이 떠 있으면 칸 크기(줄 높이)가 바뀌므로 그리드/줄바꿈을 다시 계산한다.
 	if (::IsWindow(m_hWnd)) {
 		calc_cell_size();
+		update_metrics();
+		rebuild_scr_lines();
+
+		// 스크롤 위치가 범위를 벗어나면 맞춰 준다.
+		int maxtop = (int)scr_lines.size() - rows;
+		if (maxtop < 0) maxtop = 0;
+		if (scroll_top > maxtop) scroll_top = maxtop;
+
+		update_scrollbar();
 		Invalidate();
 	}
 }
 
-void CConBox::set_kfont_match_efont(bool on)
+void CConBox::set_kfont_fill(float fill_ratio, float emin_floor)
 {
-	kfont_match_efont = on;
+	// 채움 비율은 양수여야 의미가 있고, 가독성 하한은 0~1 범위여야 한다. 벗어난 값은 무시한다.
+	if (fill_ratio > 0.0f)
+		kfill_ratio = fill_ratio;
+	if (emin_floor >= 0.0f && emin_floor <= 1.0f)
+		emin_ratio = emin_floor;
 
-	// 창이 떠 있으면 칸 크기(줄 높이)가 바뀌므로 그리드/줄바꿈을 다시 계산한다.
+	// 창이 떠 있으면 칸 폭/줄 높이가 바뀔 수 있으므로 그리드/줄바꿈을 다시 계산한다.
 	if (::IsWindow(m_hWnd)) {
 		calc_cell_size();
 		update_metrics();
@@ -341,6 +452,52 @@ void CConBox::set_cursor_blend(int bg_weight, int fg_weight)
 		if (get_cursor_rect(rc))
 			InvalidateRect(&rc, FALSE);
 	}
+}
+
+void CConBox::set_cursor_blink(int interval_ms)
+{
+	if (interval_ms < 0)
+		interval_ms = 0;
+	cursor_blink_ms = interval_ms;
+
+	// 창이 있으면 기존 타이머를 끄고 다시 건다. 간격이 0 이면 깜빡임 없이 항상 켜 둔다.
+	if (::IsWindow(m_hWnd)) {
+		KillTimer(CURSOR_TIMER);
+		cursor_on = true;
+		if (cursor_blink_ms > 0)
+			SetTimer(CURSOR_TIMER, cursor_blink_ms, NULL);
+		Invalidate();
+	}
+}
+
+void CConBox::bump_cursor()
+{
+	// 커서를 즉시 보이게 하고, 타이머가 있으면 재시작해 입력/이동 직후 한 박자 동안은
+	// 커서가 확실히 보이게 한다(이 시점에 마침 꺼지는 프레임이 걸리지 않도록).
+	cursor_on = true;
+	if (::IsWindow(m_hWnd) && cursor_blink_ms > 0) {
+		KillTimer(CURSOR_TIMER);
+		SetTimer(CURSOR_TIMER, cursor_blink_ms, NULL);
+	}
+}
+
+void CConBox::OnTimer(UINT_PTR id)
+{
+	if (id == CURSOR_TIMER) {
+		// IME 조합 중에는 조합 글자에 시선이 모이도록 커서를 깜빡이지 않고 항상 켜 둔다.
+		// 그 외에는 표시 상태를 뒤집고 커서 자리만 다시 그린다.
+		if (!ime_comp.empty()) {
+			cursor_on = true;
+		}
+		else {
+			cursor_on = !cursor_on;
+			CRect rc;
+			if (get_cursor_rect(rc))
+				InvalidateRect(&rc, FALSE);
+		}
+		return;
+	}
+	CWnd::OnTimer(id);
 }
 
 void CConBox::set_margin(int top, int left, int bottom, int right)
@@ -556,6 +713,7 @@ void CConBox::print(const char* text)
 	rebuild_scr_lines();
 	scroll_to_bottom();
 	update_scrollbar();
+	bump_cursor();
 	Invalidate();
 }
 
@@ -749,6 +907,8 @@ LRESULT CConBox::OnImeStart(WPARAM w, LPARAM l)
 		}
 		ImmReleaseContext(m_hWnd, himc);
 	}
+	// 조합 시작 시 깜빡임 상태를 켜 둔다. (조합 중 커서는 깜빡이지 않고 항상 표시된다.)
+	bump_cursor();
 	return 0;
 }
 
@@ -827,6 +987,7 @@ LRESULT CConBox::OnImeComp(WPARAM w, LPARAM l)
 	rebuild_scr_lines();
 	scroll_to_bottom();
 	update_scrollbar();
+	bump_cursor();
 	Invalidate();
 	return 0;   // 기본 인라인 조합 그리기를 막고 우리가 직접 그린다.
 }
@@ -840,6 +1001,8 @@ LRESULT CConBox::OnImeEnd(WPARAM w, LPARAM l)
 		rebuild_scr_lines();
 		update_scrollbar();
 	}
+	// 조합이 끝났으니 본문 블록 커서가 보이는 상태에서 깜빡임을 재개한다.
+	bump_cursor();
 	Invalidate();
 	return 0;
 }
@@ -1104,9 +1267,23 @@ void CConBox::OnLButtonUp(UINT f, CPoint p)
 	selecting = false;
 	ReleaseCapture();
 
-	// 드래그로 선택된 텍스트가 있으면 자동으로 클립보드에 복사한다.
-	if (sel_valid)
+	if (sel_valid) {
+		// 드래그로 선택된 텍스트가 있으면 자동으로 클립보드에 복사한다. (커서는 옮기지 않는다)
 		copy_selection_to_clipboard();
+	}
+	else {
+		// 드래그 없는 단순 클릭: 입력(편집) 영역을 눌렀으면 커서를 그 위치로 옮긴다.
+		// 다운 시점 위치(sel_a_*)를 쓴다(드래그가 없었으므로 sel_c 와 같다).
+		// 편집 영역은 edit_log 논리 줄의 edit_col 부터 끝까지이며, Shift+Enter 로 생긴 여러
+		// 화면 줄도 모두 같은 edit_log 에 속한다. 읽기전용 출력 영역(다른 논리 줄) 클릭은
+		// 무시한다. 줄 끝을 지난 클릭은 hit_test 가 이미 그 줄 끝으로 잡아 두었다.
+		if (sel_a_log == edit_log) {
+			cur_log = edit_log;
+			cur_col = (sel_a_col < edit_col) ? edit_col : sel_a_col;  // 편집 경계 이전으로는 못 감
+			desired_vx = -1;                                         // 끈적 열 초기화
+			bump_cursor();                                           // 커서 즉시 표시
+		}
+	}
 	Invalidate();
 }
 
@@ -1153,6 +1330,7 @@ void CConBox::OnChar(UINT ch, UINT rep, UINT flags)
 	rebuild_scr_lines();
 	scroll_to_bottom();
 	update_scrollbar();
+	bump_cursor();
 	Invalidate();
 }
 
@@ -1269,6 +1447,7 @@ void CConBox::OnKeyDown(UINT vk, UINT rep, UINT flags)
 	rebuild_scr_lines();
 	scroll_to_bottom();
 	update_scrollbar();
+	bump_cursor();
 	Invalidate();
 }
 
@@ -1293,6 +1472,7 @@ void CConBox::commit_input()
 	rebuild_scr_lines();
 	scroll_to_bottom();
 	update_scrollbar();
+	bump_cursor();
 	Invalidate();
 
 	// 콜백을 호출한다. 콜백이 print() 를 불러도 안전하도록 모든 상태 갱신 뒤에 부른다.
@@ -1361,6 +1541,7 @@ void CConBox::move_cursor_row(int dir)
 		scroll_top = tidx - rows + 1;
 
 	update_scrollbar();
+	bump_cursor();
 	Invalidate();
 }
 
@@ -1446,7 +1627,9 @@ void CConBox::OnPaint()
 	// 경우) 블록 위에 전경색으로 글자를 다시 그려 가려지지 않게 한다.
 	// IME 조합 중이면 채우지 않고, 조합 글자 영역을 두께 2픽셀의 속이 빈 사각형(커서색)으로
 	// 감싼다. 속은 배경색이 보이고 조합 글자는 본문과 같은 색으로 그대로 보인다.
-	if (ime_comp.empty()) {
+	// 본문(영문/평상시) 블록 커서는 cursor_on 이 true 인 동안에만 그려 깜빡인다. 깜빡임이
+	// 꺼진 프레임에서는 블록을 그리지 않으며, 본문 글자는 위에서 이미 정상으로 그려져 있다.
+	if (cursor_on && ime_comp.empty()) {
 		CRect cur;
 		if (get_cursor_rect(cur)) {
 			COLORREF cblk = blend_cursor_color();
@@ -1483,8 +1666,9 @@ void CConBox::OnPaint()
 			}
 		}
 	}
-	else {
-		// IME 조합 중: 조합 글자 영역을 속이 빈 사각형(테두리만)으로 표시한다.
+	else if (!ime_comp.empty()) {
+		// IME 조합 중: 조합 글자 영역을 속이 빈 사각형(테두리만)으로 표시한다. 조합 중에는
+		// 깜빡이지 않으므로 cursor_on 과 무관하게 항상 그린다.
 		// 커서는 조합 시작점(cur_col == ime_anchor)에 있으므로 그 위치에서 조합 글자
 		// 전체의 시각 폭만큼을 감싼다.
 		int row, vx;

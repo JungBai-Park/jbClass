@@ -13,9 +13,6 @@
       <UniqueIdentifier>{67DA6AB6-F800-4c08-8B7A-83BB121AAD01}</UniqueIdentifier>
       <Extensions>rc;ico;cur;bmp;dlg;rc2;rct;bin;rgs;gif;jpg;jpeg;jpe;resx;tiff;tif;png;wav;mfcribbon-ms</Extensions>
     </Filter>
-    <Filter Include="Source">
-      <UniqueIdentifier>{A1B2C3D4-0001-4a5b-9c8d-000000000001}</UniqueIdentifier>
-    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="ConBoxApp.h">
@@ -37,10 +34,7 @@
       <Filter>헤더 파일</Filter>
     </ClInclude>
     <ClInclude Include="..\Source\ConBox.h">
-      <Filter>Source</Filter>
-    </ClInclude>
-    <ClInclude Include="..\Source\Accessories.h">
-      <Filter>Source</Filter>
+      <Filter>소스 파일</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
@@ -54,21 +48,13 @@
       <Filter>소스 파일</Filter>
     </ClCompile>
     <ClCompile Include="..\Source\ConBox.cpp">
-      <Filter>Source</Filter>
-    </ClCompile>
-    <ClCompile Include="..\Source\Accessories.cpp">
-      <Filter>Source</Filter>
+      <Filter>소스 파일</Filter>
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="ConBox.rc">
       <Filter>리소스 파일</Filter>
     </ResourceCompile>
-  </ItemGroup>
-  <ItemGroup>
-    <None Include="res\ConBox.rc2">
-      <Filter>리소스 파일</Filter>
-    </None>
   </ItemGroup>
   <ItemGroup>
     <Image Include="res\ConBox.ico">

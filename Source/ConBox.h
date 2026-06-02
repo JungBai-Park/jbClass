@@ -2,10 +2,27 @@
 //
 // 이식 가능한 터미널 컨트롤 ConBox 의 클래스 선언.
 // wt.exe 처럼 텍스트 입력과 출력을 모두 처리하는 MFC CWnd 파생 컨트롤이다.
-// 외부로 노출되는 모든 문자열 API 는 UTF-8(char*) 을 사용한다.
 //
-// 이 파일은 데모 프로젝트(Project/)와 독립적으로 동작하도록
-// 미리 컴파일된 헤더(pch.h)에 의존하지 않고 필요한 헤더를 직접 포함한다.
+// 이식 단위는 ConBox.h / ConBox.cpp 두 파일뿐이다.
+// "사용"만 할 때는 이 헤더만 읽으면 충분하다 — 구현 세부(ConBox.cpp)는 동작을 "수정"할 때만
+// 본다. (cpp 통독은 토큰 낭비이며, 그 파일 상단 목차로 필요한 함수만 찾아 부분만 보면 된다.)
+//
+// --- 요구사항 / 의존성 ---
+//   - MFC(유니코드) + Windows 전용. afxwin.h 에 의존한다.
+//   - 한글 IME 용 imm32.lib 는 ConBox.cpp 가 #pragma comment 로 자동 링크한다(호스트 설정 불필요).
+//   - 글자를 선명하게 하려면 "호스트 앱"이 시작 시 SetProcessDPIAware() 를 호출한다
+//     (DPI 인식은 프로세스 단위 속성이라 이 컨트롤이 아니라 호스트가 켠다).
+//   - 외부로 노출되는 모든 문자열 API 는 UTF-8(const char*) 을 받는다.
+//   - 이 파일은 미리 컴파일된 헤더(pch.h)에 의존하지 않고 필요한 헤더를 직접 포함한다(단독 컴파일 가능).
+//   - .h/.cpp 는 UTF-8 BOM 으로 저장한다(BOM 이 없으면 MSVC 가 CP949 로 오인해 한글 주석이 깨진다).
+//
+// --- 사용 예 (호스트의 부모 창에서) ---
+//     CConBox box;                            // 보통 멤버로 보유한다
+//     box.set_efont("Consolas", 13, "B");     // (선택) 폰트 지정. 생략하면 기본값을 쓴다
+//     box.open(parent, 0, 0, 400, 300);       // 좌표로 자식 창 생성
+//     box.on_enter = OnEnter;                 // (선택) Enter 확정 콜백 연결
+//     box.print("hello\n");                   // 출력 (UTF-8)
+//     // 콜백 시그니처:  void OnEnter(const char* utf8) { ... }
 
 #pragma once
 
@@ -53,13 +70,18 @@ public:
 	void set_efont(const char* name, float size, const char* opts);
 
 	// 한글 폰트를 지정한다. 인자 규칙은 set_efont 와 같다.
+	// 단 size 가 0 이하이면 영문 폰트와 같은 픽셀(em) 높이로 맞추는 match 모드가 켜진다.
+	// 이 경우 size 값 자체는 무시되고, 한글을 영문과 같은 높이로 다시 만들어 줄 높이가
+	// 영문 기준으로 촘촘해진다(박스 그리기 문자의 세로선 연결에 유리). 양수이면 match
+	// 모드가 꺼져 한글은 그 크기 그대로이고 줄 높이는 두 폰트 중 큰 쪽이 된다.
+	// 아무 설정도 하지 않은 기본 상태는 match 켜짐이다.
 	void set_kfont(const char* name, float size, const char* opts);
 
-	// 줄 높이를 영문 폰트 기준으로 잡을지 여부. (기본 켜짐)
-	// 켜지면 set_kfont 의 size 를 무시하고 한글 폰트를 영문 폰트와 같은 픽셀(em) 높이로
-	// 다시 만들어, 줄 높이가 영문 기준으로 촘촘해진다(박스 그리기 문자의 세로선 연결에 유리).
-	// 끄면 한글은 set_kfont 로 지정한 크기 그대로이고 줄 높이는 두 폰트 중 큰 쪽이 된다.
-	void set_kfont_match_efont(bool on);
+	// match 모드에서 한 칸 폭(장평)을 정하는 두 비율을 지정한다. match 모드일 때만 효과가 있다.
+	// fill_ratio: 한글 한 글자가 두 칸을 채우는 비율(기본 0.92). 키우면 영문 칸이 좁아져
+	//   한글 자간이 줄고, 줄이면 자간이 넓어진다.
+	// emin_ratio: 영문을 자연 폭의 이 비율 밑으로는 좁히지 않는 가독성 하한(기본 0.7).
+	void set_kfont_fill(float fill_ratio, float emin_ratio);
 
 	// 텍스트를 출력한다. 항상 버퍼 끝(현재 출력 위치)에 이어서 쓴다.
 	// text 는 UTF-8 이며 특수문자를 다음과 같이 처리한다.
@@ -77,6 +99,10 @@ public:
 	// (배경:전경) 가중치이며 기본값은 6:4 (배경에 가까운 색). 합으로 정규화하므로
 	// (6,4) 와 (60,40) 은 같다. 합이 0 이면 무시한다.
 	void set_cursor_blend(int bg_weight, int fg_weight);
+
+	// 커서 깜빡임 간격(밀리초)을 지정한다. interval_ms 가 0 이면 깜빡이지 않고 항상
+	// 켜 둔다. 기본값은 시스템 캐럿 깜빡임 속도(GetCaretBlinkTime)를 따른다.
+	void set_cursor_blink(int interval_ms);
 
 	// 클라이언트 영역 안쪽 여백(픽셀)을 지정한다. 여백 안쪽에만 글자가 그려진다.
 	// CSS 단축 스타일로 생략한 변은 다른 변을 따른다.
@@ -101,6 +127,8 @@ protected:
 	afx_msg UINT OnGetDlgCode();
 	afx_msg void OnVScroll(UINT code, UINT pos, CScrollBar* sb);
 	afx_msg BOOL OnMouseWheel(UINT flags, short zDelta, CPoint pt);
+	// 커서 깜빡임 타이머. 표시 상태를 뒤집고 커서 자리만 다시 그린다.
+	afx_msg void OnTimer(UINT_PTR id);
 	// 한글 IME 처리 (Windows 표준 방식의 조합 과정 표시)
 	afx_msg LRESULT OnImeStart(WPARAM w, LPARAM l);
 	afx_msg LRESULT OnImeComp(WPARAM w, LPARAM l);
@@ -167,6 +195,10 @@ private:
 	// 블록 커서를 채울 색을 cur_bg/cur_fg 와 혼합 비율로 계산한다.
 	COLORREF blend_cursor_color() const;
 
+	// 커서를 즉시 보이게 하고(cursor_on=true) 깜빡임 타이머를 다시 시작한다.
+	// 입력/이동 직후 한 박자 동안은 커서가 확실히 보이게 하기 위한 것이다.
+	void bump_cursor();
+
 	// 지금 IME 가 한글(초성/한글 자모) 입력 모드인지 조회한다.
 	// 조합이 시작되기 전에도 한/영 상태를 알 수 있어, 커서 폭을 미리 정하는 데 쓴다.
 	bool is_hangul_mode() const;
@@ -195,12 +227,18 @@ private:
 	int cursor_bg_weight;  // 블록 커서 색 혼합 비율의 배경 가중치 (기본 6)
 	int cursor_fg_weight;  // 블록 커서 색 혼합 비율의 전경 가중치 (기본 4)
 
+	bool cursor_on;        // 깜빡임 표시 상태 (true 면 현재 커서가 보임)
+	int cursor_blink_ms;   // 깜빡임 토글 간격(밀리초). 0 이면 깜빡임 없이 항상 표시
+
 	CFont efont;       // 영문 폰트
 	CFont kfont;       // 한글 폰트
 	LOGFONTW efont_lf; // 영문 폰트의 LOGFONT 사본
 	LOGFONTW kfont_lf; // 한글 폰트의 LOGFONT 사본 (사용자가 지정한 원본 크기/스타일 보존)
 
-	bool kfont_match_efont; // 켜지면 한글 폰트를 영문과 같은 높이로 맞추고 줄 높이를 영문 기준으로 잡는다 (기본 true)
+	bool kfont_match_efont; // 켜지면 한글 폰트를 영문과 같은 높이로 맞추고 줄 높이를 영문 기준으로 잡는다 (set_kfont 의 size<=0 으로 켜진다, 기본 true)
+
+	float kfill_ratio;     // match 모드 칸 폭: 한글이 두 칸을 채우는 비율 (기본 0.92)
+	float emin_ratio;      // match 모드 칸 폭: 영문을 자연 폭의 이 비율 밑으로 좁히지 않는 하한 (기본 0.7)
 
 	int cell_w;        // 영문 한 글자 칸의 가로 픽셀 (한글은 2배)
 	int cell_h;        // 한 줄 칸의 세로 픽셀
