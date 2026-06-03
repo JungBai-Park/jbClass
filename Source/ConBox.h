@@ -10,6 +10,7 @@
 //
 // --- 요구사항 / 의존성 ---
 //   - MFC(유니코드) + Windows 전용. afxwin.h 에 의존한다.
+//   - start() 로 자식을 실행하려면 Windows 10 1809(빌드 17763) 이상(ConPTY). 순수 뷰로만 쓰면 무관.
 //   - 한글 IME 용 imm32.lib 는 ConBox.cpp 가 #pragma comment 로 자동 링크한다(호스트 설정 불필요).
 //   - 글자를 선명하게 하려면 "호스트 앱"이 시작 시 SetProcessDPIAware() 를 호출한다
 //     (DPI 인식은 프로세스 단위 속성이라 이 컨트롤이 아니라 호스트가 켠다).
@@ -23,15 +24,30 @@
 //     box.open(parent, 0, 0, 400, 300);       // 좌표로 자식 창 생성
 //     box.print("hello\n");                   // 출력 (UTF-8) — 셀 그리드에 흐른다
 //
-// ConBox 는 set_input_sink 로 입력 싱크가 걸린 "터미널(raw) 모드"로 쓰는 것을 전제한다.
-// 이 모드에서는 키를 로컬에서 편집하지 않고(로컬 에코 끔) VT 시퀀스/UTF-8 로 인코딩해 싱크로
-// 보낸다(화면은 자식이 그린다). ConExe 가 attach() 에서 자신을 싱크로 등록한다. ConPTY 자식
-// 실행은 ConExe.h 참고. 싱크가 없으면 print() 출력만 표시하는 읽기 전용 뷰어로 동작한다.
+// ConBox 는 두 가지로 쓸 수 있다.
+//  (1) 순수 터미널 뷰: 호스트가 print() 로 바이트를 먹이고 set_input_sink() 로 키 입력 바이트를
+//      받아간다(터미널 raw 모드 - 로컬 에코 끔, 키를 VT/UTF-8 로 인코딩해 싱크로 보냄). 어떤
+//      바이트 소스(파일/소켓/직접 만든 프로세스)와도 연결할 수 있다.
+//  (2) ConPTY 자식 실행기: start(cmdline, cols, rows) 한 번이면 ConPTY 로 자식(cmd/powershell/
+//      python REPL 등)을 띄우고 그 콘솔 입출력을 자동 연결한다(내부적으로 위 입력/리사이즈 싱크를
+//      재사용한다). 자식 출력은 내부 타이머가 폴링해 print() 로 흘린다.
+// 싱크도 없고 start() 도 안 하면 print() 출력만 보여주는 읽기 전용 뷰어다.
 
 #pragma once
 
-#include <afxwin.h>   // MFC 코어 (CWnd, CDC, CFont 등)
+// ConPTY(CreatePseudoConsole/HPCON/ResizePseudoConsole 등)는 Windows 10 1809(빌드 17763, RS5)
+// 이상에서만 선언된다. afxwin.h 가 windows.h 를 끌어오므로 그 전에 최소 버전을 직접 지정한다
+// (이 헤더만으로 자기완결적이게). 호스트가 targetver 로 더 높은 값을 정했으면 존중하도록 #ifndef.
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0A00            // Windows 10
+#endif
+#ifndef NTDDI_VERSION
+#define NTDDI_VERSION 0x0A000006       // NTDDI_WIN10_RS5 (ConPTY 최소 버전)
+#endif
+
+#include <afxwin.h>   // MFC 코어 (CWnd, CDC, CFont 등) — windows.h(ConPTY HPCON 등)도 끌어온다
 #include <vector>     // 내부 셀 그리드 버퍼
+#include <string>     // IME 조합 중 문자열(comp_str)
 
 // 화면 한 칸(셀)에 들어가는 정보. 셀 하나 = 화면의 한 칸이다.
 // 2배 폭 글자(한글/CJK)는 lead 칸(ch=글자, wide=true)이 차지하고, 바로 다음 칸은 trail 칸
@@ -73,7 +89,9 @@ public:
 	// match 모드에서 한 칸 폭(장평)을 정하는 두 비율을 지정한다. match 모드일 때만 효과가 있다.
 	// fill_ratio: 한글 한 글자가 두 칸을 채우는 비율(기본 0.92). 키우면 영문 칸이 좁아져
 	//   한글 자간이 줄고, 줄이면 자간이 넓어진다.
-	// emin_ratio: 영문을 자연 폭의 이 비율 밑으로는 좁히지 않는 가독성 하한(기본 0.7).
+	// emin_ratio: 영문을 자연 폭의 이 비율 밑으로는 좁히지 않는 가독성 하한(기본 1.0).
+	//   기본 1.0 이면 영문 칸이 자연 폭으로 고정되어 wt.exe 처럼 한글 자간이 약간 넓어진다.
+	//   1 미만으로 낮추면 영문 칸이 좁아지며 한글이 두 칸을 더 촘촘히 채운다.
 	void set_kfont_fill(float fill_ratio, float emin_ratio);
 
 	// 박스/블록 그리기 문자를 폰트 글리프 대신 ConBox 가 도형으로 직접 그리는 수준을 정한다.
@@ -132,18 +150,49 @@ public:
 	// 편집하지 않고(로컬 에코 끔), 키/문자를 VT 시퀀스 및 UTF-8 바이트로 인코딩해 sink 로
 	// 흘려보낸다(자식 프로세스의 stdin 으로 보내는 용도). bytes/len 은 UTF-8 바이트열이며,
 	// user 는 sink 호출 시 그대로 되돌려주는 사용자 컨텍스트다. nullptr 을 주면 읽기 전용
-	// 뷰어 모드로 되돌아간다. (ConExe 는 attach() 에서 이 API 로 자신을 등록한다.)
+	// 뷰어 모드로 되돌아간다. (start() 가 내부적으로 이 API 로 자신을 등록한다.)
 	void set_input_sink(void (*sink)(const char* bytes, int len, void* user), void* user);
 
 	// 리사이즈 싱크를 지정한다. 창 크기 변경 등으로 화면 그리드(cols/rows)가 바뀌면 새 칸/줄
 	// 수를 이 콜백으로 통지한다(자식 콘솔의 의사 콘솔 크기를 맞추는 용도). nullptr 이면 통지하지
-	// 않는다. (ConExe 는 attach() 에서 이 API 로 자신을 등록해 ResizePseudoConsole 로 연결한다.)
+	// 않는다. (start() 는 내부적으로 이 API 로 자신을 등록해 ResizePseudoConsole 로 연결한다.)
 	void set_resize_sink(void (*sink)(int cols, int rows, void* user), void* user);
+
+	// === ConPTY 자식 실행 (선택 기능) ===
+	// 이 그룹을 쓰면 ConBox 가 ConPTY 로 자식 프로그램을 직접 실행하고 입출력을 자동 연결한다.
+	// 쓰지 않으면(start() 미호출) ConPTY 관련 멤버는 잠들어 있고 순수 터미널 뷰로 동작한다.
+
+	// 자식 프로그램을 ConPTY 로 실행한다. cmdline 은 UTF-8(예: "python.exe", "cmd /c dir"),
+	// cols/rows 는 의사 콘솔 크기(보통 grid_cols()/grid_rows()). 내부적으로 입력/리사이즈 싱크를
+	// 자신에게 걸고, 출력 폴링 타이머를 띄운다. 이미 실행 중이면 먼저 정리하고 새로 시작한다.
+	// 성공하면 true. (open() 으로 창이 만들어진 뒤 호출한다 - 폴링 타이머가 창에 필요하다.)
+	bool start(const char* cmdline, int cols, int rows);
+
+	// 자식 stdin 으로 바이트열(UTF-8/VT)을 보낸다. 보통 입력 싱크 경로가 자동 호출한다.
+	void write(const char* data, int len);
+
+	// 자식 의사 콘솔의 칸/줄 크기를 바꾼다(ResizePseudoConsole). 보통 리사이즈 싱크가 자동 호출한다.
+	void resize(int cols, int rows);
+
+	// 자식/PTY/파이프/폴링 타이머를 모두 정리한다. 여러 번 불러도 안전하다(멱등).
+	void stop();
+
+	// 자식이 실행 중이고 출력 경로가 살아 있는지 조회한다.
+	bool is_running() const;
+
+	// 자식 자연 종료(예: 셸 exit) 시 한 번 호출되는 콜백을 등록한다. 콜백 시점에는 이미 정리가
+	// 끝나 is_running()==false 다(콜백 안에서 새 start() 안전). 명시적 stop() 으로 끝낸 경우엔 안 부른다.
+	void set_exit_callback(void (*cb)(void* user), void* user);
+
+	// 출력 파이프에 쌓인 바이트를 읽어 화면(print)으로 반영한다. 보통 내부 타이머가 부른다.
+	void pump();
 
 protected:
 	afx_msg void OnPaint();
 	afx_msg BOOL OnEraseBkgnd(CDC* dc);
 	afx_msg void OnSize(UINT type, int cx, int cy);
+	// 창 파괴 시 자식/폴링 타이머를 먼저 정리한다(폴링이 파괴 중 창을 건드리지 않게).
+	afx_msg void OnDestroy();
 	afx_msg void OnChar(UINT ch, UINT rep, UINT flags);
 	afx_msg void OnKeyDown(UINT vk, UINT rep, UINT flags);
 	afx_msg UINT OnGetDlgCode();
@@ -151,8 +200,8 @@ protected:
 	afx_msg BOOL OnMouseWheel(UINT flags, short zDelta, CPoint pt);
 	// 커서 깜빡임 타이머. 표시 상태를 뒤집고 커서 자리만 다시 그린다.
 	afx_msg void OnTimer(UINT_PTR id);
-	// 한글 IME 처리. 터미널 모드에서는 확정분만 자식에 보내고 미완성 조합은 시스템 기본
-	// 인라인 표시에 맡긴다(ConBox 직접 조합 렌더는 이후 단계 M5).
+	// 한글 IME 처리. 터미널 모드에서는 확정분만 자식에 보내고, 미완성 조합은 comp_str 에 담아
+	// ConBox 가 블록 커서 칸에 직접 그린다(시스템 기본 인라인은 OnImeComp 가 return 0 으로 억제).
 	afx_msg LRESULT OnImeStart(WPARAM w, LPARAM l);
 	afx_msg LRESULT OnImeComp(WPARAM w, LPARAM l);
 	afx_msg LRESULT OnImeEnd(WPARAM w, LPARAM l);
@@ -164,7 +213,7 @@ private:
 	// 폰트 한 벌을 만들어 font 에 채우고, 만든 LOGFONT 를 lf_out 에 남긴다.
 	void make_font(CFont& font, LOGFONTW& lf_out, const char* name, float size, const char* opts);
 
-	// 아직 지정되지 않은 폰트에 기본값(영문 Consolas, 한글 맑은 고딕)을 채운다.
+	// 아직 지정되지 않은 폰트에 기본값(영문 Cascadia Mono, 한글 맑은 고딕)을 채운다.
 	void apply_default_fonts();
 
 	// 현재 폰트를 기준으로 고정 그리드 한 칸의 가로/세로 픽셀 크기를 잰다.
@@ -272,7 +321,7 @@ private:
 
 	// 한글 IME 조합 중이면 강제로 확정(완성)시켜, 완성 글자의 UTF-8 이 먼저 자식에 전송되게 한다.
 	// 조합 종료 트리거(방향키/Home/End/Delete/Enter/Tab/Esc 등, 마우스 클릭)를 자식에 보내기
-	// 직전에 호출해 "제자리 완성 후 트리거" 순서를 보장한다(요구사양서 3.1). 조합이 있었으면 true.
+	// 직전에 호출해 "제자리 완성 후 트리거" 순서를 보장한다(Requirements.md §10). 조합이 있었으면 true.
 	bool finalize_composition();
 
 	// 더블 버퍼링용 메모리 DC/비트맵을 (필요하면) 만들어 둔다. 클라이언트 크기가
@@ -288,8 +337,24 @@ private:
 	void (*resize_sink)(int cols, int rows, void* user);
 	void* resize_sink_user;
 
-	COLORREF cur_fg;   // 현재 전경색 (기본 흰색)
-	COLORREF cur_bg;   // 현재 배경색 (기본 검정)
+	// === ConPTY 자식 실행 상태 (start() 미사용 시 모두 잠듦; 순수 터미널 뷰엔 영향 없음) ===
+	HPCON h_pc;                      // 의사 콘솔 핸들 (CreatePseudoConsole)
+	HANDLE in_write;                 // 자식 stdin 에 쓰는 쪽 (입력 전송용)
+	HANDLE out_read;                 // 자식 콘솔 출력을 읽는 쪽 (폴링)
+	PROCESS_INFORMATION child_proc;  // 자식 프로세스/스레드 핸들
+	bool child_running;              // 자식 실행 중 여부
+	void (*exit_cb)(void* user);     // 자식 자연 종료 콜백 (없으면 nullptr)
+	void* exit_cb_user;              // 콜백에 되돌려줄 컨텍스트
+
+	// 자식 종료(파이프 닫힘/프로세스 종료)를 감지했을 때 정리하고 종료 콜백을 발화한다.
+	// 먼저 stop() 으로 정리한 뒤 콜백을 불러, 콜백이 즉시 재시작(start)해도 안전하게 한다.
+	void handle_child_exit();
+	// start() 가 입력/리사이즈 싱크로 거는 정적 thunk. user(=this)의 write/resize 로 라우팅한다.
+	static void child_input_thunk(const char* bytes, int len, void* user);
+	static void child_resize_thunk(int cols, int rows, void* user);
+
+	COLORREF cur_fg;   // 현재 전경색 (기본 밝은 회색 RGB(200,200,200))
+	COLORREF cur_bg;   // 현재 배경색 (기본 짙은 회색 RGB(32,32,32))
 
 	int cursor_bg_weight;  // 블록 커서 색 혼합 비율의 배경 가중치 (기본 6)
 	int cursor_fg_weight;  // 블록 커서 색 혼합 비율의 전경 가중치 (기본 4)
@@ -305,7 +370,7 @@ private:
 	bool kfont_match_efont; // 켜지면 한글 폰트를 영문과 같은 높이로 맞추고 줄 높이를 영문 기준으로 잡는다 (set_kfont 의 size<=0 으로 켜진다, 기본 true)
 
 	float kfill_ratio;     // match 모드 칸 폭: 한글이 두 칸을 채우는 비율 (기본 0.92)
-	float emin_ratio;      // match 모드 칸 폭: 영문을 자연 폭의 이 비율 밑으로 좁히지 않는 하한 (기본 0.7)
+	float emin_ratio;      // match 모드 칸 폭: 영문을 자연 폭의 이 비율 밑으로 좁히지 않는 하한 (기본 1.0 = 자연 폭 고정)
 
 	int glyph_level;       // 박스/블록 문자 직접 렌더 수준 (0=끔, 1=블록요소만(기본), 2=+직선/정션 박스선)
 
@@ -331,6 +396,10 @@ private:
 
 	bool cursor_visible;          // DECTCEM(?25): 커서 표시 여부 (기본 true)
 	int  saved_row, saved_col;    // DECSC/DECRC 로 저장한 커서 위치
+
+	// IME 조합 중(미확정) 문자열. 비어 있으면 조합 없음. 비어 있지 않으면 OnPaint 가
+	// 블록 커서 칸에 직접 그린다(시스템 기본 인라인 대신 — 위치를 커서에 고정하기 위함).
+	std::wstring comp_str;
 
 	// 스크롤 영역(DECSTBM). LF/RI/IL/DL/SU/SD 가 존중하는 줄 범위다. 기본은 화면 전체 [0, rows-1].
 	int scroll_top;
@@ -363,4 +432,11 @@ private:
 	CBitmap* back_old_bmp;  // back_dc 에 원래 들어있던 비트맵 (정리 시 되돌리기용)
 	int back_w;             // 현재 back_bmp 의 가로 픽셀 (크기 변경 감지용)
 	int back_h;             // 현재 back_bmp 의 세로 픽셀
+
+	// [DEBUG] 한글/커서 렌더 디버깅용 캡처+로그. 사용자가 "디버깅 기능 삭제하자" 할 때까지 보존.
+	//         제거 시 이 블록과 ConBox.cpp 의 // [DEBUG] 표시 부분(헬퍼/호출/타이머/init)을 지운다.
+	bool dbg_record;        // 녹화 on/off (생성자에서 DBG_HARNESS 스위치를 따름, 기본 false)
+	int dbg_seq;            // 캡처 일련번호
+	bool dbg_input_seen;    // 첫 입력 발생 후 true. 그 전(claude 부팅)엔 출력 캡처를 안 함
+	void dbg_dump(const char* tag);       // 백버퍼를 BMP 로 저장 + 상태 로그
 };

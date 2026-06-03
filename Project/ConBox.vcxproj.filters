@@ -36,9 +36,6 @@
     <ClInclude Include="..\Source\ConBox.h">
       <Filter>소스 파일</Filter>
     </ClInclude>
-    <ClInclude Include="..\Source\ConExe.h">
-      <Filter>소스 파일</Filter>
-    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="ConBoxApp.cpp">
@@ -51,9 +48,6 @@
       <Filter>소스 파일</Filter>
     </ClCompile>
     <ClCompile Include="..\Source\ConBox.cpp">
-      <Filter>소스 파일</Filter>
-    </ClCompile>
-    <ClCompile Include="..\Source\ConExe.cpp">
       <Filter>소스 파일</Filter>
     </ClCompile>
   </ItemGroup>

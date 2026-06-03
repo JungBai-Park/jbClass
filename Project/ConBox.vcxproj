@@ -206,15 +206,11 @@
     <ClInclude Include="Resource.h" />
     <ClInclude Include="targetver.h" />
     <ClInclude Include="..\Source\ConBox.h" />
-    <ClInclude Include="..\Source\ConExe.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="ConBoxApp.cpp" />
     <ClCompile Include="ConBoxDlg.cpp" />
     <ClCompile Include="..\Source\ConBox.cpp">
-      <PrecompiledHeader>NotUsing</PrecompiledHeader>
-    </ClCompile>
-    <ClCompile Include="..\Source\ConExe.cpp">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
     </ClCompile>
     <ClCompile Include="pch.cpp">

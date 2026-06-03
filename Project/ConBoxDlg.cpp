@@ -32,6 +32,7 @@ BEGIN_MESSAGE_MAP(CConBoxDlg, CDialog)
 	ON_WM_PAINT()
 	ON_WM_QUERYDRAGICON()
 	ON_WM_SIZE()
+	ON_WM_DESTROY()
 END_MESSAGE_MAP()
 
 
@@ -58,87 +59,59 @@ BOOL CConBoxDlg::OnInitDialog()
 	if (CWnd* cancel = GetDlgItem(IDCANCEL))
 		cancel->DestroyWindow();
 
-	// 폰트는 창 생성 전에 지정한다. (기본값과 동일하지만 API 사용 예시를 겸한다.)
+	// 폰트는 창 생성 전에 지정한다. 값은 ConBox 기본값과 동일하며, API 사용 예시를 겸한다.
 	// 한글은 크기를 0 으로 주어 영문 높이에 맞추는 match 모드로 둔다(기본 동작).
-	// 영문 폰트로 Cascadia Mono 를 쓴다. (둥근 모서리 ╭╮╰╯ 와 로고의 사분면 블록
-	//  ▛▜▘▝ 글리프를 가져 도표가 깨지지 않는다. Consolas 에는 이 글리프들이 없다.)
-	con_box.set_efont("Cascadia Mono", 13, "B");
-	con_box.set_kfont("Malgun Gothic", 0, "B");
+	// (영문 Cascadia Mono 는 둥근 모서리 ╭╮╰╯ 와 로고의 사분면 블록 ▛▜▘▝ 글리프를 가져
+	//  도표가 깨지지 않는다. Consolas 에는 이 글리프들이 없다.)
+	con_box.set_efont("Cascadia Mono", 12, "");
+	con_box.set_kfont("Malgun Gothic", 0, "");
 
-	// match 모드의 칸 폭(장평) 비율. 기본값과 동일하지만 API 사용 예시를 겸한다.
-	con_box.set_kfont_fill(0.92f, 0.7f);
+	// match 모드의 칸 폭(장평) 비율. 기본값과 동일하며 API 사용 예시를 겸한다.
+	con_box.set_kfont_fill(0.92f, 1.0f);
 
 	// ConBox 를 자식 창으로 만든다. (위치/크기는 아래 resize_to_grid 가 정한다.)
 	con_box.open(this, 0, 0, 10, 10);
 
-	// 위에서 지정한 폰트 설정 기준으로 ConBox 가 96x32 칸(영문)이 되도록 메인 창
+	// 위에서 지정한 폰트 설정 기준으로 ConBox 가 60x20 칸(영문)이 되도록 메인 창
 	// 크기를 다시 잡고 화면 중앙으로 옮긴다. (셀 크기는 open 에서 확정되었다.)
+	// [DEBUG] 디버깅용으로 96x32 -> 60x20 으로 축소(캡처 BMP 작아져 토큰 절약). 원복 시 96,32.
 	resize_to_grid(96, 32);
 
-	// 초기 화면: ConBox 개요/특징 도표 (둥근 모서리). 로고 칸만 살구색.
-	// C++20 에서 u8 리터럴은 char8_t 형이므로 const char* 로 캐스팅한다.
-	// (도표 문자열은 한글=2칸 폭을 계산해 정렬되어 있다. Temp/gen_box.py 로 생성.)
-	const COLORREF c_fg   = RGB(255, 255, 255);   // 본문/테두리: 흰색
-	const COLORREF c_logo = RGB(214, 112, 84);    // 로고: 살구색(PNG 색감)
-
-	con_box.set_color(c_fg);
-	con_box.print(reinterpret_cast<const char*>(u8"╭───────────────────────────────────────────────────────────╮\n"));
-
-	// 로고 헤더 3줄: 흰색 여백 + 살구색 로고 + 흰색 타이틀
-	con_box.set_color(c_fg);   con_box.print(reinterpret_cast<const char*>(u8"│ "));
-	con_box.set_color(c_logo); con_box.print(reinterpret_cast<const char*>(u8" ▐▛███▜▌ "));
-	con_box.set_color(c_fg);   con_box.print(reinterpret_cast<const char*>(u8"  ConBox                                         │\n"));
-	con_box.set_color(c_fg);   con_box.print(reinterpret_cast<const char*>(u8"│ "));
-	con_box.set_color(c_logo); con_box.print(reinterpret_cast<const char*>(u8"▝▜█████▛▘"));
-	con_box.set_color(c_fg);   con_box.print(reinterpret_cast<const char*>(u8"  이식 가능한 커스텀 터미널 컨트롤               │\n"));
-	con_box.set_color(c_fg);   con_box.print(reinterpret_cast<const char*>(u8"│ "));
-	con_box.set_color(c_logo); con_box.print(reinterpret_cast<const char*>(u8"  ▘▘ ▝▝  "));
-	con_box.set_color(c_fg);   con_box.print(reinterpret_cast<const char*>(u8"  MFC CWnd 파생 · UTF-8 문자열 API               │\n"));
-
-	// 본문(표 + 안내) 은 모두 흰색이라 한 덩어리로 출력한다.
-	con_box.set_color(c_fg);
-	con_box.print(reinterpret_cast<const char*>(
-		u8"├──────────┬────────────────────────────────────────────────┤\n"
-		u8"│ 렌더링   │ 고정 그리드 · 한글 2배폭 · 자동 줄바꿈/스크롤  │\n"
-		u8"├──────────┼────────────────────────────────────────────────┤\n"
-		u8"│ 폰트     │ 영문/한글 개별 설정 · 한글 높이 영문에 맞춤    │\n"
-		u8"├──────────┼────────────────────────────────────────────────┤\n"
-		u8"│ 입력     │ IME 한글 조합(삽입) · 한/영 커서폭 전환        │\n"
-		u8"├──────────┼────────────────────────────────────────────────┤\n"
-		u8"│ 편집     │ 커서 이동 · 선택/클립보드 · 화살표 입력영역    │\n"
-		u8"├──────────┼────────────────────────────────────────────────┤\n"
-		u8"│ 색상     │ 문자 단위 전경색·배경색 지정                   │\n"
-		u8"├──────────┼────────────────────────────────────────────────┤\n"
-		u8"│ 커서     │ 블록 커서 깜빡임 · 조합 중 테두리 커서         │\n"
-		u8"├──────────┴────────────────────────────────────────────────┤\n"
-		u8"│ 타이프(Type) 쳐서 동작을 확인해 보세요.                   │\n"
-		u8"╰───────────────────────────────────────────────────────────╯\n"));
-
-	// M2 검증: ConExe 로 상호작용 셸(cmd)을 ConPTY 로 실행해 입출력 왕복을 확인한다.
-	// attach() 가 출력(자식->ConBox)과 입력(ConBox->자식)을 모두 연결하므로, 이후 ConBox 에
-	// 타이핑하면 cmd 로 전달되고 결과가 ConBox 에 표시된다. 로컬 에코는 자동으로 꺼진다.
-	// (이 단계에서는 VT 시퀀스 미해석 - 일부 제어문자가 그대로 보일 수 있다. VT 파서/셀
-	//  그리드는 이후 M3 에서 도입한다.)
-	con_box.print("\n");
-	con_exe.attach(&con_box);
-	// 자식이 종료되면(예: powershell 에서 exit) ConBox 에 안내를 출력하도록 콜백을 건다(M5).
-	con_exe.set_exit_callback(&CConBoxDlg::on_child_exit, this);
-	con_exe.start("powershell -NoLogo", con_box.grid_cols(), con_box.grid_rows());
+	// 초기 화면은 비워 두고, ConBox 가 직접 python 대화형 REPL 을 ConPTY 로 실행한다.
+	// start() 가 입력(ConBox->자식)·출력(자식->ConBox)·리사이즈를 모두 자동 연결하므로, 이후
+	// ConBox 에 타이핑하면 python 으로 전달되고 결과가 ConBox 에 표시된다. 로컬 에코는 자동으로 꺼진다.
+	// 자식이 종료되면 메인 윈도우를 닫도록 콜백을 건다.
+	con_box.set_exit_callback(&CConBoxDlg::on_child_exit, this);
+	// 자식의 작업 디렉토리를 프로젝트 루트로 옮긴 뒤 실행한다(자식이 cwd 를 상속).
+	// 새 목표(기본 stdio 위주 + 제한적 VT100)의 대표 자식이다. ConPTY 에서 tty 로 인식되어
+	// 대화형 REPL 로 뜬다. (python.exe 는 PATH 에서 찾는다.)
+	SetCurrentDirectory(_T("D:\\Work\\Study\\ConBox"));
+	con_box.start("python.exe",
+		con_box.grid_cols(), con_box.grid_rows());
 
 	// 키보드 입력을 받도록 ConBox 에 포커스를 준다.
 	con_box.SetFocus();
 	return FALSE;  // 포커스를 직접 설정했으므로 FALSE 를 반환한다.
 }
 
+void CConBoxDlg::OnDestroy()
+{
+	// 창이 닫힐 때(타이틀바 X 포함) 자식/출력펌프/타이머를 먼저 깔끔히 정리한다. 그래야
+	// 출력 펌프가 파괴 중인 ConBox 를 건드려 죽지 않고, 디버그 로그/캡처도 정상 마감된다.
+	// (con_box 자신의 OnDestroy 도 stop 하지만, 여기서 먼저 불러 종료 경로를 명확히 한다. 멱등.)
+	con_box.stop();
+	CDialog::OnDestroy();
+}
+
 void CConBoxDlg::on_child_exit(void* user)
 {
-	// ConExe 자식(powershell)이 종료되면 호출된다. 호출 시점에는 이미 ConExe 정리가 끝나
-	// is_running()==false 다. 데모에서는 ConBox 에 종료 안내만 출력한다(원하면 여기서 재시작
-	// 하거나 창을 닫을 수도 있다).
+	// ConExe 자식(cmd.exe)이 종료되면 호출된다. 호출 시점에는 이미 ConExe 정리가 끝나
+	// is_running()==false 다. 데모에서는 자식이 끝나면 메인 윈도우를 닫는다.
+	// 이 콜백은 ConExe 출력 펌프(타이머) 안에서 호출되므로, 펌프 스택을 빠져나온 뒤
+	// 안전하게 닫히도록 즉시 닫지 않고 WM_CLOSE 를 게시(PostMessage)한다.
 	CConBoxDlg* self = (CConBoxDlg*)user;
-	if (self != nullptr)
-		self->con_box.print(reinterpret_cast<const char*>(
-			u8"\r\n\x1b[33m[프로세스가 종료되었습니다. 창을 닫아 주세요.]\x1b[m\r\n"));
+	if (self != nullptr && self->GetSafeHwnd() != NULL)
+		self->PostMessage(WM_CLOSE);
 }
 
 void CConBoxDlg::layout_children()
@@ -150,9 +123,9 @@ void CConBoxDlg::layout_children()
 	CRect client;
 	GetClientRect(&client);
 
-	const int margin = 20;
+	const int margin = 5;
 
-	// 확인/취소 버튼이 없으므로 ConBox 가 사방 20px 마진으로 클라이언트 영역을 꽉 채운다.
+	// 확인/취소 버튼이 없으므로 ConBox 가 사방 5px 마진(베젤)으로 클라이언트 영역을 꽉 채운다.
 	int box_w = client.Width() - 2 * margin;
 	int box_h = client.Height() - 2 * margin;
 	if (box_w < 10) box_w = 10;
@@ -173,9 +146,9 @@ void CConBoxDlg::resize_to_grid(int cols, int rows)
 	// 클라이언트가 줄어 칸 수가 모자란다. 스크롤바 폭을 미리 더해 칸 수를 보장한다.
 	bw += ::GetSystemMetrics(SM_CXVSCROLL);
 
-	// 데모는 ConBox 를 사방 20px 마진으로 배치하므로(layout_children 과 같은 값),
+	// 데모는 ConBox 를 사방 5px 마진(베젤)으로 배치하므로(layout_children 과 같은 값),
 	// 대화상자 클라이언트는 그만큼 더 크다.
-	const int margin = 20;
+	const int margin = 5;
 	CRect want(0, 0, bw + 2 * margin, bh + 2 * margin);
 
 	// 클라이언트 사각형을 현재 창 스타일 기준의 창 사각형(테두리/타이틀바 포함)으로 키운다.

@@ -2,6 +2,10 @@
 setlocal EnableDelayedExpansion
 cd /d "%~dp0"
 
+set "TEMP=%~dp0\Temp"
+set "TMP=%~dp0\Temp"
+if not exist "%TEMP%"   mkdir "%TEMP%"
+
 if /i "%~1" == "up" goto :upgrade
 
 :claude

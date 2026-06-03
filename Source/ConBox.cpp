@@ -23,24 +23,197 @@
 //   입력           : set_input_sink, set_resize_sink, send_input_bytes, send_input_wide,
 //                    terminal_keydown, paste_clipboard, finalize_composition, OnChar, OnKeyDown
 //   그리기         : ensure_back_buffer, OnPaint
+//   자식 실행(ConPTY): Utf8ToWide/CreatePtyPipes(static), start, write, resize, stop, is_running,
+//                    set_exit_callback, pump, handle_child_exit, child_input_thunk/child_resize_thunk, OnDestroy
+//
+// ===== 설계 개요 (DESIGN) =====
+// 큰 그림·데이터 모델·확장 지점을 여기 한 곳에 모은다(별도 설계 문서 없음). 함수만 찾아 읽을 때,
+// 그 함수 머리 주석의 "(설계: [태그])" 표시를 보고 이 블록의 해당 [태그] 항만 읽으면 된다
+// (전체 통독 불필요). 멤버별 상세는 ConBox.h 선언 주석, 세부 구현은 각 함수 주석이 정본이다.
+//
+// [DM] 데이터 모델 (셀 그리드)
+//   screen: vector<Row>      현재 화면. 항상 rows 줄 x cols 칸(고정 폭). Row = vector<CharInfo>.
+//   CharInfo{ wchar_t ch; COLORREF fg,bg; bool wide; }  wide=2배폭(한글) lead 칸(다음 칸은 trail ch=0).
+//   scrollback: vector<Row>  화면 위로 밀려난 줄(상한 MAX_SCROLLBACK, 앞부터 버림).
+//   main_saved: vector<Row>  대체화면 진입 시 백업한 주 화면(복귀 시 swap).
+//   핵심 상태: cur_row/cur_col(화면 0-based 칸 커서) · view_top(보기 맨 위, 통합 인덱스) ·
+//     cursor_visible(?25) · saved_row/col(DECSC/RC) · scroll_top/bot(DECSTBM 영역) ·
+//     alt_active/saved_main_*(대체화면) · cols/rows · cell_w/h/base · margin_* · glyph_level ·
+//     vt_state/params/priv/gtlt(파서; print 청크 호출 사이 유지) · cur_fg/bg/bold/reverse(SGR) ·
+//     app_cursor_keys/bracketed_paste(자식이 DEC 모드로 켠 입력 인코딩) · back_dc/bmp(더블버퍼).
+//     ConPTY: h_pc/in_write/out_read/child_proc/child_running/exit_cb(start() 미사용 시 잠듦).
+//
+// [COORD] 좌표계
+//   셀 그리드 (cur_row,cur_col): 화면 칸. 2배폭은 lead+trail 2칸 → 칸 = 시각 칸.
+//   통합 인덱스 idx: scrollback 다음에 screen. line_at(idx) 가 줄을 돌려줌. 총줄수 = scrollback.size()+rows.
+//   화면/픽셀: view_top 기준 줄 + 좌/상 여백(margin_left/top)을 더해 변환.
+//
+// [VT] 출력 파서 (print -> vt_feed -> dispatch_csi)
+//   print: UTF-8 -> UTF-16, 글자마다 vt_feed 상태기계에 투입. 끝에 맨아래 스크롤 + 커서 bump + 다시그림.
+//   vt_feed: GROUND(글자->put_char, C0: CR/LF/BS/TAB(8배수)/BEL무시) / ESC(7,8=DECSC/RC · M=RI ·
+//     [=CSI · ]=OSC) / CSI(파라미터 누적 · ?=priv · <=>=gtlt · 최종바이트->dispatch_csi) / OSC(BEL/ST까지 버림).
+//   dispatch_csi: gtlt(프라이빗 <>= 시퀀스)면 통째 무시(최종바이트 오인 방지). 그 외 커서이동
+//     (CUU/CUD/CUF/CUB/CUP/HVP/CHA/VPA) · 지우기 ED/EL(erase_cells)/ECH · SGR(m) · 모드 h/l
+//     (?25,?1049/47,?1048,?1,?2004) · 저장복원(s/u) · 풀스크린(DECSTBM r, IL/DL, ICH/DCH, SU/SD) ·
+//     질의응답(DSR n -> 입력싱크로 CPR/상태, DA c -> VT102).
+//   put_char: 폭 초과면 autowrap, reverse면 색 스왑 기록, 2배폭은 다음 칸 trail. line_feed: 커서가
+//     영역 하단(scroll_bot)이면 scroll_up_region, 아니면 한 줄 내림.
+//   스크롤 일꾼: scroll_lines_up/down(범위 내 순수 회전) · scroll_up_region(주화면+상단0일 때만
+//     밀린 줄을 scrollback 보존) · enter/leave_alt_screen(main_saved 와 swap).
+//
+// [FONT] 폰트/셀 크기 (calc_cell_size — 상세 알고리즘은 그 함수 주석)
+//   고정 칸 cell_w/h/base 를 폰트 메트릭으로 결정. match 모드(set_kfont 크기<=0, 기본): 한글을 영문
+//   높이에 맞추고 칸 폭을 한글 폭에서 역산(cw=round(kwid/(2*kfill_ratio)) 를 [emin,natw] clamp;
+//   emin_ratio=1 이면 영문 자연폭 natw 고정 = wt.exe). OFF(크기>0): 영문 natw, 한글 원본, 줄높이=max.
+//
+// [PAINT] 그리기 (OnPaint — 더블버퍼)
+//   메모리 DC 에 한 프레임 다 그린 뒤 BitBlt(깜빡임 제거). view_top 부터 rows 줄 line_at 순회, 칸 단위
+//   (2배폭은 kfont 로 2칸, trail/빈칸은 글자 생략), TA_BASELINE 정렬. 블록/박스는 glyph_level 따라
+//   DrawBlockElement/DrawBoxLine 로 칸에 직접 칠. 커서: cursor_on&&cursor_visible 이면 get_cursor_rect
+//   사각형을 blend_cursor_color 로 채우고(한글 2칸/영문 1칸) 덮은 글자 재그림. child_caret(자식이 커서
+//   칸을 반전으로 칠함 = 칸 배경이 양옆과 다름)이면 ConBox 블록 생략(두 커서 방지).
+//
+// [IME] 한글 조합 (OnImeStart/Comp/End/Notify + OnPaint 의 comp_str)
+//   확정분(GCS_RESULTSTR)만 send_input_wide 로 자식에. 미완성(GCS_COMPSTR)은 comp_str 에 담아 직접
+//   그림(속 빈 2px 테두리, 커서 칸 고정, return 0 으로 시스템 인라인 + WM_CHAR 중복 억제). 줄 중간 조합은
+//   OnPaint 가 ScrollDC 로 우측으로 밀어 삽입 미리보기(삽입 모드 자식 기준; Python REPL 등). 조합 순서
+//   보장: finalize_composition 이 트리거 키 직전 ImmNotifyIME(CPS_COMPLETE)로 강제 확정 -> [완성][트리거].
+//   커서 폭: is_hangul_mode(ImmGetConversionStatus IME_CMODE_NATIVE), 한/영 토글은 OnImeNotify 가 즉시 반영.
+//
+// [PTY] 자식 실행 (start/write/resize/stop/pump/handle_child_exit — 파일 하단 "자식 실행" 섹션)
+//   start: CreatePtyPipes(파이프 + CreatePseudoConsole) -> STARTUPINFOEX+속성 -> CreateProcessW ->
+//     PTY측 끝 닫기 -> set_input_sink/set_resize_sink 로 자신 배선 -> SetTimer(PUMP_TIMER). 입력 ->
+//     write -> 자식 stdin, 그리드 변경 -> resize -> ResizePseudoConsole. pump(PUMP_TIMER 폴링):
+//     PeekNamedPipe -> ReadFile -> print. 종료 감지: ConPTY 는 자식이 끝나도 conhost 가 파이프를 쥐어
+//     EOF 를 못 보므로 WaitForSingleObject(child_proc.hProcess)로 폴링 -> handle_child_exit(stop 후 exit_cb).
+//     수명: OnDestroy(+소멸자)가 stop. start() 를 안 부르면 ConPTY 멤버는 잠들고 순수 터미널 뷰로 동작.
+//
+// [EXT] 확장 지점 / 한계
+//   새 VT 시퀀스 = dispatch_csi/vt_feed 에 분기 추가(셀이 COLORREF 라 16/256/트루컬러 표현). 새 보조
+//   함수는 ConBox.cpp 상단 static(이식 단위를 ConBox.h/.cpp 두 파일로 유지). 폰트/창/여백/장평 변경 시
+//   calc_cell_size(폰트) -> update_metrics(-> reset_screen) 순서. 미구현: 마우스 드래그 선택/복사
+//   (셀 그리드 좌표 재작성 필요). UTF-8 멀티바이트가 출력 청크 경계에서 잘리면 깨질 수 있음(드묾).
+//   한글 IME 순서/커서 폭은 자동 캡처 불가 -> 실타이핑 수동 검증(Learned.md).
+// ===== 설계 개요 끝 =====
 
 #include "ConBox.h"
 #include <string>
 #include <imm.h>            // 한글 IME (Input Method Manager)
 #pragma comment(lib, "imm32.lib")
 
+// ConPTY 속성 매크로. 일부 SDK 구성에서 CreatePseudoConsole/HPCON 은 노출돼도 이 매크로가
+// 노출되지 않는 경우가 있어, 없으면 직접 정의한다(ProcThreadAttributePseudoConsole=22 |
+// PROC_THREAD_ATTRIBUTE_INPUT(0x00020000) = 0x00020016, SDK 전역에서 동일한 고정값).
+#ifndef PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE_HANDLE
+#define PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE_HANDLE 0x00020016
+#endif
+
 // 커서 깜빡임 타이머 ID.
 static const UINT_PTR CURSOR_TIMER = 1;
+// 자식 출력 폴링 타이머 ID(= start() 가 거는 타이머). CURSOR(1)/DBG(2) 와 구분해 3 을 쓴다.
+static const UINT_PTR PUMP_TIMER = 3;
+static const UINT PUMP_INTERVAL_MS = 16;   // 출력 폴링 간격(ms). 16~30 이면 화면 갱신이 부드럽다.
 
-// VT 기본 색. SGR 0(리셋)과 39/49 가 복귀하는 색이며, 요구사양 기본값(흰 글자/검은 바탕)과 같다.
-static const COLORREF DEFAULT_FG = RGB(255, 255, 255);
-static const COLORREF DEFAULT_BG = RGB(0, 0, 0);
+// VT 기본 색. SGR 0(리셋)과 39/49 가 복귀하는 색이며, 요구사양 기본값과 같다.
+// 값은 wt.exe 의 Campbell 스킴을 아크릴/불투명 90% 로 띄웠을 때 화면에 보이는 표시색에 맞췄다
+// (밝은 회색 글자 / 짙은 회색 바탕). 순수 검정 대신 RGB(32,32,32) 바탕이라 wt 와 비슷해 보인다.
+static const COLORREF DEFAULT_FG = RGB(200, 200, 200);
+static const COLORREF DEFAULT_BG = RGB(32, 32, 32);
 
 // VT 파서 상태값. (vt_state)
 enum { VT_GROUND = 0, VT_ESC = 1, VT_CSI = 2, VT_OSC = 3 };
 
 // 스크롤백 줄 수 상한.
 static const int MAX_SCROLLBACK = 5000;
+
+// ===== [DEBUG] 한글/커서 렌더 디버깅용 로그+캡처 (제거 시 이 블록과 // [DEBUG] 호출부 삭제) =====
+// 디버그 하네스 활성 스위치: 0 = 비활성(기본), 1 = 활성(입력/출력 시 캡처+상태 로그 수집).
+// 활성화하려면 1 로 바꿔 재빌드한다. (ConExe 의 I/O 덤프는 ConExe.cpp 의 DBG_IO 로 따로 켠다.)
+#define DBG_HARNESS 0
+#include <cstdio>
+#include <cstdarg>
+#include <vector>
+#include <gdiplus.h>
+#pragma comment(lib, "gdiplus.lib")
+// 지연(echo) 캡처용 일회성 타이머 ID. CURSOR_TIMER(1)와 겹치지 않게 2 를 쓴다.
+static const UINT_PTR DBG_TIMER = 2;
+// Temp 의 디버그 로그에 시각과 함께 한 줄 덧붙인다.
+static void DbgLog(const char* fmt, ...)
+{
+	FILE* fp = nullptr;
+	if (fopen_s(&fp, "D:\\Work\\Study\\ConBox\\Temp\\condbg.log", "ab") != 0 || fp == nullptr)
+		return;
+	SYSTEMTIME st; GetLocalTime(&st);
+	fprintf(fp, "%02d:%02d:%02d.%03d ", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+	va_list ap; va_start(ap, fmt); vfprintf(fp, fmt, ap); va_end(ap);
+	fputc('\n', fp);
+	fclose(fp);
+}
+// PNG 인코더 CLSID 를 찾는다(GDI+ 표준 패턴).
+static int DbgGetEncoderClsid(const WCHAR* mime, CLSID* clsid)
+{
+	UINT num = 0, size = 0;
+	Gdiplus::GetImageEncodersSize(&num, &size);
+	if (size == 0) return -1;
+	std::vector<BYTE> buf(size);
+	Gdiplus::ImageCodecInfo* info = (Gdiplus::ImageCodecInfo*)buf.data();
+	Gdiplus::GetImageEncoders(num, size, info);
+	for (UINT i = 0; i < num; ++i)
+		if (wcscmp(info[i].MimeType, mime) == 0) { *clsid = info[i].Clsid; return (int)i; }
+	return -1;
+}
+// HBITMAP(백버퍼)을 PNG 파일로 바로 저장한다. GDI+ 를 지연 초기화(한 번)해서 쓴다(검증 후 제거).
+static void DbgWritePng(HBITMAP hbmp, const char* path)
+{
+	if (hbmp == nullptr) return;
+	static bool inited = false;
+	static ULONG_PTR token = 0;
+	if (!inited) {
+		Gdiplus::GdiplusStartupInput input;
+		if (Gdiplus::GdiplusStartup(&token, &input, NULL) != Gdiplus::Ok) return;
+		inited = true;
+	}
+	WCHAR wpath[300];
+	MultiByteToWideChar(CP_ACP, 0, path, -1, wpath, 300);
+	Gdiplus::Bitmap* bmp = Gdiplus::Bitmap::FromHBITMAP(hbmp, NULL);
+	if (bmp != nullptr) {
+		CLSID clsid;
+		if (DbgGetEncoderClsid(L"image/png", &clsid) >= 0)
+			bmp->Save(wpath, &clsid, NULL);
+		delete bmp;
+	}
+}
+
+// [임시 진단] I/O 덤프 활성 스위치: 0 = 비활성(기본), 1 = 활성(conexe_io.log 에 자식 IN/OUT
+// 바이트 덤프). 활성화하려면 1 로 바꿔 재빌드한다. (화면 캡처는 위 DBG_HARNESS 스위치.)
+#define DBG_IO 0
+
+// [임시 진단] 자식 I/O 바이트열을 사람이 읽을 수 있게 풀어 Temp 로그에 덧붙인다.
+// ESC/CR/LF/제어문자를 마커로 바꿔, 자식이 보내는 커서 제어 시퀀스(?25h/?25l, CUP 등)를
+// 눈으로 확인하려는 용도다. DBG_IO 가 0 이면 본문이 컴파일되지 않아 호출은 무동작이다.
+static void DbgDumpIo(const char* tag, const char* data, int len)
+{
+#if DBG_IO
+	FILE* fp = nullptr;
+	if (fopen_s(&fp, "D:\\Work\\Study\\ConBox\\Temp\\conexe_io.log", "ab") != 0 || fp == nullptr)
+		return;
+	fprintf(fp, "[%s %d] ", tag, len);
+	for (int i = 0; i < len; ++i) {
+		unsigned char c = (unsigned char)data[i];
+		if (c == 0x1B)      fputs("<ESC>", fp);
+		else if (c == 0x0D) fputs("<CR>", fp);
+		else if (c == 0x0A) fputs("<LF>\n", fp);   // 줄바꿈은 실제 개행도 넣어 가독성 확보
+		else if (c == 0x7F) fputs("<DEL>", fp);
+		else if (c < 0x20)  fprintf(fp, "<%02X>", c);
+		else                fputc(c, fp);
+	}
+	fputs("\n----\n", fp);
+	fclose(fp);
+#else
+	(void)tag; (void)data; (void)len;   // 비활성 시 미사용 매개변수 경고 방지
+#endif
+}
+// ===== [DEBUG] 끝 =====
 
 // 메시지 맵: 그리기/배경/크기/키보드/스크롤/IME 를 처리한다.
 BEGIN_MESSAGE_MAP(CConBox, CWnd)
@@ -53,6 +226,7 @@ BEGIN_MESSAGE_MAP(CConBox, CWnd)
 	ON_WM_VSCROLL()
 	ON_WM_MOUSEWHEEL()
 	ON_WM_TIMER()
+	ON_WM_DESTROY()
 	ON_MESSAGE(WM_IME_STARTCOMPOSITION, &CConBox::OnImeStart)
 	ON_MESSAGE(WM_IME_COMPOSITION, &CConBox::OnImeComp)
 	ON_MESSAGE(WM_IME_ENDCOMPOSITION, &CConBox::OnImeEnd)
@@ -310,9 +484,9 @@ static bool DrawBoxLine(CDC& dc, wchar_t ch, int px, int py, int cw, int chh, CO
 
 CConBox::CConBox()
 {
-	// 색상 기본값: 검은 바탕에 흰 글씨.
-	cur_fg = RGB(255, 255, 255);
-	cur_bg = RGB(0, 0, 0);
+	// 색상 기본값: VT 기본 색과 같은 출처(짙은 회색 바탕에 밝은 회색 글씨, wt Campbell 표시색).
+	cur_fg = DEFAULT_FG;
+	cur_bg = DEFAULT_BG;
 
 	// 셀 크기는 폰트 측정 전까지 쓰일 안전한 임시값으로 둔다.
 	cell_w = 8;
@@ -359,21 +533,32 @@ CConBox::CConBox()
 	app_cursor_keys = false;
 	bracketed_paste = false;
 
-	// 입력 싱크는 기본적으로 없다(읽기 전용 뷰어). ConExe 등이 set_input_sink 로 등록한다.
+	// 입력 싱크는 기본적으로 없다(읽기 전용 뷰어). start() 가, 또는 호스트가 set_input_sink 로 건다.
 	input_sink = nullptr;
 	input_sink_user = nullptr;
 
-	// 리사이즈 싱크도 기본적으로 없다. ConExe 가 attach() 에서 set_resize_sink 로 등록한다.
+	// 리사이즈 싱크도 기본적으로 없다. start() 가 내부적으로 set_resize_sink 로 건다.
 	resize_sink = nullptr;
 	resize_sink_user = nullptr;
+
+	// ConPTY 자식 실행 상태. start() 전까지는 모두 비어 있다(순수 터미널 뷰).
+	h_pc = nullptr;
+	in_write = nullptr;
+	out_read = nullptr;
+	ZeroMemory(&child_proc, sizeof(child_proc));
+	child_running = false;
+	exit_cb = nullptr;
+	exit_cb_user = nullptr;
 
 	// 블록 커서 색 혼합 비율 기본값: 배경:전경 = 6:4 (배경에 가까운 중간색).
 	cursor_bg_weight = 6;
 	cursor_fg_weight = 4;
 
 	// match 모드에서 한 칸 폭(장평)을 정하는 비율 기본값.
+	// emin_ratio = 1.0 이면 영문 칸을 자연폭(natw) 밑으로 좁히지 않으므로 cell_w 가 natw 로
+	// 고정되어, wt.exe 처럼 영문은 자연폭·한글은 2칸에 자연폭으로 그려진다(이때 kfill_ratio 무효).
 	kfill_ratio = 0.92f;
-	emin_ratio = 0.7f;
+	emin_ratio = 1.0f;
 
 	// 박스/블록 문자 직접 렌더는 기본적으로 블록 요소만 켠다(로고 등의 칸 틈 방지).
 	glyph_level = 1;
@@ -392,10 +577,19 @@ CConBox::CConBox()
 	back_old_bmp = nullptr;
 	back_w = 0;
 	back_h = 0;
+
+	// [DEBUG] 녹화 여부는 DBG_HARNESS 스위치를 따른다(기본 비활성). dbg_record 가 false 면
+	// dbg_dump(캡처+로그)와 정착 타이머(DBG_TIMER) 가 모두 동작하지 않는다.
+	dbg_record = (DBG_HARNESS != 0);
+	dbg_seq = 0;
+	dbg_input_seen = false;
 }
 
 CConBox::~CConBox()
 {
+	// 자식/PTY/폴링 타이머가 남아 있으면 정리한다(보통 OnDestroy 가 먼저 처리하지만 안전망).
+	stop();
+
 	// 메모리 DC 에 백버퍼 비트맵이 선택된 채로 CBitmap 이 파괴되지 않도록,
 	// 원래 비트맵을 되돌려 놓는다. (CDC/CBitmap 멤버 자체는 자동 정리된다.)
 	if (back_old_bmp)
@@ -448,15 +642,16 @@ void CConBox::make_font(CFont& font, LOGFONTW& lf_out, const char* name, float s
 
 void CConBox::apply_default_fonts()
 {
-	// 기본값: 영문 Consolas 13pt Bold, 한글 맑은 고딕 Bold.
+	// 기본값: 영문 Cascadia Mono 12pt normal, 한글 맑은 고딕 normal (wt.exe 클로드 프로파일에 맞춤).
 	// 한글 크기는 0(=영문 높이에 맞추는 match 모드, 생성자에서 kfont_match_efont=true)으로
 	// 두어 "size<=0 이면 match" 규칙과 일관되게 한다.
 	if (efont.GetSafeHandle() == NULL)
-		make_font(efont, efont_lf, "Consolas", 13, "B");
+		make_font(efont, efont_lf, "Cascadia Mono", 12, "");
 	if (kfont.GetSafeHandle() == NULL)
-		make_font(kfont, kfont_lf, "Malgun Gothic", 0, "B");
+		make_font(kfont, kfont_lf, "Malgun Gothic", 0, "");
 }
 
+// (설계: [FONT] — 파일 상단 "설계 개요" 참조)
 void CConBox::calc_cell_size()
 {
 	// 창이 있으면 창 DC, 없으면 화면 DC 로 폰트 크기를 측정한다.
@@ -691,7 +886,72 @@ void CConBox::OnTimer(UINT_PTR id)
 			InvalidateRect(&rc, FALSE);
 		return;
 	}
+	if (id == PUMP_TIMER) {
+		// 자식(ConPTY) 출력 폴링. start() 가 건 타이머다. 자식을 안 띄웠으면 이 타이머도 없다.
+		pump();
+		return;
+	}
+	if (id == DBG_TIMER) {   // [DEBUG] 자식 출력이 ~80ms 동안 멈춘(정착) 직후 최종 화면을 1장 캡처
+		KillTimer(DBG_TIMER);
+		dbg_dump("out");
+		return;
+	}
 	CWnd::OnTimer(id);
+}
+
+// [DEBUG] 현재 백버퍼(화면에 그려지는 그대로)를 BMP 로 저장하고 커서/조합 상태를 로그에 남긴다.
+void CConBox::dbg_dump(const char* tag)
+{
+	if (!dbg_record) return;
+	// "out"(출력 정착)이 아닌 캡처는 곧 입력 이벤트다. 첫 입력 후부터 출력 디바운스 캡처를 켠다
+	// (그 전 claude 부팅 출력은 캡처하지 않아 노이즈를 막는다).
+	if (strcmp(tag, "out") != 0)
+		dbg_input_seen = true;
+	if (GetSafeHwnd() != nullptr)
+		UpdateWindow();   // 대기 중인 페인트를 강제로 백버퍼에 반영한 뒤 캡처
+	++dbg_seq;
+	char path[300];
+	sprintf_s(path, sizeof(path), "D:\\Work\\Study\\ConBox\\Temp\\cap_%03d_%s.png", dbg_seq, tag);
+
+	// 전체 창 대신 커서가 있는 줄만 가로 한 줄(창 좌우 끝까지) 잘라 저장한다(PNG 가 작아져
+	// 판독/토큰에 유리). 가로는 긴 한글 입력이 늘어나도 다 담기도록 창 폭 전체로 두고,
+	// 세로만 커서 줄 +-1 줄로 좁힌다. 커서 위치를 못 구하면(드묾) 전체 백버퍼를 저장한다.
+	CRect cur;
+	if (get_cursor_rect(cur) && back_w > 0 && back_h > 0) {
+		int left   = 0;
+		int right  = back_w;
+		int top    = cur.top    - cell_h;
+		int bottom = cur.bottom + cell_h;
+		if (top < 0) top = 0;
+		if (bottom > back_h) bottom = back_h;
+		int cw = right - left, ch = bottom - top;
+		if (cw > 0 && ch > 0) {
+			CDC crop_dc;
+			crop_dc.CreateCompatibleDC(&back_dc);
+			CBitmap crop_bmp;
+			crop_bmp.CreateCompatibleBitmap(&back_dc, cw, ch);
+			CBitmap* old = crop_dc.SelectObject(&crop_bmp);
+			crop_dc.BitBlt(0, 0, cw, ch, &back_dc, left, top, SRCCOPY);
+			crop_dc.SelectObject(old);
+			DbgWritePng((HBITMAP)crop_bmp.GetSafeHandle(), path);
+		}
+	}
+	else {
+		DbgWritePng((HBITMAP)back_bmp.GetSafeHandle(), path);
+	}
+
+	// 조합 중 문자열(comp_str)을 UTF-8 과 코드포인트로 풀어 함께 기록한다.
+	char comp_utf8[128] = { 0 };
+	if (!comp_str.empty())
+		WideCharToMultiByte(CP_UTF8, 0, comp_str.c_str(), (int)comp_str.size(),
+			comp_utf8, sizeof(comp_utf8) - 1, NULL, NULL);
+	char cps[160] = { 0 }; int off = 0;
+	for (size_t i = 0; i < comp_str.size() && off < (int)sizeof(cps) - 8; ++i)
+		off += sprintf_s(cps + off, sizeof(cps) - off, "U+%04X ", (unsigned)comp_str[i]);
+
+	DbgLog("[seq=%03d %s] cur=(%d,%d) on=%d vis=%d hangul=%d comp=\"%s\" %s",
+		dbg_seq, tag, cur_row, cur_col, cursor_on ? 1 : 0, cursor_visible ? 1 : 0,
+		is_hangul_mode() ? 1 : 0, comp_utf8, cps);
 }
 
 void CConBox::set_margin(int top, int left, int bottom, int right)
@@ -837,7 +1097,7 @@ Row CConBox::blank_row() const
 void CConBox::reset_screen()
 {
 	// 화면(screen)을 현재 rows x cols 크기로 맞춘다. 기존 줄은 보존하되 cols 로 패딩/자르고,
-	// 행 수를 rows 로 맞춘다. (정교한 reflow/PTY 동기화는 M3c)
+	// 행 수를 rows 로 맞춘다. (셀 단위 패딩/자르기만 하며 정교한 reflow 는 하지 않는다.)
 	CharInfo blank;
 	blank.ch = L' ';
 	blank.fg = cur_fg;
@@ -867,6 +1127,7 @@ void CConBox::reset_screen()
 	if (scroll_top >= scroll_bot) { scroll_top = 0; scroll_bot = rows - 1; }
 }
 
+// (설계: [COORD]/[DM] — 파일 상단 "설계 개요" 참조)
 const Row& CConBox::line_at(int idx) const
 {
 	// (scrollback + screen) 통합 인덱스. 앞부분은 scrollback, 그 다음이 현재 화면이다.
@@ -1067,6 +1328,7 @@ void CConBox::leave_alt_screen()
 	reset_screen();
 }
 
+// (설계: [VT] — 파일 상단 "설계 개요" 참조)
 void CConBox::put_char(wchar_t wc)
 {
 	// 현재 커서 칸에 글자 하나를 쓴다. 이 글자를 넣으면 칸이 화면 폭(cols)을 넘는 경우 먼저
@@ -1127,6 +1389,11 @@ void CConBox::print(const char* text)
 	update_scrollbar();
 	bump_cursor();
 	Invalidate();
+
+	// [DEBUG] 자식 출력이 올 때마다 정착 타이머(80ms)를 재시작한다. 더 출력이 없으면 OnTimer 가
+	// "out" 캡처를 1장 남긴다(연속 청크를 1장으로 합침). 첫 입력 전(부팅)에는 안 찍는다.
+	if (dbg_record && dbg_input_seen && GetSafeHwnd() != nullptr)
+		SetTimer(DBG_TIMER, 80, NULL);
 }
 
 void CConBox::scroll_to_bottom()
@@ -1163,6 +1430,7 @@ static COLORREF Xterm256ToRgb(int n)
 	return RGB(v, v, v);
 }
 
+// (설계: [VT] — 파일 상단 "설계 개요" 참조)
 void CConBox::vt_feed(wchar_t wc)
 {
 	// VT 파서 상태기계. 한 글자(또는 제어문자)를 받아 현재 상태에 따라 처리한다.
@@ -1245,6 +1513,7 @@ void CConBox::vt_feed(wchar_t wc)
 	}
 }
 
+// (설계: [VT] — 파일 상단 "설계 개요" 참조)
 void CConBox::dispatch_csi(wchar_t fin)
 {
 	// '<' '=' '>' 접두로 시작한 시퀀스(2차 DA, kitty keyboard 프로토콜, XTMODKEYS 등)는
@@ -1383,7 +1652,7 @@ void CConBox::dispatch_csi(wchar_t fin)
 				if (set) { saved_row = cur_row; saved_col = cur_col; }
 				else { cur_row = saved_row; cur_col = saved_col; clamp_cursor(); }
 			}
-			// 그 밖의 프라이빗 모드(?7 autowrap=항상 켬, ?2004 bracketed paste=M5 등)는 무시한다.
+			// 그 밖의 프라이빗 모드(?7 autowrap=항상 켬, ?2004 bracketed paste 등)는 무시한다.
 		}
 		break;
 	}
@@ -1572,54 +1841,79 @@ LRESULT CConBox::OnImeStart(WPARAM w, LPARAM l)
 	}
 	// 조합 시작 시 깜빡임 상태를 켜 둔다.
 	bump_cursor();
-	// 조합 글자는 시스템 기본 인라인 표시에 맡긴다(ConBox 직접 조합 렌더는 이후 단계 M5).
-	// 위에서 조합/후보 창만 커서 위치로 옮겨 두었다.
+	dbg_dump("imestart");   // [DEBUG] 조합 시작 시점
+	// 조합 글자는 ConBox 가 직접 그린다(OnImeComp 가 comp_str 에 담고 OnPaint 가 커서 칸에
+	// 그림). 위에서는 후보 목록 창 위치만 커서 아래로 맞춰 두었다(시스템 인라인은 안 쓴다).
 	return Default();
 }
 
+// (설계: [IME] — 파일 상단 "설계 개요" 참조)
 LRESULT CConBox::OnImeComp(WPARAM w, LPARAM l)
 {
-	// 터미널(raw) 모드: 확정(GCS_RESULTSTR)된 글자만 UTF-8 로 자식에 보내고, 미완성 조합은
-	// 시스템 기본 인라인 표시에 맡긴다(로컬 버퍼에 삽입하지 않는다).
-	// (조합 중 방향키 등으로 글자가 옮겨진 칸에서 완성되는 순서 문제의 근본 해결은 M5 에서
-	//  강제 확정 후 전송 순서를 보장하는 방식으로 다룬다 - 요구사양서 3.1 참조.)
-	if (input_sink != nullptr) {
-		HIMC himc = ImmGetContext(m_hWnd);
-		if (himc == NULL)
-			return Default();
-		if (l & GCS_RESULTSTR) {
-			// 확정분을 추출해 자식으로 보낸다. 기본 처리(Default)를 부르지 않고 메시지를
-			// 소비(return 0)해, 시스템이 같은 확정분을 WM_CHAR/WM_IME_CHAR 로 또 보내는
-			// 중복을 막는다.
-			LONG bytes = ImmGetCompositionStringW(himc, GCS_RESULTSTR, NULL, 0);
-			int n = bytes / (int)sizeof(wchar_t);
-			if (n > 0) {
-				std::wstring r;
-				r.resize(n);
-				ImmGetCompositionStringW(himc, GCS_RESULTSTR, &r[0], bytes);
-				send_input_wide(r.c_str(), n);
-			}
-			ImmReleaseContext(m_hWnd, himc);
-			bump_cursor();
-			return 0;
-		}
-		// 미완성 조합(GCS_COMPSTR 등)은 시스템 기본 인라인 표시에 맡긴다.
-		ImmReleaseContext(m_hWnd, himc);
-		bump_cursor();
+	// 확정(GCS_RESULTSTR)된 글자는 UTF-8 로 자식에 보내고, 미완성 조합(GCS_COMPSTR)은
+	// comp_str 에 담아 ConBox 가 블록 커서 칸에 직접 그린다(OnPaint). 시스템 기본 인라인
+	// 표시는 메시지를 소비(return 0)해 끈다. 조합창 위치를 커서에 고정하지 못해 첫 칸에
+	// 겹치던 문제를 없애기 위함이다.
+	// (조합 중 방향키 등으로 글자가 옮겨진 칸에서 완성되는 순서 문제는, 트리거 키 직전에
+	//  강제 확정해 전송 순서를 보장하는 방식으로 다룬다 - Requirements.md §10 (IME compose-finalize order) 참조.)
+	HIMC himc = ImmGetContext(m_hWnd);
+	if (himc == NULL)
 		return Default();
+
+	// 확정분: 추출해 자식으로 보낸다(터미널 모드일 때). 확정됐으니 조합 표시를 지운다.
+	if (l & GCS_RESULTSTR) {
+		LONG bytes = ImmGetCompositionStringW(himc, GCS_RESULTSTR, NULL, 0);
+		int n = bytes / (int)sizeof(wchar_t);
+		if (n > 0 && input_sink != nullptr) {
+			std::wstring r;
+			r.resize(n);
+			ImmGetCompositionStringW(himc, GCS_RESULTSTR, &r[0], bytes);
+			send_input_wide(r.c_str(), n);
+		}
+		comp_str.clear();
 	}
 
-	// 입력 싱크가 없는 읽기 전용 뷰어 모드에서는 로컬 조합 편집을 하지 않는다.
-	// 조합 표시는 시스템 기본 인라인에 맡긴다.
+	// 미완성 조합분: comp_str 에 담는다(길이 0 이면 비운다). 직접 그릴 것이므로 보관만 한다.
+	if (l & GCS_COMPSTR) {
+		LONG bytes = ImmGetCompositionStringW(himc, GCS_COMPSTR, NULL, 0);
+		int n = bytes / (int)sizeof(wchar_t);
+		if (n > 0) {
+			comp_str.resize(n);
+			ImmGetCompositionStringW(himc, GCS_COMPSTR, &comp_str[0], bytes);
+		}
+		else {
+			comp_str.clear();
+		}
+	}
+
+	ImmReleaseContext(m_hWnd, himc);
+
+	// 조합/확정 표시가 바뀌었으니 커서 칸부터 줄 오른쪽 끝까지를 다시 그린다. OnPaint 가 조합
+	// 폭만큼 그 줄 픽셀을 우측으로 미는(삽입 흉내) 영역이라 2칸이 아니라 줄 끝 띠를 무효화한다.
+	CRect rc;
+	if (get_cursor_rect(rc)) {
+		rc.right = margin_left + cols * cell_w + cell_w;
+		InvalidateRect(rc);
+	}
 	bump_cursor();
-	return Default();
+	dbg_dump("ime");   // [DEBUG] 자모 한 타마다 직후 캡처(자식 echo 는 print 의 "out" 캡처가 잡음)
+	// 메시지를 소비해 시스템 기본 인라인 표시와 확정분의 WM_CHAR/WM_IME_CHAR 중복을 막는다.
+	return 0;
 }
 
 LRESULT CConBox::OnImeEnd(WPARAM w, LPARAM l)
 {
-	// 로컬 버퍼에 삽입한 조합 글자가 없으므로(조합 표시는 시스템 기본 인라인에 맡긴다)
-	// 정리할 것이 없다. 조합이 끝났으니 본문 블록 커서 깜빡임을 재개하고 기본 처리에 맡긴다.
+	// 조합이 끝났으니 직접 그리던 조합 표시(comp_str)를 지우고 커서 칸을 다시 그린다.
+	// 확정분은 이미 OnImeComp(GCS_RESULTSTR)에서 자식에 보냈고 자식 에코로 화면에 그려진다.
+	comp_str.clear();
+	// 조합 중 우측으로 밀어 그렸던 줄을 원위치로 되돌리기 위해 줄 끝까지 무효화한다.
+	CRect rc;
+	if (get_cursor_rect(rc)) {
+		rc.right = margin_left + cols * cell_w + cell_w;
+		InvalidateRect(rc);
+	}
 	bump_cursor();
+	dbg_dump("imeend");   // [DEBUG] 조합 종료 시점(자식 echo 는 "out" 캡처가 잡음)
 	return Default();
 }
 
@@ -1781,7 +2075,7 @@ bool CConBox::finalize_composition()
 	// 한글 IME 조합 중이면 강제로 확정(완성)시킨다. CPS_COMPLETE 는 동기적으로
 	// WM_IME_COMPOSITION(GCS_RESULTSTR)을 디스패치하므로, 이 함수가 반환하기 전에 OnImeComp 가
 	// 완성 글자의 UTF-8 을 자식에 먼저 보낸다. 그래서 트리거 키 전송 직전에 부르면 "제자리 완성
-	// 후 트리거" 순서가 보장된다(요구사양서 3.1).
+	// 후 트리거" 순서가 보장된다(Requirements.md §10 (IME compose-finalize order)).
 	//
 	// 한글 IME 가 방향키 등으로 조합을 스스로 먼저 확정하는 경우도 있는데(WM_IME_COMPOSITION 이
 	// WM_KEYDOWN 보다 먼저 옴), 그때는 이 함수 시점에 조합이 남아 있지 않아 no-op 이 된다(안전망).
@@ -1828,6 +2122,7 @@ void CConBox::OnChar(UINT ch, UINT rep, UINT flags)
 			}
 		}
 		bump_cursor();
+		dbg_dump("char");   // [DEBUG] 영문/확정 문자 전송 직후(자식 echo 는 "out" 캡처가 잡음)
 		return;
 	}
 
@@ -1843,7 +2138,7 @@ void CConBox::OnKeyDown(UINT vk, UINT rep, UINT flags)
 		bool tshift = (::GetKeyState(VK_SHIFT) & 0x8000) != 0;
 
 		// 조합 종료 트리거 키(방향키/Home/End/Delete/Insert/Page/Enter/Tab/Esc)면 먼저 IME
-		// 조합을 강제 확정해, 완성 글자가 트리거 키보다 먼저 자식에 전송되게 한다(요구사양서 3.1).
+		// 조합을 강제 확정해, 완성 글자가 트리거 키보다 먼저 자식에 전송되게 한다(Requirements.md §10 (IME compose-finalize order)).
 		switch (vk) {
 		case VK_LEFT: case VK_RIGHT: case VK_UP: case VK_DOWN:
 		case VK_HOME: case VK_END: case VK_DELETE: case VK_INSERT:
@@ -1856,6 +2151,9 @@ void CConBox::OnKeyDown(UINT vk, UINT rep, UINT flags)
 
 		if (terminal_keydown(vk, tctrl, tshift))
 			bump_cursor();
+		// [DEBUG] 특수키(Enter/방향키/Home/End 등) 전송 직후 + echo 캡처. IME 가 처리 중인
+		// 키(VK_PROCESSKEY)는 OnImeComp 에서 이미 캡처하므로 중복을 피해 건너뛴다.
+		if (vk != VK_PROCESSKEY) dbg_dump("key");
 		return;
 	}
 
@@ -1916,6 +2214,7 @@ void CConBox::ensure_back_buffer(CDC* ref, int w, int h)
 	}
 }
 
+// (설계: [PAINT]/[IME] — 파일 상단 "설계 개요" 참조)
 void CConBox::OnPaint()
 {
 	CPaintDC paintDC(this);
@@ -1992,12 +2291,90 @@ void CConBox::OnPaint()
 	dc.SelectObject(old_font);
 	dc.SetTextAlign(old_align);
 
+	// IME 조합 중(미확정)이면 그 글자를 블록 커서 칸에 직접 그린다(시스템 기본 인라인 대신).
+	// 위치를 ConBox 블록 커서(cur_row/cur_col, 자식 에코로 항상 정확히 유지됨)에 고정해
+	// 조합 글자가 입력 시작 칸에 겹치던 문제를 없앤다. 조합 중임을 나타내려고 속이 빈(배경색)
+	// 사각형에 2픽셀 외곽선 커서를 그리고 그 위에 전경색 글자를 얹는다. 조합 중엔 깜빡임 없이
+	// 항상 보이게 한다(글자가 깜빡여 사라지지 않게).
+	if (!comp_str.empty()) {
+		CRect cur;
+		if (get_cursor_rect(cur)) {
+			// 조합 문자열 표시 폭(칸 수)을 계산한다. 한글 한 음절이면 보통 2칸이다.
+			int cells = 0;
+			for (size_t i = 0; i < comp_str.size(); ++i)
+				cells += IsWideChar(comp_str[i]) ? 2 : 1;
+			if (cells < 1) cells = 1;
+			int comp_w_px = cells * cell_w;
+			cur.right = cur.left + comp_w_px;
+
+			// 줄 중간(기존 글자 위)에서 조합하면 조합 블록이 그 글자를 덮어 가린다. 조합 중인
+			// 글자는 아직 자식에 보내지 않아(확정분만 전송) 자식이 삽입으로 뒤 글자를 밀어낼 수
+			// 없기 때문이다. 대상 자식이 삽입 모드 줄편집(Python REPL/readline 등)이면, 확정 시
+			// 자식 echo 가 할 삽입을 미리 흉내 내 커서 칸부터 줄 오른쪽 끝까지의 픽셀을 조합 폭만큼
+			// 우측으로 밀어 둔다(ScrollDC 는 같은 DC 겹침 이동에 안전). 노출된 빈 자리에는 아래에서
+			// 조합 블록을 그린다. 끝 글자는 클립으로 잘리나 조합 중 임시 표시라 무방하며, 조합
+			// 종료 시 무효화(OnImeComp/OnImeEnd)로 원위치로 돌아온다.
+			int row_right = margin_left + cols * cell_w;
+			if (cur.left < row_right) {
+				CRect scroll_rc(cur.left, cur.top, row_right, cur.bottom);
+				dc.ScrollDC(comp_w_px, 0, &scroll_rc, &scroll_rc, NULL, NULL);
+			}
+
+			// 속 빈(배경색) + 2픽셀 외곽선 사각형: 먼저 외곽선 색으로 전체를 칠하고, 2픽셀
+			// 안쪽을 배경색으로 덮어 테두리만 남긴다. 외곽선 색은 블록 커서 색을 재활용한다.
+			const int bw = 2;   // 외곽선 두께(픽셀)
+			COLORREF cblk = blend_cursor_color();
+			dc.FillSolidRect(cur, cblk);
+			CRect inner(cur.left + bw, cur.top + bw, cur.right - bw, cur.bottom - bw);
+			if (inner.right > inner.left && inner.bottom > inner.top)
+				dc.FillSolidRect(inner, cur_bg);
+
+			int saved = dc.SaveDC();
+			dc.IntersectClipRect(&cur);
+			dc.SetTextAlign(TA_LEFT | TA_BASELINE);
+			dc.SetBkMode(TRANSPARENT);
+			dc.SetTextColor(cur_fg);
+
+			int x = cur.left;
+			for (size_t i = 0; i < comp_str.size(); ++i) {
+				wchar_t wc = comp_str[i];
+				bool wide = IsWideChar(wc);
+				dc.SelectObject(wide ? &kfont : &efont);
+				bool cdrawn = (glyph_level >= 1 && DrawBlockElement(dc, wc, x, cur.top, cell_w, cell_h, cur_fg))
+				           || (glyph_level >= 2 && DrawBoxLine(dc, wc, x, cur.top, cell_w, cell_h, cur_fg));
+				if (!cdrawn)
+					dc.TextOutW(x, cur.top + cell_base, &wc, 1);
+				x += (wide ? 2 : 1) * cell_w;
+			}
+
+			dc.RestoreDC(saved);
+		}
+	}
 	// 커서를 그린다. 칸을 꽉 채우는 블록 커서를 cursor_on 이고 커서가 표시 상태(cursor_visible)일
 	// 때만 그려 깜빡인다. 화면 밖이면 그리지 않는다. 커서 칸에 이미 글자가 있으면 블록 위에 전경색
 	// 으로 글자를 다시 그려 가려지지 않게 한다(한글 모드 2칸 블록이 다음 칸 글자까지 덮는 경우 포함).
-	if (cursor_on && cursor_visible) {
+	// 단, 조합 중(comp_str 비어 있지 않음)이면 위에서 조합 글자를 이미 그렸으므로 건너뛴다.
+	else if (cursor_on && cursor_visible) {
 		CRect cur;
 		if (get_cursor_rect(cur)) {
+			// 자식이 커서 칸을 직접 배경색으로 강조했는지(반전 캐럿 등) 본다. claude 같은 일부
+			// TUI 는 입력 캐럿을 배경 반전 셀로 화면에 직접 그리면서 하드웨어 커서도 그 칸에 켜 둔다
+			// (?25h). 그 위에 ConBox 블록 커서를 또 그리면 깜빡임 OFF 때 자식의 밝은 반전 칸이
+			// 드러나 커서가 두 개처럼 보인다. 그래서 커서 칸 배경이 양옆 칸과 다른 국소 강조이면
+			// (= 자식이 그 칸을 캐럿으로 칠한 것) 우리 블록을 안 그리고 자식 캐럿을 그대로 커서로
+			// 삼는다. 전면 테마 배경(모든 칸이 같은 비기본 배경)은 양옆과 같아 강조로 보지 않으므로
+			// 커서가 사라지지 않는다.
+			bool child_caret = false;
+			if (cur_row >= 0 && cur_row < (int)screen.size()) {
+				const Row& cl = screen[cur_row];
+				if (cur_col >= 0 && cur_col < (int)cl.size()) {
+					COLORREF ref_bg = DEFAULT_BG;
+					if (cur_col > 0)                       ref_bg = cl[cur_col - 1].bg;
+					else if (cur_col + 1 < (int)cl.size()) ref_bg = cl[cur_col + 1].bg;
+					child_caret = (cl[cur_col].bg != ref_bg);
+				}
+			}
+			if (!child_caret) {
 			COLORREF cblk = blend_cursor_color();
 			dc.FillSolidRect(cur, cblk);
 
@@ -2030,10 +2407,306 @@ void CConBox::OnPaint()
 				// SaveDC 이전 상태(폰트/정렬/클립)로 한 번에 원복한다.
 				dc.RestoreDC(saved);
 			}
+			}   // if (!child_caret)
 		}
 	}
 
 	// 메모리 DC 에 완성된 한 프레임을 화면으로 한 번에 복사한다. (깜빡임 제거)
 	// 비트맵은 멤버로 계속 살려 두므로 여기서 떼어내지 않는다. (소멸자에서 정리)
 	paintDC.BitBlt(0, 0, rc.Width(), rc.Height(), &back_dc, 0, 0, SRCCOPY);
+}
+
+
+// ===== 자식 실행 (ConPTY) =====
+// start() 로 자식을 띄우면 이 그룹이 ConPTY 입출력을 담당한다. 자식 출력은 PUMP_TIMER 가
+// 주기적으로 pump() 를 불러 print() 로 흘리고, 키 입력/리사이즈는 start() 가 자신에게 건
+// 입력/리사이즈 싱크(child_input_thunk/child_resize_thunk)를 통해 write()/resize() 로 온다.
+
+// UTF-8 문자열을 UTF-16 으로 변환해 돌려준다(널 종료 포함). 실패/빈 문자열이면 빈 벡터.
+static std::vector<wchar_t> Utf8ToWide(const char* s)
+{
+	std::vector<wchar_t> out;
+	if (s == nullptr)
+		return out;
+	int wlen = ::MultiByteToWideChar(CP_UTF8, 0, s, -1, NULL, 0);
+	if (wlen <= 0)
+		return out;
+	out.resize(wlen);
+	::MultiByteToWideChar(CP_UTF8, 0, s, -1, out.data(), wlen);
+	return out;
+}
+
+// 입력/출력 파이프 쌍을 만들고 CreatePseudoConsole 로 의사 콘솔을 구성한다.
+// PTY 측 끝(자식이 읽을 입력 read 끝, 자식이 쓸 출력 write 끝)은 호출부가 spawn 후 닫는다.
+// 우리가 계속 쓰는 끝(in_write, out_read)은 멤버에 보관한다.
+static bool CreatePtyPipes(int cols, int rows,
+	HPCON& h_pc_out, HANDLE& in_write_out, HANDLE& out_read_out,
+	HANDLE& pty_in_read_out, HANDLE& pty_out_write_out)
+{
+	HANDLE in_read = nullptr, in_write = nullptr;
+	HANDLE out_read = nullptr, out_write = nullptr;
+
+	if (!::CreatePipe(&in_read, &in_write, NULL, 0))
+		return false;
+	if (!::CreatePipe(&out_read, &out_write, NULL, 0)) {
+		::CloseHandle(in_read);
+		::CloseHandle(in_write);
+		return false;
+	}
+
+	COORD size;
+	size.X = (SHORT)cols;
+	size.Y = (SHORT)rows;
+	HPCON pc = nullptr;
+	HRESULT hr = ::CreatePseudoConsole(size, in_read, out_write, 0, &pc);
+	if (FAILED(hr)) {
+		::CloseHandle(in_read);
+		::CloseHandle(in_write);
+		::CloseHandle(out_read);
+		::CloseHandle(out_write);
+		return false;
+	}
+
+	h_pc_out = pc;
+	in_write_out = in_write;
+	out_read_out = out_read;
+	// PTY 측 끝은 호출부가 자식 생성 후 닫는다(그래야 자식 종료 시 out_read 가 EOF 를 본다).
+	pty_in_read_out = in_read;
+	pty_out_write_out = out_write;
+	return true;
+}
+
+// (설계: [PTY] — 파일 상단 "설계 개요" 참조)
+bool CConBox::start(const char* cmdline, int cols, int rows)
+{
+	// 이미 돌고 있으면 먼저 정리하고 새로 시작한다.
+	stop();
+
+	if (cols < 1) cols = 1;
+	if (rows < 1) rows = 1;
+
+	// 파이프 + 의사 콘솔 구성. PTY 측 끝(pty_in_read/pty_out_write)은 자식 생성 후 닫는다.
+	HANDLE pty_in_read = nullptr, pty_out_write = nullptr;
+	if (!CreatePtyPipes(cols, rows, h_pc, in_write, out_read, pty_in_read, pty_out_write)) {
+		stop();
+		return false;
+	}
+
+	// 자식이 의사 콘솔에 붙도록 STARTUPINFOEX 의 속성 목록을 구성한다.
+	STARTUPINFOEXW si;
+	ZeroMemory(&si, sizeof(si));
+	si.StartupInfo.cb = sizeof(STARTUPINFOEXW);
+
+	// 속성 1개(PSEUDOCONSOLE_HANDLE)를 담을 목록 크기를 먼저 구한 뒤 할당한다.
+	SIZE_T attr_bytes = 0;
+	::InitializeProcThreadAttributeList(NULL, 1, 0, &attr_bytes);
+	si.lpAttributeList =
+		(LPPROC_THREAD_ATTRIBUTE_LIST)::HeapAlloc(::GetProcessHeap(), 0, attr_bytes);
+	if (si.lpAttributeList == nullptr) {
+		::CloseHandle(pty_in_read);
+		::CloseHandle(pty_out_write);
+		stop();
+		return false;
+	}
+	if (!::InitializeProcThreadAttributeList(si.lpAttributeList, 1, 0, &attr_bytes) ||
+		!::UpdateProcThreadAttribute(si.lpAttributeList, 0,
+			PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE_HANDLE,
+			h_pc, sizeof(h_pc), NULL, NULL)) {
+		::HeapFree(::GetProcessHeap(), 0, si.lpAttributeList);
+		::CloseHandle(pty_in_read);
+		::CloseHandle(pty_out_write);
+		stop();
+		return false;
+	}
+
+	// 명령줄은 CreateProcessW 가 쓰기 가능 버퍼를 요구하므로 가변 벡터에 담는다.
+	std::vector<wchar_t> cmd = Utf8ToWide(cmdline);
+	if (cmd.empty()) {
+		::DeleteProcThreadAttributeList(si.lpAttributeList);
+		::HeapFree(::GetProcessHeap(), 0, si.lpAttributeList);
+		::CloseHandle(pty_in_read);
+		::CloseHandle(pty_out_write);
+		stop();
+		return false;
+	}
+
+	BOOL ok = ::CreateProcessW(
+		NULL,            // 모듈 이름은 명령줄에서 찾게 한다
+		cmd.data(),      // 가변 명령줄 버퍼
+		NULL, NULL,
+		FALSE,           // 핸들 상속 안 함 (의사 콘솔 속성으로 콘솔만 연결)
+		EXTENDED_STARTUPINFO_PRESENT,
+		NULL, NULL,
+		&si.StartupInfo,
+		&child_proc);
+
+	// 속성 목록은 더 이상 필요 없다.
+	::DeleteProcThreadAttributeList(si.lpAttributeList);
+	::HeapFree(::GetProcessHeap(), 0, si.lpAttributeList);
+
+	// PTY 측 끝은 이제 닫는다. 의사 콘솔이 자체 복제본을 들고 있으므로 우리 쪽은 불필요하며,
+	// 출력 write 끝을 닫아야 자식 종료 시 out_read 가 EOF/broken pipe 를 보게 된다.
+	::CloseHandle(pty_in_read);
+	::CloseHandle(pty_out_write);
+
+	if (!ok) {
+		ZeroMemory(&child_proc, sizeof(child_proc));
+		stop();
+		return false;
+	}
+
+	// 입력(ConBox 키 -> 자식 stdin)과 리사이즈(그리드 -> ResizePseudoConsole)를 자신에게 건다.
+	// 범용 싱크 메커니즘을 그대로 재사용한다(순수 터미널 뷰의 set_input_sink 와 같은 경로).
+	set_input_sink(&CConBox::child_input_thunk, this);
+	set_resize_sink(&CConBox::child_resize_thunk, this);
+
+	// 출력 폴링 타이머를 ConBox 자기 창에 건다(CConExe 가 쓰던 메시지 전용 창은 불필요).
+	// start() 는 open() 이후에 호출되어야 한다(창이 있어야 타이머가 동작한다).
+	SetTimer(PUMP_TIMER, PUMP_INTERVAL_MS, NULL);
+
+	child_running = true;
+	return true;
+}
+
+void CConBox::write(const char* data, int len)
+{
+	if (in_write == nullptr || data == nullptr || len <= 0)
+		return;
+	DbgDumpIo("IN", data, len);   // [임시 진단] DBG_IO 가 1 일 때만 기록
+	DWORD written = 0;
+	::WriteFile(in_write, data, (DWORD)len, &written, NULL);
+}
+
+void CConBox::child_input_thunk(const char* bytes, int len, void* user)
+{
+	CConBox* self = (CConBox*)user;
+	if (self != nullptr)
+		self->write(bytes, len);
+}
+
+void CConBox::resize(int cols, int rows)
+{
+	// 의사 콘솔이 살아 있을 때만 크기를 바꾼다. 자식은 콘솔 크기 변화를 감지해 화면을 다시 그린다.
+	if (h_pc == nullptr || !child_running)
+		return;
+	if (cols < 1) cols = 1;
+	if (rows < 1) rows = 1;
+	COORD size;
+	size.X = (SHORT)cols;
+	size.Y = (SHORT)rows;
+	::ResizePseudoConsole(h_pc, size);
+}
+
+void CConBox::child_resize_thunk(int cols, int rows, void* user)
+{
+	CConBox* self = (CConBox*)user;
+	if (self != nullptr)
+		self->resize(cols, rows);
+}
+
+void CConBox::set_exit_callback(void (*cb)(void* user), void* user)
+{
+	exit_cb = cb;
+	exit_cb_user = user;
+}
+
+void CConBox::stop()
+{
+	// 폴링 타이머부터 끈다(더 이상 pump 가 불리지 않게). 창이 살아 있을 때만 KillTimer.
+	if (GetSafeHwnd() != nullptr)
+		KillTimer(PUMP_TIMER);
+
+	// start() 가 자신에게 걸어 둔 입력/리사이즈 싱크를 해제한다(자식이 없으면 입력은 버린다).
+	if (input_sink == &CConBox::child_input_thunk)
+		set_input_sink(nullptr, nullptr);
+	if (resize_sink == &CConBox::child_resize_thunk)
+		set_resize_sink(nullptr, nullptr);
+
+	// 의사 콘솔을 닫으면 자식 콘솔 세션이 끝난다.
+	if (h_pc != nullptr) {
+		::ClosePseudoConsole(h_pc);
+		h_pc = nullptr;
+	}
+	if (in_write != nullptr) {
+		::CloseHandle(in_write);
+		in_write = nullptr;
+	}
+	if (out_read != nullptr) {
+		::CloseHandle(out_read);
+		out_read = nullptr;
+	}
+	if (child_proc.hThread != nullptr) {
+		::CloseHandle(child_proc.hThread);
+		child_proc.hThread = nullptr;
+	}
+	if (child_proc.hProcess != nullptr) {
+		::CloseHandle(child_proc.hProcess);
+		child_proc.hProcess = nullptr;
+	}
+	ZeroMemory(&child_proc, sizeof(child_proc));
+	child_running = false;
+}
+
+bool CConBox::is_running() const
+{
+	return child_running;
+}
+
+void CConBox::pump()
+{
+	if (!child_running || out_read == nullptr)
+		return;
+
+	// 파이프에 쌓인 바이트 수를 먼저 확인한다(블로킹 ReadFile 회피).
+	// PeekNamedPipe 가 실패하면 파이프가 닫힌 것(자식 종료)이므로 정리한다.
+	DWORD avail = 0;
+	if (!::PeekNamedPipe(out_read, NULL, 0, NULL, &avail, NULL)) {
+		handle_child_exit();
+		return;
+	}
+
+	// 쌓인 만큼만 읽어 화면(print)으로 반영한다. 받은 바이트는 UTF-8 이며, print 가 VT 시퀀스로
+	// 해석해 셀 그리드에 반영한다. 한 번의 펌프에서 여러 번 나눠 읽을 수 있다.
+	while (avail > 0) {
+		char buf[4096];
+		DWORD want = (avail < sizeof(buf) - 1) ? avail : (DWORD)(sizeof(buf) - 1);
+		DWORD got = 0;
+		if (!::ReadFile(out_read, buf, want, &got, NULL) || got == 0) {
+			handle_child_exit();
+			return;
+		}
+		buf[got] = '\0';   // print() 가 널 종료 UTF-8 을 받으므로 종료문자를 둔다.
+		DbgDumpIo("OUT", buf, (int)got);   // [임시 진단] DBG_IO 가 1 일 때만 기록
+		print(buf);
+		avail -= got;
+	}
+
+	// 자식 종료 감지. ConPTY 에서는 자식이 끝나도 conhost(의사 콘솔)가 출력 파이프의 write 끝을
+	// 계속 쥐고 있어 PeekNamedPipe 가 EOF 를 보지 못한다. 그래서 자식 프로세스 핸들을 직접
+	// 폴링해 종료를 확인한다. 종료가 확인되면 남은 출력을 모두 비운 뒤에 정리/콜백을 한다.
+	if (child_proc.hProcess != nullptr &&
+		::WaitForSingleObject(child_proc.hProcess, 0) == WAIT_OBJECT_0) {
+		DWORD more = 0;
+		if (::PeekNamedPipe(out_read, NULL, 0, NULL, &more, NULL) && more > 0)
+			return;   // 아직 읽을 출력이 남았으면 다음 펌프에서 마저 읽는다.
+		handle_child_exit();
+	}
+}
+
+void CConBox::handle_child_exit()
+{
+	// 자식이 자연 종료했다. 콜백 정보를 먼저 챙긴 뒤 정리하고, 정리가 끝난 상태(is_running()==false)
+	// 에서 콜백을 부른다. 그러면 콜백이 곧바로 새 start() 를 호출해도 우리 정리와 충돌하지 않는다.
+	void (*cb)(void*) = exit_cb;
+	void* user = exit_cb_user;
+	stop();
+	if (cb != nullptr)
+		cb(user);
+}
+
+void CConBox::OnDestroy()
+{
+	// 창이 파괴되기 전에 자식/폴링 타이머를 먼저 정리한다(폴링이 파괴 중 창을 건드리지 않게).
+	stop();
+	CWnd::OnDestroy();
 }

@@ -4,8 +4,7 @@
 
 #pragma once
 
-#include "../Source/ConBox.h"   // 데모에서 사용할 ConBox 컨트롤
-#include "../Source/ConExe.h"   // 데모에서 자식 프로그램을 실행할 ConExe 실행기
+#include "../Source/ConBox.h"   // 데모에서 사용할 ConBox 컨트롤 (자식 실행 ConPTY 기능 포함)
 
 
 // CConBoxDlg 대화 상자
@@ -28,14 +27,14 @@ public:
 protected:
 	HICON m_hIcon;
 
-	CConBox con_box;   // 데모용 ConBox 컨트롤 인스턴스
-	CConExe con_exe;   // 데모용 ConExe 실행기 (M1 검증: cmd /c dir 출력을 ConBox 로 흘림)
+	CConBox con_box;   // 데모용 ConBox 컨트롤 인스턴스 (start() 로 자식도 직접 실행)
 
 	// 생성된 메시지 맵 함수
 	virtual BOOL OnInitDialog();
 	afx_msg void OnPaint();
 	afx_msg HCURSOR OnQueryDragIcon();
 	afx_msg void OnSize(UINT type, int cx, int cy);
+	afx_msg void OnDestroy();
 	DECLARE_MESSAGE_MAP()
 
 	// ConBox 와 확인/취소 버튼을 현재 창 크기에 맞춰 다시 배치한다.
