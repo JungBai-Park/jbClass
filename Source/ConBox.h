@@ -1,442 +1,461 @@
-﻿// ConBox.h
+// ConBox.h
 //
-// 이식 가능한 터미널 컨트롤 ConBox 의 클래스 선언.
-// wt.exe 처럼 터미널 기반 자식 프로그램의 콘솔 출력을 표시하고 키 입력을 자식으로 보내는
-// MFC CWnd 파생 컨트롤이다. 내부는 cols x rows 셀 그리드 화면 버퍼 + 스크롤백으로 동작한다.
+// Portable terminal control (CWnd-derived). Like wt.exe it displays the console
+// output of a terminal child program and forwards keystrokes to it. Internally a
+// cols x rows cell-grid screen buffer plus scrollback.
 //
-// 이식 단위는 ConBox.h / ConBox.cpp 두 파일뿐이다.
-// "사용"만 할 때는 이 헤더만 읽으면 충분하다 — 구현 세부(ConBox.cpp)는 동작을 "수정"할 때만
-// 본다. (cpp 통독은 토큰 낭비이며, 그 파일 상단 목차로 필요한 함수만 찾아 부분만 보면 된다.)
+// Portability unit is just ConBox.h + ConBox.cpp. To "use" it this header alone
+// suffices; read ConBox.cpp only when modifying behavior (its top-of-file table of
+// contents lets you find one function without reading the whole file).
 //
-// --- 요구사항 / 의존성 ---
-//   - MFC(유니코드) + Windows 전용. afxwin.h 에 의존한다.
-//   - start() 로 자식을 실행하려면 Windows 10 1809(빌드 17763) 이상(ConPTY). 순수 뷰로만 쓰면 무관.
-//   - 한글 IME 용 imm32.lib 는 ConBox.cpp 가 #pragma comment 로 자동 링크한다(호스트 설정 불필요).
-//   - 글자를 선명하게 하려면 "호스트 앱"이 시작 시 SetProcessDPIAware() 를 호출한다
-//     (DPI 인식은 프로세스 단위 속성이라 이 컨트롤이 아니라 호스트가 켠다).
-//   - 외부로 노출되는 모든 문자열 API 는 UTF-8(const char*) 을 받는다.
-//   - 이 파일은 미리 컴파일된 헤더(pch.h)에 의존하지 않고 필요한 헤더를 직접 포함한다(단독 컴파일 가능).
-//   - .h/.cpp 는 UTF-8 BOM 으로 저장한다(BOM 이 없으면 MSVC 가 CP949 로 오인해 한글 주석이 깨진다).
+// --- Requirements / dependencies ---
+//   - MFC (Unicode), Windows only. Depends on afxwin.h.
+//   - start() (ConPTY child) needs Windows 10 1809 (build 17763)+. Pure-view use does not.
+//   - imm32.lib (Korean IME) is auto-linked by ConBox.cpp via #pragma comment (no host setup).
+//   - For crisp glyphs the HOST app calls SetProcessDPIAware() at startup. DPI awareness is a
+//     process-wide property, so the host enables it, not this control.
+//   - Every string API takes UTF-8 (const char*) so C++ string literals pass directly.
+//   - Self-contained: includes its own headers, does not depend on a precompiled header.
+//   - Save .h/.cpp as ASCII (comments are ASCII-only) so encoding is unambiguous.
 //
-// --- 사용 예 (호스트의 부모 창에서) ---
-//     CConBox box;                            // 보통 멤버로 보유한다
-//     box.set_efont("Consolas", 13, "B");     // (선택) 폰트 지정. 생략하면 기본값을 쓴다
-//     box.open(parent, 0, 0, 400, 300);       // 좌표로 자식 창 생성
-//     box.print("hello\n");                   // 출력 (UTF-8) — 셀 그리드에 흐른다
+// --- Usage (inside the host parent window) ---
+//     CConBox box;                            // usually held as a member
+//     box.set_efont("Consolas", 13, "B");     // (optional) font; omitted = defaults
+//     box.open(parent, 0, 0, 400, 300);       // create child window by coords
+//     box.print("hello\n");                   // output (UTF-8) flows into the cell grid
 //
-// ConBox 는 두 가지로 쓸 수 있다.
-//  (1) 순수 터미널 뷰: 호스트가 print() 로 바이트를 먹이고 set_input_sink() 로 키 입력 바이트를
-//      받아간다(터미널 raw 모드 - 로컬 에코 끔, 키를 VT/UTF-8 로 인코딩해 싱크로 보냄). 어떤
-//      바이트 소스(파일/소켓/직접 만든 프로세스)와도 연결할 수 있다.
-//  (2) ConPTY 자식 실행기: start(cmdline, cols, rows) 한 번이면 ConPTY 로 자식(cmd/powershell/
-//      python REPL 등)을 띄우고 그 콘솔 입출력을 자동 연결한다(내부적으로 위 입력/리사이즈 싱크를
-//      재사용한다). 자식 출력은 내부 타이머가 폴링해 print() 로 흘린다.
-// 싱크도 없고 start() 도 안 하면 print() 출력만 보여주는 읽기 전용 뷰어다.
+// Two ways to use ConBox:
+//  (1) Pure terminal view: host feeds bytes via print() and takes keystroke bytes via
+//      set_input_sink() (raw mode: no local echo; keys encoded to VT/UTF-8). Works with any
+//      byte source (file/socket/host-managed process).
+//  (2) ConPTY child runner: one start(cmdline) call spawns a child (cmd/powershell/python REPL)
+//      and auto-wires its console I/O (console size taken from grid_cols()/grid_rows(); internally
+//      reuses the input/resize sinks). Child output is polled by an internal timer into print().
+// With no sink and no start(), it is a read-only viewer of print() output.
 
 #pragma once
 
-// ConPTY(CreatePseudoConsole/HPCON/ResizePseudoConsole 등)는 Windows 10 1809(빌드 17763, RS5)
-// 이상에서만 선언된다. afxwin.h 가 windows.h 를 끌어오므로 그 전에 최소 버전을 직접 지정한다
-// (이 헤더만으로 자기완결적이게). 호스트가 targetver 로 더 높은 값을 정했으면 존중하도록 #ifndef.
+// ConPTY (CreatePseudoConsole/HPCON/ResizePseudoConsole) is declared only on Win10 1809
+// (build 17763, RS5)+. afxwin.h pulls in windows.h, so set the minimum version before it.
+// #ifndef so a host that picked a higher target (via targetver) is respected.
 #ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x0A00            // Windows 10
 #endif
 #ifndef NTDDI_VERSION
-#define NTDDI_VERSION 0x0A000006       // NTDDI_WIN10_RS5 (ConPTY 최소 버전)
+#define NTDDI_VERSION 0x0A000006       // NTDDI_WIN10_RS5 (ConPTY minimum)
 #endif
 
-#include <afxwin.h>   // MFC 코어 (CWnd, CDC, CFont 등) — windows.h(ConPTY HPCON 등)도 끌어온다
-#include <vector>     // 내부 셀 그리드 버퍼
-#include <string>     // IME 조합 중 문자열(comp_str)
+#include <afxwin.h>   // MFC core (CWnd, CDC, CFont); also pulls in windows.h (ConPTY HPCON etc.)
+#include <vector>
+#include <string>
 
-// 화면 한 칸(셀)에 들어가는 정보. 셀 하나 = 화면의 한 칸이다.
-// 2배 폭 글자(한글/CJK)는 lead 칸(ch=글자, wide=true)이 차지하고, 바로 다음 칸은 trail 칸
-// (ch=0)으로 비워 둔다(렌더는 lead 가 두 칸을 그리고 trail 은 건너뛴다). 빈 칸은 ch=L' '.
+// One screen cell. A double-width glyph (Korean/CJK) occupies a lead cell (ch=glyph, wide=true)
+// and the next cell is its trail (ch=0, skipped by the renderer). An empty cell is ch=L' '.
 struct CharInfo {
-	wchar_t  ch;     // 글자 (UTF-16). 0 = wide 글자의 trail 칸(렌더 생략)
-	COLORREF fg;     // 전경색
-	COLORREF bg;     // 배경색
-	bool     wide;   // 2배 폭 글자의 lead 칸 여부 (한글, CJK 등)
+	wchar_t  ch;     // UTF-16 char; 0 = trail cell of a wide glyph (render skips it)
+	COLORREF fg;
+	COLORREF bg;
+	bool     wide;   // lead cell of a double-width glyph
 };
 
-// 화면 한 줄. cols 개 셀(칸)로 이루어진다(빈 칸 포함 고정 폭). 2배 폭 글자는 lead+trail 두 셀.
 typedef std::vector<CharInfo> Row;
 
-// 터미널 컨트롤 본체.
-// 사용 순서: set_efont/set_kfont 로 폰트를 먼저 지정한 뒤 open() 으로 창을 만든다.
 class CConBox : public CWnd
 {
 public:
 	CConBox();
 	virtual ~CConBox();
 
-	// 부모 창 안에 좌표 (x0,y0)-(x1,y1) 위치로 자식 창을 생성한다.
-	// 리소스 에디터 없이 좌표만으로 창이 만들어진다.
+	// Create the child window at coords (x0,y0)-(x1,y1) inside parent (no .rc resource needed).
 	void open(CWnd* parent, int x0, int y0, int x1, int y1);
 
-	// 영문 폰트를 지정한다. 크기 단위는 포인트, opts 는 추가설정 문자열이다.
-	// (명세의 char* 대신 const char* 로 받는다. 문자열 리터럴 호출을 위해서이다.)
+	// Set the English font. size is in points. opts is an attribute string (see set_builtin_glyphs
+	// note below and ConBox.cpp ParseFontOpts for the grammar).
 	void set_efont(const char* name, float size, const char* opts);
 
-	// 한글 폰트를 지정한다. 인자 규칙은 set_efont 와 같다.
-	// 단 size 가 0 이하이면 영문 폰트와 같은 픽셀(em) 높이로 맞추는 match 모드가 켜진다.
-	// 이 경우 size 값 자체는 무시되고, 한글을 영문과 같은 높이로 다시 만들어 줄 높이가
-	// 영문 기준으로 촘촘해진다(박스 그리기 문자의 세로선 연결에 유리). 양수이면 match
-	// 모드가 꺼져 한글은 그 크기 그대로이고 줄 높이는 두 폰트 중 큰 쪽이 된다.
-	// 아무 설정도 하지 않은 기본 상태는 match 켜짐이다.
+	// Set the Korean font (same arg rules as set_efont). If size <= 0, "match mode" turns on:
+	// Korean is rasterized to the same pixel (em) height as English (the size value is ignored) and
+	// line height tracks English, which keeps box-drawing vertical lines connecting. If size > 0,
+	// match mode is off: Korean keeps that size and line height is the max of the two fonts.
+	// Default (nothing set) is match mode on.
 	void set_kfont(const char* name, float size, const char* opts);
 
-	// match 모드에서 한 칸 폭(장평)을 정하는 두 비율을 지정한다. match 모드일 때만 효과가 있다.
-	// fill_ratio: 한글 한 글자가 두 칸을 채우는 비율(기본 0.92). 키우면 영문 칸이 좁아져
-	//   한글 자간이 줄고, 줄이면 자간이 넓어진다.
-	// emin_ratio: 영문을 자연 폭의 이 비율 밑으로는 좁히지 않는 가독성 하한(기본 1.0).
-	//   기본 1.0 이면 영문 칸이 자연 폭으로 고정되어 wt.exe 처럼 한글 자간이 약간 넓어진다.
-	//   1 미만으로 낮추면 영문 칸이 좁아지며 한글이 두 칸을 더 촘촘히 채운다.
-	void set_kfont_fill(float fill_ratio, float emin_ratio);
+	// Force-scale cell height/width by a ratio after font metrics are computed.
+	// 1.0 = unchanged, <1.0 shrinks, >1.0 enlarges. Persists until the next font change.
+	// Calling after open() recomputes cols/rows.
+	void adjust(float h_ratio, float w_ratio);
 
-	// 박스/블록 그리기 문자를 폰트 글리프 대신 ConBox 가 도형으로 직접 그리는 수준을 정한다.
-	// 폰트의 블록 글리프는 칸을 가로/세로로 꽉 채우지 않아(특히 세로) 인접 칸 사이에 틈이
-	// 생기는데, 칸을 직접 칠하면 틈 없이 이어지고 폰트에 의존하지 않는다.
-	//   0 = 끔(전부 폰트로 그림)
-	//   1 = 블록 요소(U+2580~259F: 반칸/사분면/풀블록)만 직접 그림 (기본값)
-	//   2 = 1 에 더해 박스선도 직접 그림: 단선 직교/정션(─│┌┐└┘├┤┬┴┼),
-	//       둥근 모서리(╭╮╰╯, 직각으로 대체), 대각선(╱╲╳), 순수 이중선(═║╔╗╚╝╠╣╦╩╬).
-	// 단/이중 혼합선·점선·굵은선·음영은 어느 수준에서도 폰트로 그린다.
+	// Choose how many box/block characters ConBox draws as shapes itself instead of via the font.
+	// Font block glyphs often leave gaps between adjacent cells (especially vertically); drawing the
+	// cell directly is gap-free and font-independent.
+	//   0 = off (everything via the font)
+	//   1 = block elements U+2580..259F (halves/quadrants/full) only (default)
+	//   2 = also box lines: single orthogonal/junctions, rounded corners (drawn square),
+	//       diagonals, and pure double lines.
+	// Mixed single/double, dashed, heavy, and shaded lines are always font-drawn.
 	void set_builtin_glyphs(int level);
 
-	// 텍스트를 출력한다. 현재 커서 위치에서 이어서 셀 그리드에 쓰며, 폭(cols)을 넘으면 자동
-	// 줄바꿈하고, 화면 맨 아래를 넘으면 위 줄을 스크롤백으로 밀어내며 스크롤한다.
-	// text 는 UTF-8 이며 특수문자를 다음과 같이 처리한다.
-	//   \n : 다음 줄 맨 처음으로 이동, \r : 현재 줄 맨 처음으로 이동(덮어쓰기), \t : 4칸 탭
-	// 출력 후에는 강제로 맨 아래까지 스크롤한다.
+	// Print text at the cursor into the cell grid. Autowraps past cols; scrolls (top line -> scrollback)
+	// past the bottom. text is UTF-8 and is parsed as VT/ANSI (escape sequences, \r \n \b \t). New
+	// output forces a scroll to the bottom. Parser state persists across calls (chunked output is safe).
 	void print(const char* text);
 
-	// 현재 전경색(글자색)을 지정한다. 이후 출력에 적용된다.
+	// Default foreground / background color for subsequent output (child SGR may override; SGR
+	// 0/39/49 reset to these). Also the basis for the cursor block blend.
 	void set_color(COLORREF fg);
-
-	// 현재 배경색을 지정한다. 이후 출력에 적용된다.
 	void set_bg_color(COLORREF bg);
 
-	// 블록 커서 색을 배경색과 전경색의 혼합으로 정할 때의 비율을 지정한다.
-	// (배경:전경) 가중치이며 기본값은 6:4 (배경에 가까운 색). 합으로 정규화하므로
-	// (6,4) 와 (60,40) 은 같다. 합이 0 이면 무시한다.
+	// Cursor color = blend of default bg:fg at this weight ratio. Default bg 4 : fg 6 (leans fg).
+	// Normalized by the sum, so (4,6) == (40,60). Ignored if the sum is 0. (I-beam draws pure fg, not
+	// this blend; this blend is the block/underline color and the IME composing box outline.)
 	void set_cursor_blend(int bg_weight, int fg_weight);
 
-	// 커서 깜빡임 간격(밀리초)을 지정한다. interval_ms 가 0 이면 깜빡이지 않고 항상
-	// 켜 둔다. 기본값은 시스템 캐럿 깜빡임 속도(GetCaretBlinkTime)를 따른다.
+	// Cursor blink interval (ms); 0 = never blink (always on). Default follows the system caret rate
+	// (GetCaretBlinkTime).
 	void set_cursor_blink(int interval_ms);
 
-	// 클라이언트 영역 안쪽 여백(픽셀)을 지정한다. 여백 안쪽에만 글자가 그려진다.
-	// CSS 단축 스타일로 생략한 변은 다른 변을 따른다.
-	//   left   가 음수면 top 을 따른다.
-	//   bottom 이 음수면 top 을 따른다.
-	//   right  가 음수면 (위에서 결정된) left 를 따른다.
-	// 예: set_margin(5) -> 사방 5,  set_margin(5,8) -> 상하 5 / 좌우 8.
-	// 기본값은 사방 10 이며, open 이후 호출하면 resize 처럼 칸 수/줄 수를 재계산한다.
+	// Set the cursor shape. 0 = default (currently mapped to fixed block; the default mapping is
+	// raised as new shapes are added). Explicit shapes:
+	//   1=blinking block, 2=fixed block, 3=blinking underline, 4=fixed underline,
+	//   5=blinking I-beam, 6=fixed I-beam.
+	// Odd types blink (subject to set_cursor_blink / system rate); even types stay solid. Block and
+	// underline hide while a Korean IME composition is active (only the composing glyph shows); the
+	// I-beam stays visible during composition. Korean (2-cell) cursors render 2 cells wide.
+	void set_cursor(int type);
+
+	// Inner padding (px); glyphs draw only inside it. CSS-shorthand omission of negative sides:
+	// left<0 follows top, bottom<0 follows top, right<0 follows the resolved left.
+	// Default 10 on all sides. Calling after open() recomputes the grid.
 	void set_margin(int top, int left = -1, int bottom = -1, int right = -1);
 
-	// 가로 cols 칸(영문 기준) x 세로 rows 줄을 모두 담는 데 필요한 클라이언트 영역
-	// 픽셀 크기를 w/h 로 돌려준다. 안쪽 여백(set_margin)도 포함한 값이다.
-	// 호스트가 "80x24 로 띄우기" 처럼 그리드 기준으로 창 크기를 정할 때 쓴다.
-	// 한 칸 픽셀은 폰트/DPI 로 정해지므로 open() 이후(셀 크기 확정 후) 호출해야 정확하다.
+	// Return in w/h the client pixel size that holds cols x rows cells including set_margin padding.
+	// Cell px depends on font/DPI, so call after open(). Host uses this to size a window by grid.
 	void client_size_for_grid(int cols, int rows, int& w, int& h) const;
 
-	// 현재 화면 그리드의 가로 칸 수 / 세로 줄 수를 돌려준다. open() 이후(메트릭 확정 후) 유효하다.
-	// 호스트가 자식 콘솔(PTY) 크기를 ConBox 그리드에 맞춰 시작할 때 쓴다.
+	// Current screen grid columns/rows (valid after open()). Host uses these to size the child PTY.
 	int grid_cols() const { return cols; }
 	int grid_rows() const { return rows; }
 
-	// 입력 싱크(터미널/raw 모드)를 지정한다. sink 가 설정되면 ConBox 는 키 입력을 로컬에서
-	// 편집하지 않고(로컬 에코 끔), 키/문자를 VT 시퀀스 및 UTF-8 바이트로 인코딩해 sink 로
-	// 흘려보낸다(자식 프로세스의 stdin 으로 보내는 용도). bytes/len 은 UTF-8 바이트열이며,
-	// user 는 sink 호출 시 그대로 되돌려주는 사용자 컨텍스트다. nullptr 을 주면 읽기 전용
-	// 뷰어 모드로 되돌아간다. (start() 가 내부적으로 이 API 로 자신을 등록한다.)
+	// Set the input sink (raw/terminal mode). Once set, ConBox does not locally edit/echo; it encodes
+	// keys/chars to VT sequences and UTF-8 bytes and pushes them to sink (for the child's stdin). user
+	// is an opaque context returned on each call. nullptr reverts to read-only viewer mode.
+	// (start() registers itself via this API internally.)
 	void set_input_sink(void (*sink)(const char* bytes, int len, void* user), void* user);
 
-	// 리사이즈 싱크를 지정한다. 창 크기 변경 등으로 화면 그리드(cols/rows)가 바뀌면 새 칸/줄
-	// 수를 이 콜백으로 통지한다(자식 콘솔의 의사 콘솔 크기를 맞추는 용도). nullptr 이면 통지하지
-	// 않는다. (start() 는 내부적으로 이 API 로 자신을 등록해 ResizePseudoConsole 로 연결한다.)
+	// Set the resize sink. When the grid (cols/rows) changes, the new size is reported here (to match
+	// the child's pseudo-console). nullptr = no notification. (start() registers itself here to wire
+	// ResizePseudoConsole.)
 	void set_resize_sink(void (*sink)(int cols, int rows, void* user), void* user);
 
-	// === ConPTY 자식 실행 (선택 기능) ===
-	// 이 그룹을 쓰면 ConBox 가 ConPTY 로 자식 프로그램을 직접 실행하고 입출력을 자동 연결한다.
-	// 쓰지 않으면(start() 미호출) ConPTY 관련 멤버는 잠들어 있고 순수 터미널 뷰로 동작한다.
+	// === ConPTY child runner (optional) ===
+	// Using this group makes ConBox spawn a child and auto-wire its I/O. If start() is never called,
+	// the ConPTY members stay dormant and ConBox is a pure terminal view.
 
-	// 자식 프로그램을 ConPTY 로 실행한다. cmdline 은 UTF-8(예: "python.exe", "cmd /c dir"),
-	// cols/rows 는 의사 콘솔 크기(보통 grid_cols()/grid_rows()). 내부적으로 입력/리사이즈 싱크를
-	// 자신에게 걸고, 출력 폴링 타이머를 띄운다. 이미 실행 중이면 먼저 정리하고 새로 시작한다.
-	// 성공하면 true. (open() 으로 창이 만들어진 뒤 호출한다 - 폴링 타이머가 창에 필요하다.)
-	bool start(const char* cmdline, int cols, int rows);
+	// Spawn cmdline (UTF-8, e.g. "python.exe", "cmd /c dir") under ConPTY. Console size is taken from
+	// grid_cols()/grid_rows(). Internally wires the input/resize sinks to itself and starts an output
+	// polling timer. Restarts if already running. Returns true on success. Call after open() (the
+	// polling timer needs the window).
+	bool start(const char* cmdline);
 
-	// 자식 stdin 으로 바이트열(UTF-8/VT)을 보낸다. 보통 입력 싱크 경로가 자동 호출한다.
+	// Send bytes (UTF-8/VT) to the child stdin. Normally called by the input-sink path.
 	void write(const char* data, int len);
 
-	// 자식 의사 콘솔의 칸/줄 크기를 바꾼다(ResizePseudoConsole). 보통 리사이즈 싱크가 자동 호출한다.
+	// ResizePseudoConsole to cols x rows. Normally called by the resize-sink path.
 	void resize(int cols, int rows);
 
-	// 자식/PTY/파이프/폴링 타이머를 모두 정리한다. 여러 번 불러도 안전하다(멱등).
+	// Tear down child/PTY/pipes/polling timer. Idempotent.
 	void stop();
 
-	// 자식이 실행 중이고 출력 경로가 살아 있는지 조회한다.
 	bool is_running() const;
 
-	// 자식 자연 종료(예: 셸 exit) 시 한 번 호출되는 콜백을 등록한다. 콜백 시점에는 이미 정리가
-	// 끝나 is_running()==false 다(콜백 안에서 새 start() 안전). 명시적 stop() 으로 끝낸 경우엔 안 부른다.
+	// Register a callback fired once on the child's natural exit (e.g. shell exit). At callback time
+	// cleanup is done (is_running()==false, so the callback may start() again). Not fired for an
+	// explicit stop().
 	void set_exit_callback(void (*cb)(void* user), void* user);
 
-	// 출력 파이프에 쌓인 바이트를 읽어 화면(print)으로 반영한다. 보통 내부 타이머가 부른다.
+	// Read pending child output and feed it to print(). Normally driven by the internal timer.
 	void pump();
 
 protected:
 	afx_msg void OnPaint();
 	afx_msg BOOL OnEraseBkgnd(CDC* dc);
 	afx_msg void OnSize(UINT type, int cx, int cy);
-	// 창 파괴 시 자식/폴링 타이머를 먼저 정리한다(폴링이 파괴 중 창을 건드리지 않게).
+	// Tears down child/polling timer first so polling never touches a dying window.
 	afx_msg void OnDestroy();
 	afx_msg void OnChar(UINT ch, UINT rep, UINT flags);
 	afx_msg void OnKeyDown(UINT vk, UINT rep, UINT flags);
 	afx_msg UINT OnGetDlgCode();
 	afx_msg void OnVScroll(UINT code, UINT pos, CScrollBar* sb);
 	afx_msg BOOL OnMouseWheel(UINT flags, short zDelta, CPoint pt);
-	// 커서 깜빡임 타이머. 표시 상태를 뒤집고 커서 자리만 다시 그린다.
+	// Mouse drag selection: down anchors, drag extends, up copies to clipboard.
+	afx_msg void OnLButtonDown(UINT flags, CPoint pt);
+	afx_msg void OnLButtonUp(UINT flags, CPoint pt);
+	afx_msg void OnMouseMove(UINT flags, CPoint pt);
+	// Right click pastes the clipboard to the child stdin.
+	afx_msg void OnRButtonDown(UINT flags, CPoint pt);
 	afx_msg void OnTimer(UINT_PTR id);
-	// 한글 IME 처리. 터미널 모드에서는 확정분만 자식에 보내고, 미완성 조합은 comp_str 에 담아
-	// ConBox 가 블록 커서 칸에 직접 그린다(시스템 기본 인라인은 OnImeComp 가 return 0 으로 억제).
+	// Korean IME. In terminal mode only committed text is sent to the child; the in-progress
+	// composition is held in comp_str and drawn by ConBox in the cursor cell (system inline is
+	// suppressed by OnImeComp returning 0).
 	afx_msg LRESULT OnImeStart(WPARAM w, LPARAM l);
 	afx_msg LRESULT OnImeComp(WPARAM w, LPARAM l);
 	afx_msg LRESULT OnImeEnd(WPARAM w, LPARAM l);
-	// 한/영 토글 등 IME 상태 변화 통지. 한글 모드로 바뀌면 커서 모양을 즉시 갱신한다.
+	// IME state change (e.g. Korean/English toggle); updates the cursor width immediately.
 	afx_msg LRESULT OnImeNotify(WPARAM w, LPARAM l);
 	DECLARE_MESSAGE_MAP()
 
 private:
-	// 폰트 한 벌을 만들어 font 에 채우고, 만든 LOGFONT 를 lf_out 에 남긴다.
-	void make_font(CFont& font, LOGFONTW& lf_out, const char* name, float size, const char* opts);
+	// Build one font into font, leaving the resulting LOGFONT in lf_out and width ratio in width_pct.
+	void make_font(CFont& font, LOGFONTW& lf_out, int& width_pct, const char* name, float size, const char* opts);
 
-	// 아직 지정되지 않은 폰트에 기본값(영문 Cascadia Mono, 한글 맑은 고딕)을 채운다.
+	// Fill any unset font with the defaults (English Cascadia Mono, Korean Malgun Gothic).
 	void apply_default_fonts();
 
-	// 현재 폰트를 기준으로 고정 그리드 한 칸의 가로/세로 픽셀 크기를 잰다.
+	// Measure the fixed-grid cell width/height/baseline from the current fonts.
+	// (Algorithm detail is in calc_cell_size's own comment.)
 	void calc_cell_size();
 
-	// 클라이언트 영역 크기로부터 화면에 들어가는 가로 칸 수(cols), 세로 줄 수(rows)를 구한다.
+	// Derive cols/rows that fit the client area.
 	void update_metrics();
 
-	// 스크롤을 강제로 맨 아래로 내린다. (view_top 을 마지막 화면이 보이는 위치로)
 	void scroll_to_bottom();
 
-	// 세로 스크롤바의 범위/위치를 갱신하고, 내용이 다 보이면 숨긴다.
+	// Update scrollbar range/pos; hide it when all content is visible.
 	void update_scrollbar();
 
-	// VT 파서: 한 글자(또는 제어문자)를 상태기계에 넣는다. ESC/CSI/OSC 시퀀스를 해석하고
-	// 그 외 글자는 put_char 로 화면에 쓴다. 파서 상태는 멤버라 print 호출(청크) 사이에 유지된다.
+	// VT parser: feed one char (or control byte) into the state machine. Interprets ESC/CSI/OSC and
+	// routes other chars to put_char. State is a member, so it persists across print() chunks.
 	void vt_feed(wchar_t wc);
 
-	// 완성된 CSI 시퀀스(최종 바이트 fin)를 해석해 커서 이동/지우기/SGR 등을 수행한다.
+	// Dispatch a completed CSI sequence (final byte fin): cursor moves / erases / SGR etc.
 	void dispatch_csi(wchar_t fin);
 
-	// 현재 커서 칸에 글자 하나를 쓴다. 폭(cols)을 넘으면 먼저 자동 줄바꿈한다. 2배 폭 글자는
-	// lead 칸에 쓰고 다음 칸을 trail(ch=0)로 둔다. 현재 SGR 색/속성을 셀에 반영한다.
+	// Write one glyph at the cursor (autowrapping first if past cols). A wide glyph fills the lead
+	// cell and sets the next to trail (ch=0). Applies the current SGR color/attributes.
 	void put_char(wchar_t wc);
 
-	// 커서를 다음 줄로 내린다. 커서가 스크롤 영역 하단(scroll_bot)에 있으면 영역을 한 줄
-	// 스크롤한다(scroll_up_region). 그 밖에는 화면 끝을 넘지 않는 선에서 한 줄 내린다.
+	// Move the cursor down a line. At the scroll region's bottom (scroll_bot) this scrolls the region
+	// (scroll_up_region); otherwise it advances one line without leaving the screen.
 	void line_feed();
 
-	// 스크롤 영역 [scroll_top, scroll_bot] 을 위로 n줄 스크롤한다(윗줄이 사라지고 아래에 빈 줄).
-	// 주 화면이고 영역 상단이 화면 맨 위(scroll_top==0)일 때만 밀려난 줄을 scrollback 으로 보존한다.
-	// (LF 가 하단에서 줄을 내릴 때, SU(CSI S) 에서 쓴다.)
+	// Scroll region [scroll_top, scroll_bot] up n lines (top lines lost, blanks at the bottom). Only on
+	// the main screen with scroll_top==0 are the displaced lines preserved into scrollback.
+	// (Used by LF at the bottom and by SU (CSI S).)
 	void scroll_up_region(int n);
 
-	// 스크롤 영역 [scroll_top, scroll_bot] 을 아래로 n줄 스크롤한다(아래줄이 사라지고 위에 빈 줄).
-	// (RI(역인덱스)가 상단에서 줄을 올릴 때, SD(CSI T) 에서 쓴다. scrollback 에는 관여하지 않는다.)
+	// Scroll region [scroll_top, scroll_bot] down n lines (bottom lines lost, blanks at the top).
+	// (Used by RI at the top and by SD (CSI T); does not touch scrollback.)
 	void scroll_down_region(int n);
 
-	// 줄 범위 [top, bot] 안에서 위/아래로 n줄 회전한다(빈 줄로 채움). scrollback 에는 관여하지
-	// 않는 순수 줄 이동이며, 스크롤 영역 스크롤과 IL/DL 의 공통 일꾼이다.
+	// Rotate lines within [top, bot] up/down by n (filling blanks). Pure line moves not touching
+	// scrollback; shared worker for region scrolls and IL/DL.
 	void scroll_lines_up(int top, int bot, int n);
 	void scroll_lines_down(int top, int bot, int n);
 
-	// IL/DL: 커서가 스크롤 영역 안에 있을 때 커서 줄부터 빈 줄을 n개 삽입(insert_lines)하거나
-	// n줄 삭제(delete_lines)한다. 영역 하단(scroll_bot)까지의 줄들이 밀려나며, 커서는 1열로 간다.
+	// IL/DL: when the cursor is inside the scroll region, insert n blank lines at / delete n lines from
+	// the cursor line down to scroll_bot; the cursor moves to column 1.
 	void insert_lines(int n);
 	void delete_lines(int n);
 
-	// ICH/DCH: 커서 칸부터 같은 줄에서 빈 칸을 n개 삽입(insert_chars)하거나 n칸 삭제(delete_chars)
-	// 한다. 줄 폭(cols)은 유지되며 오른쪽으로 밀려 넘친 칸은 버리고, 삭제 시 끝에 빈 칸을 채운다.
+	// ICH/DCH: insert n blanks at / delete n cells from the cursor within the same line. Line width
+	// (cols) is preserved: overflow on the right is dropped, deletes fill blanks at the end.
 	void insert_chars(int n);
 	void delete_chars(int n);
 
-	// 대체 화면(alt screen) 진입/복귀. vim/htop 등 풀스크린 TUI 가 ?1049(/?1047/?47) 로 쓴다.
-	// 진입 시 현재 주 화면을 main_saved 로 백업하고 빈 대체 화면으로 바꾸며(스크롤백은 동결되어
-	// 보이지 않는다), 복귀 시 주 화면을 되돌린다.
+	// Alt-screen enter/leave. Full-screen TUIs use ?1049 (/?1047/?47). Enter backs up the main screen
+	// into main_saved and shows a blank alt screen (scrollback frozen/hidden); leave restores it.
 	void enter_alt_screen();
 	void leave_alt_screen();
 
-	// cols 칸의 빈 줄(공백 셀, 현재 배경색)을 만들어 돌려준다.
+	// A blank row (cols blank cells in the current background color).
 	Row blank_row() const;
 
-	// screen[row] 의 [c0, c1) 칸을 공백 셀(현재 배경색)로 지운다. (ED/EL 공통)
+	// Erase screen[row] cells [c0, c1) to blanks (current bg). Shared by ED/EL.
 	void erase_cells(int row, int c0, int c1);
 
-	// 커서 좌표를 화면 범위 [0,rows-1] / [0,cols] 안으로 맞춘다.
+	// Clamp the cursor into [0,rows-1] / [0,cols].
 	void clamp_cursor();
 
-	// 화면(screen)을 현재 cols/rows 크기에 맞게 재구성한다(행 수/줄 폭 맞춤, 커서 clamp).
+	// Rebuild screen to the current cols/rows (row count, line width, cursor clamp).
 	void reset_screen();
 
-	// (scrollback + screen) 통합 인덱스 idx 의 줄을 돌려준다. 렌더/스크롤에서 쓴다.
+	// Line at unified (scrollback + screen) index idx. Used by render/scroll.
 	const Row& line_at(int idx) const;
 
-	// 현재 커서 위치(cur_row/cur_col)를 화면 좌표로 변환한다.
-	// row_out 은 화면 맨 위(view_top) 기준 줄 번호, vx_out 은 줄 안에서의 가로 칸(칸 좌표)이다.
-	// 버퍼가 비었으면 false 를 돌려준다(화면 밖 여부는 호출 측에서 판정).
+	// Convert the cursor (cur_row/cur_col) to screen coords: row_out relative to view_top, vx_out the
+	// cell column within the line. false if the buffer is empty (off-screen is judged by the caller).
 	bool cursor_screen_pos(int& row_out, int& vx_out) const;
 
-	// 현재 커서가 그려질 사각형(칸을 채우는 블록)을 구한다. 화면 밖이면 false.
+	// The cell-filling rectangle where the cursor draws. false if off-screen.
 	bool get_cursor_rect(CRect& rc) const;
 
-	// 블록 커서를 채울 색을 cur_bg/cur_fg 와 혼합 비율로 계산한다.
+	// Cursor block fill color = blend of default_bg:default_fg at the weight ratio (independent of the
+	// last printed SGR colors).
 	COLORREF blend_cursor_color() const;
 
-	// 커서를 즉시 보이게 하고(cursor_on=true) 깜빡임 타이머를 다시 시작한다.
-	// 입력/이동 직후 한 박자 동안은 커서가 확실히 보이게 하기 위한 것이다.
+	// Make the cursor visible now and restart the blink timer (so it is solid for a beat after
+	// input/move/output).
 	void bump_cursor();
 
-	// 지금 IME 가 한글(초성/한글 자모) 입력 모드인지 조회한다.
-	// 조합이 시작되기 전에도 한/영 상태를 알 수 있어, 커서 폭을 미리 정하는 데 쓴다.
+	// Whether the IME is currently in Korean (jamo) input mode. Known even before composition starts,
+	// so the cursor width can be set ahead of typing.
 	bool is_hangul_mode() const;
 
-	// 터미널(raw) 모드에서 키 입력을 자식에게 보낸다.
-	// send_input_bytes : UTF-8 바이트열을 그대로 입력 싱크로 보낸다.
-	// send_input_wide  : UTF-16 글자들을 UTF-8 로 변환해 보낸다(문자/IME 확정 글자용).
-	// terminal_keydown : 방향키/Home/End/Delete 등 비문자 키를 VT 시퀀스로 보낸다. 보냈으면 true.
+	// Send key input to the child in raw mode.
+	//   send_input_bytes : raw UTF-8 bytes straight to the input sink.
+	//   send_input_wide  : UTF-16 chars converted to UTF-8 (typed/committed-IME glyphs).
+	//   terminal_keydown : non-char keys (arrows/Home/End/Delete...) as VT sequences; true if sent.
 	void send_input_bytes(const char* bytes, int len);
 	void send_input_wide(const wchar_t* ws, int n);
 	bool terminal_keydown(UINT vk, bool ctrl, bool shift);
 
-	// 클립보드 텍스트를 자식 stdin 으로 보낸다. bracketed_paste 가 켜져 있으면
-	// ESC[200~ ... ESC[201~ 로 감싼다(자식이 붙여넣기를 타이핑과 구분하게).
+	// Paste clipboard text to the child stdin, wrapping in ESC[200~ ... ESC[201~ if bracketed_paste is
+	// on (so the child distinguishes paste from typing).
 	void paste_clipboard();
 
-	// 한글 IME 조합 중이면 강제로 확정(완성)시켜, 완성 글자의 UTF-8 이 먼저 자식에 전송되게 한다.
-	// 조합 종료 트리거(방향키/Home/End/Delete/Enter/Tab/Esc 등, 마우스 클릭)를 자식에 보내기
-	// 직전에 호출해 "제자리 완성 후 트리거" 순서를 보장한다(Requirements.md §10). 조합이 있었으면 true.
+	// Selection helpers.
+	// Convert client pixel coords to a unified-index row + cell column.
+	void hit_test(CPoint pt, int& abs_row, int& col) const;
+	void copy_selection();
+	void clear_selection();
+
+	// If an IME composition is in progress, force-commit it so the completed glyph's UTF-8 reaches the
+	// child first. Call right before sending a composition-ending trigger (arrows/Home/End/Delete/
+	// Enter/Tab/Esc, mouse click) to guarantee the [completed][trigger] order (Requirements.md sec 10).
+	// Returns true if a composition was committed.
 	bool finalize_composition();
 
-	// 더블 버퍼링용 메모리 DC/비트맵을 (필요하면) 만들어 둔다. 클라이언트 크기가
-	// 바뀐 경우에만 비트맵을 다시 만들어, 잦은 다시그리기에서 매번 GDI 객체를
-	// 할당/해제하지 않게 한다. ref 는 호환 기준이 되는 화면 DC, w/h 는 필요한 크기.
+	// Lazily (re)create the double-buffer memory DC/bitmap. The bitmap is rebuilt only when the client
+	// size changes, so frequent repaints do not reallocate GDI objects each time.
 	void ensure_back_buffer(CDC* ref, int w, int h);
 
-	// 입력 싱크(터미널/raw 모드). 설정되면 로컬 편집 대신 키를 인코딩해 이 싱크로 보낸다.
+	// Input sink (raw/terminal mode). When set, keys are encoded and pushed here instead of locally edited.
 	void (*input_sink)(const char* bytes, int len, void* user);
 	void* input_sink_user;
 
-	// 리사이즈 싱크. 그리드(cols/rows)가 바뀌면 새 크기를 통지한다(자식 PTY 크기 동기화용).
+	// Resize sink. Reports a new grid size (to sync the child PTY size).
 	void (*resize_sink)(int cols, int rows, void* user);
 	void* resize_sink_user;
 
-	// === ConPTY 자식 실행 상태 (start() 미사용 시 모두 잠듦; 순수 터미널 뷰엔 영향 없음) ===
-	HPCON h_pc;                      // 의사 콘솔 핸들 (CreatePseudoConsole)
-	HANDLE in_write;                 // 자식 stdin 에 쓰는 쪽 (입력 전송용)
-	HANDLE out_read;                 // 자식 콘솔 출력을 읽는 쪽 (폴링)
-	PROCESS_INFORMATION child_proc;  // 자식 프로세스/스레드 핸들
-	bool child_running;              // 자식 실행 중 여부
-	void (*exit_cb)(void* user);     // 자식 자연 종료 콜백 (없으면 nullptr)
-	void* exit_cb_user;              // 콜백에 되돌려줄 컨텍스트
+	// === ConPTY child state (all dormant unless start() is used) ===
+	HPCON h_pc;                      // pseudo-console handle
+	HANDLE in_write;                 // write end of child stdin
+	HANDLE out_read;                 // read end of child output (polled)
+	PROCESS_INFORMATION child_proc;
+	bool child_running;
+	void (*exit_cb)(void* user);     // child natural-exit callback (nullptr if none)
+	void* exit_cb_user;
 
-	// 자식 종료(파이프 닫힘/프로세스 종료)를 감지했을 때 정리하고 종료 콜백을 발화한다.
-	// 먼저 stop() 으로 정리한 뒤 콜백을 불러, 콜백이 즉시 재시작(start)해도 안전하게 한다.
+	// On detecting child exit, clean up then fire the exit callback. stop() runs first so the callback
+	// may safely restart (start()) immediately.
 	void handle_child_exit();
-	// start() 가 입력/리사이즈 싱크로 거는 정적 thunk. user(=this)의 write/resize 로 라우팅한다.
+	// Static thunks start() registers on the input/resize sinks; route to this->write/resize.
 	static void child_input_thunk(const char* bytes, int len, void* user);
 	static void child_resize_thunk(int cols, int rows, void* user);
 
-	COLORREF cur_fg;   // 현재 전경색 (기본 밝은 회색 RGB(200,200,200))
-	COLORREF cur_bg;   // 현재 배경색 (기본 짙은 회색 RGB(32,32,32))
+	COLORREF default_fg; // default RGB(200,200,200)
+	COLORREF default_bg; // default RGB(32,32,32)
 
-	int cursor_bg_weight;  // 블록 커서 색 혼합 비율의 배경 가중치 (기본 6)
-	int cursor_fg_weight;  // 블록 커서 색 혼합 비율의 전경 가중치 (기본 4)
+	COLORREF cur_fg;     // current SGR foreground
+	COLORREF cur_bg;     // current SGR background
 
-	bool cursor_on;        // 깜빡임 표시 상태 (true 면 현재 커서가 보임)
-	int cursor_blink_ms;   // 깜빡임 토글 간격(밀리초). 0 이면 깜빡임 없이 항상 표시
+	int cursor_bg_weight;  // cursor blend bg weight (default 6)
+	int cursor_fg_weight;  // cursor blend fg weight (default 4)
 
-	CFont efont;       // 영문 폰트
-	CFont kfont;       // 한글 폰트
-	LOGFONTW efont_lf; // 영문 폰트의 LOGFONT 사본
-	LOGFONTW kfont_lf; // 한글 폰트의 LOGFONT 사본 (사용자가 지정한 원본 크기/스타일 보존)
+	bool cursor_on;        // blink visible state
+	int cursor_blink_ms;   // blink toggle interval (ms); 0 = always on
+	int cursor_type;       // shape: 1=blink block,2=fixed block,3=blink underline,4=fixed underline,
+	                       // 5=blink I-beam,6=fixed I-beam. Odd=blinking, even=fixed (see set_cursor).
 
-	bool kfont_match_efont; // 켜지면 한글 폰트를 영문과 같은 높이로 맞추고 줄 높이를 영문 기준으로 잡는다 (set_kfont 의 size<=0 으로 켜진다, 기본 true)
+	CFont efont;
+	CFont kfont;
+	LOGFONTW efont_lf;
+	LOGFONTW kfont_lf; // keeps the user's original size/style
 
-	float kfill_ratio;     // match 모드 칸 폭: 한글이 두 칸을 채우는 비율 (기본 0.92)
-	float emin_ratio;      // match 모드 칸 폭: 영문을 자연 폭의 이 비율 밑으로 좁히지 않는 하한 (기본 1.0 = 자연 폭 고정)
+	bool kfont_match_efont; // on: match Korean height to English and base line height on English
+	                        // (turned on by set_kfont size<=0, default true)
 
-	int glyph_level;       // 박스/블록 문자 직접 렌더 수준 (0=끔, 1=블록요소만(기본), 2=+직선/정션 박스선)
+	int efont_width_pct;   // English width ratio (%) (default 100)
+	int kfont_width_pct;   // Korean width ratio (%) (default 100)
 
-	int cell_w;        // 영문 한 글자 칸의 가로 픽셀 (한글은 2배)
-	int cell_h;        // 한 줄 칸의 세로 픽셀
-	int cell_base;     // 칸 위쪽에서 글자 기준선까지의 픽셀 (베이스라인 정렬용)
+	int glyph_level;       // built-in glyph level (0=off, 1=blocks (default), 2=+box lines)
 
-	int cols;          // 화면에 들어가는 가로 칸 수
-	int rows;          // 화면에 들어가는 세로 줄 수
+	int cell_w;        // px width of one English cell (Korean is 2x)
+	int cell_h;        // px height of one line cell
+	int cell_base;     // px from cell top to glyph baseline (baseline alignment)
 
-	int margin_top;    // 클라이언트 영역 안쪽 여백(픽셀). 이 안쪽에만 글자를 그린다.
+	float adjust_h;    // cell height scale (see adjust())
+	float adjust_w;    // cell width scale
+
+	int cols;
+	int rows;
+
+	int margin_top;    // inner padding (px); glyphs draw only inside it
 	int margin_bottom;
 	int margin_left;
 	int margin_right;
 
-	// 화면 셀 그리드. screen 은 현재 화면(항상 rows 개 줄, 각 줄 cols 칸), scrollback 은 화면
-	// 위로 밀려난 줄들이다. 커서 (cur_row, cur_col) 는 화면 내 0-based 칸 좌표다(VT 절대 좌표 제어).
-	std::vector<Row> screen;      // 현재 화면 (rows 개 줄, 각 줄 cols 칸 셀)
-	std::vector<Row> scrollback;  // 화면 위로 밀려난 줄들 (가변, 상한 트림)
-	int view_top;                 // 보기 맨 위 = (scrollback + screen) 통합 인덱스 (휠/스크롤바로 조정)
-	int cur_row;                  // 커서 화면 행 (0..rows-1)
-	int cur_col;                  // 커서 화면 칸 (0..cols)
+	// Cell grid. screen = current screen (always rows lines x cols cells). scrollback = lines pushed
+	// off the top. Cursor (cur_row, cur_col) is a 0-based on-screen cell coord (VT absolute moves).
+	std::vector<Row> screen;
+	std::vector<Row> scrollback;  // trimmed past a cap
+	int view_top;                 // top of view = unified (scrollback + screen) index (wheel/scrollbar)
+	int cur_row;                  // 0..rows-1
+	int cur_col;                  // 0..cols
 
-	bool cursor_visible;          // DECTCEM(?25): 커서 표시 여부 (기본 true)
-	int  saved_row, saved_col;    // DECSC/DECRC 로 저장한 커서 위치
+	bool cursor_visible;          // DECTCEM (?25): cursor shown (default true)
+	int  saved_row, saved_col;    // saved by DECSC/DECRC
 
-	// IME 조합 중(미확정) 문자열. 비어 있으면 조합 없음. 비어 있지 않으면 OnPaint 가
-	// 블록 커서 칸에 직접 그린다(시스템 기본 인라인 대신 — 위치를 커서에 고정하기 위함).
+	// In-progress (uncommitted) IME string. Empty = no composition. When non-empty OnPaint draws it in
+	// the cursor cell itself (instead of system inline) to pin it to the cursor.
 	std::wstring comp_str;
 
-	// 스크롤 영역(DECSTBM). LF/RI/IL/DL/SU/SD 가 존중하는 줄 범위다. 기본은 화면 전체 [0, rows-1].
+	// Scroll region (DECSTBM), respected by LF/RI/IL/DL/SU/SD. Default is the whole screen [0, rows-1].
 	int scroll_top;
 	int scroll_bot;
 
-	// 대체 화면(alt screen). 풀스크린 TUI 가 ?1049(/?1047/?47) 로 전환한다.
-	std::vector<Row> main_saved;  // 대체 화면 진입 시 백업해 둔 주 화면 (복귀 시 되돌린다)
-	bool alt_active;              // 대체 화면이 활성인지 (이때 스크롤백은 동결되어 보이지 않는다)
-	int  saved_main_row;          // 대체 화면 진입 시 저장한 주 화면 커서 (복귀 시 되돌린다)
+	// Alt screen. Full-screen TUIs switch in via ?1049 (/?1047/?47).
+	std::vector<Row> main_saved;  // main screen backed up on entry (restored on leave)
+	bool alt_active;              // alt screen active (scrollback frozen/hidden while so)
+	int  saved_main_row;          // main-screen cursor saved on entry
 	int  saved_main_col;
 
-	// VT 파서 상태 (print 가 청크로 불려도 시퀀스가 이어지도록 멤버로 유지)
+	// VT parser state (members so a sequence survives across chunked print() calls).
 	int  vt_state;                // 0=GROUND 1=ESC 2=CSI 3=OSC
-	int  vt_params[16];           // CSI 숫자 파라미터
-	int  vt_nparam;               // 채워진 파라미터 수
-	bool vt_priv;                 // CSI '?' (DEC 프라이빗) 마커
-	bool vt_gtlt;                 // CSI '<' '=' '>' 접두 마커 (2차DA/kitty/XTMODKEYS 등, 전부 무시)
+	int  vt_params[16];           // CSI numeric params
+	int  vt_nparam;
+	bool vt_priv;                 // CSI '?' (DEC private) marker
+	bool vt_gtlt;                 // CSI '<' '=' '>' prefix marker (2nd DA/kitty/XTMODKEYS; all ignored)
 
-	// SGR 현재 속성. put_char 가 셀에 반영한다. (색은 cur_fg/cur_bg 사용)
-	bool cur_bold;                // 밝은색 매핑
-	bool cur_reverse;             // 전경/배경 스왑
+	// Current SGR attributes applied by put_char (colors use cur_fg/cur_bg).
+	bool cur_bold;                // maps to bright color
+	bool cur_reverse;             // swap fg/bg
 
-	// 입력 모드(자식이 DEC 프라이빗 모드로 켠다). 키 인코딩/붙여넣기 방식을 바꾼다.
-	bool app_cursor_keys;         // DECCKM(?1): 켜지면 방향키를 ESC O x (예: ESC O A) 로 보낸다
-	bool bracketed_paste;         // ?2004: 켜지면 붙여넣기를 ESC[200~ ... ESC[201~ 로 감싼다
+	// Input modes the child turns on via DEC private modes; change key encoding / paste.
+	bool app_cursor_keys;         // DECCKM (?1): arrows as ESC O x instead of ESC [ x
+	bool bracketed_paste;         // ?2004: wrap pastes in ESC[200~ ... ESC[201~
 
-	// 더블 버퍼링용 캐시. OnPaint 가 매 프레임 새로 만들지 않고 재사용한다.
-	CDC back_dc;            // 영속 메모리 DC (한 번 만들어 계속 쓴다)
-	CBitmap back_bmp;       // 백버퍼 비트맵 (클라이언트 크기와 같다)
-	CBitmap* back_old_bmp;  // back_dc 에 원래 들어있던 비트맵 (정리 시 되돌리기용)
-	int back_w;             // 현재 back_bmp 의 가로 픽셀 (크기 변경 감지용)
-	int back_h;             // 현재 back_bmp 의 세로 픽셀
+	// === Mouse drag selection state ===
+	// anchor = drag start cell (fixed on button down), end = current drag cell (live). Stored
+	// unordered; sorted when drawing/copying.
+	bool sel_active;        // a selection exists (shown + clipboard target)
+	bool selecting;         // dragging with the left button down (SetCapture active)
+	int sel_anchor_row;     // unified-index row
+	int sel_anchor_col;
+	int sel_end_row;
+	int sel_end_col;
 
-	// [DEBUG] 한글/커서 렌더 디버깅용 캡처+로그. 사용자가 "디버깅 기능 삭제하자" 할 때까지 보존.
-	//         제거 시 이 블록과 ConBox.cpp 의 // [DEBUG] 표시 부분(헬퍼/호출/타이머/init)을 지운다.
-	bool dbg_record;        // 녹화 on/off (생성자에서 DBG_HARNESS 스위치를 따름, 기본 false)
-	int dbg_seq;            // 캡처 일련번호
-	bool dbg_input_seen;    // 첫 입력 발생 후 true. 그 전(claude 부팅)엔 출력 캡처를 안 함
-	void dbg_dump(const char* tag);       // 백버퍼를 BMP 로 저장 + 상태 로그
+	// Double-buffer cache reused by OnPaint (not recreated each frame).
+	CDC back_dc;            // persistent memory DC
+	CBitmap back_bmp;       // back buffer bitmap (matches client size)
+	CBitmap* back_old_bmp;  // bitmap originally in back_dc (restored on teardown)
+	int back_w;             // current back_bmp size (change detection)
+	int back_h;
+
+	// [DEBUG] Korean/cursor render capture+log. Keep until told to remove; on removal delete this block
+	//         and the // [DEBUG] marked parts (helpers/calls/timer/init) in ConBox.cpp.
+	bool dbg_record;        // on/off (follows the DBG_HARNESS switch in the ctor, default false)
+	int dbg_seq;            // capture serial
+	bool dbg_input_seen;    // true after the first input (no output capture before that)
+	void dbg_dump(const char* tag);       // save the back buffer to BMP + log state
 };

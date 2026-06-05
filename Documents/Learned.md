@@ -1,7 +1,7 @@
-# Learned — pitfalls & conventions (so Claude doesn't repeat mistakes)
+﻿# Learned — pitfalls & conventions (so Claude doesn't repeat mistakes)
 
 Concise notes Claude should recall each session. Implementation truth = `Source/` code; usage =
-`Source/ConBox.h`; design map = the "설계 개요 (DESIGN)" block atop `ConBox.cpp`. Paths from project root.
+`Source/ConBox.h`; design map = the "DESIGN OVERVIEW" block atop `ConBox.cpp`. Paths from project root.
 
 ## Build
 - Solution `Project/ConBox.sln`. Build (x64 Debug):
@@ -12,9 +12,10 @@ Concise notes Claude should recall each session. Implementation truth = `Source/
 - In Bash, MSBuild `/t:` flags get mangled into POSIX paths — build via the **PowerShell** tool instead.
 
 ## Source/ file conventions
-- Save `Source/*.h`/`*.cpp` as **UTF-8 BOM**. Without BOM, MSVC reads CP949 (C4819) and a Korean
-  comment's trailing byte can swallow the next line. (Edit tool preserves BOM; a clean build with
-  Korean comments confirms it.)
+- `Source/*.h`/`*.cpp` comments are **English, ASCII-only (no byte >= 128)** per CLAUDE.md. Because
+  the files are pure ASCII they need **no BOM** (ASCII is identical in UTF-8/CP949, so no C4819). The
+  one non-ASCII code literal (Korean glyph width probe) is written as the escape `L"\xac00"` (U+AC00)
+  to keep the file pure ASCII. Verify: `0` non-ASCII bytes via `[IO.File]::ReadAllBytes`.
 - `ConBox.cpp` is **PrecompiledHeader=NotUsing** in the vcxproj. Don't add `..\Source` to global
   include paths (demo uses `#include "../Source/ConBox.h"`).
 - Source skips the host `targetver.h`, so `ConBox.h` sets `_WIN32_WINNT`/`NTDDI_VERSION` (RS5) via
@@ -29,9 +30,9 @@ Concise notes Claude should recall each session. Implementation truth = `Source/
   **`PostMessage(WM_CHAR)` is eaten** by the dialog pump — use the input-queue path.
 - SendKeys gotcha: `+ ^ % ~ ( ) { } [ ]` are special; send literal `+`/`(` as `{+}`/`{(}`
   (`7*7` is fine, but `1+2` → `1@`). The ConBox child window class starts with "Afx...".
-- Demo child = **`python.exe`** (interactive REPL; representative target). Verify: `7*7`+Enter →
-  `49`; colored prompt (Python 3.14 REPL color = limited VT100); Ctrl+Z then Enter (EOF) → child
-  exits → `set_exit_callback` closes the window, no crash.
+- Demo child = **`powershell.exe`** (interactive stdio shell; representative target). Verify:
+  `7*7`+Enter → `49`; colored prompt (PSReadLine = limited VT100); `exit`+Enter → child exits →
+  `set_exit_callback` closes the window, no crash.
 - Self-dump beats external screenshot: `PrintWindow`/`GetWindowDC` come out **black** (double-buffer
   + DWM). Use the harness PNG dump; for a real WT window, `AttachThreadInput`+`CopyFromScreen`.
 
@@ -51,23 +52,30 @@ To reproduce `calc_cell_size` values (`cell_w`/`natw`/`kwid`):
 - Match C rounding: pt→px `-(LONG)(pt*dpi/72+0.5)` and `cw=(int)(…+0.5)` = round-half-up
   (`[Math]::Floor(x+0.5)`); height scale `(LONG)(…)` truncates toward 0 (`[Math]::Truncate`).
   PowerShell `[int]` is banker's rounding (wrong).
-- Default font (Cascadia Mono 12pt, DPI 96): `natw`=9, `kwid`=16, `cw=round(16/1.84)=9`, clamp `[9,9]` → `cell_w=9`.
+- Default font (Cascadia Mono 12pt, DPI 96): `natw_e`=9, `natw_k`=16, `w_e`=9, `w_k`=16, `cell_w`=9.
 - Glyph coverage: `GetGlyphIndicesW` + `GGI_MARK_NONEXISTING_GLYPHS` → `0xFFFF` for missing glyphs.
   Default is **Cascadia Mono** (has rounded corners U+256D.., quadrant blocks U+2598..); **Consolas
   lacks** those — don't default to Consolas.
 
 ## Cursor rendering
-- Block cursor; color = `blend_cursor_color()` mixing bg:fg at `cursor_bg_weight:cursor_fg_weight`
-  (default 6:4; `set_cursor_blend`). Width 2 cells if `is_hangul_mode()` else 1.
+- **`cursor_type`** (1..6) picks the shape; `set_cursor(type)` maps `0`→the current default (raised as
+  shapes were added; now 6=fixed I-beam). **Odd=blink, even=fixed** — `set_cursor`/`bump_cursor`/
+  `OnTimer` all gate the blink timer on `(cursor_type & 1)`. The shape itself is chosen in `OnPaint`'s
+  cursor branch: `<=2` block, `<=4` underline, else I-beam.
+- color = `blend_cursor_color()` mixing `default_bg`:`default_fg` at `cursor_bg_weight:cursor_fg_weight` (default **4:6**, leans fg; `set_cursor_blend`). The default colors are stored in `default_fg` and `default_bg` (updated via `set_color`/`set_bg_color`), keeping the cursor blend independent of the SGR colors of the last printed text. Block/underline use the blend; **I-beam uses pure `default_fg`**. Width 2 cells if `is_hangul_mode()` else 1.
+- **I-beam** sits at the cell's **left edge** (insertion point): English 1px, Korean 3px, all `default_fg`.
+  During IME composition the I-beam is the one shape that stays visible — drawn (3px) to the **right** of
+  the hollow box (after the composing glyph, so it is on top). Block/underline are hidden while composing.
+- IME composing hollow box outline is **1px** (`bw=1` in OnPaint), blend color.
 - Blink `CURSOR_TIMER`; `OnTimer` toggles `cursor_on`, invalidates only the cursor cell; `bump_cursor()`
-  forces visible after input/move/output. Child `?25l` → `cursor_visible=false` → no block.
+  forces visible after input/move/output. Child `?25l` → `cursor_visible=false` → no cursor.
 - **`child_caret` (double-cursor fix)**: some TUIs (claude) paint the cursor cell as a reverse cell
   AND keep the hardware cursor there; drawing the ConBox block too looks like two cursors. `OnPaint`
   skips the block when the cursor cell's bg differs from its neighbors (= child-painted caret).
 
 ## ConPTY child runner (now inside ConBox)
-- `start`/`write`/`resize`/`stop`/`pump`/`handle_child_exit` are in `ConBox.cpp`'s "자식 실행 (ConPTY)"
-  section (design `[PTY]`).
+- `start`/`write`/`resize`/`stop`/`pump`/`handle_child_exit` are in `ConBox.cpp`'s "Child runner
+  (ConPTY)" section (design `[PTY]`).
 - Close the PTY-side pipe ends right after spawn (else `out_read` never sees EOF).
 - **Child-exit detection can't use pipe EOF** (ConPTY's conhost holds the write end open). `pump`
   polls `WaitForSingleObject(child_proc.hProcess, 0)`; after draining output → `handle_child_exit`
@@ -92,7 +100,7 @@ To reproduce `calc_cell_size` values (`cell_w`/`natw`/`kwid`):
   `IMN_SETCONVERSIONMODE` reflects it. (At a TUI prompt where the child paints its own caret,
   `child_caret` may hide the ConBox block, so verify by composing, not by the empty-prompt width.)
 - **Composition self-draw** (design `[IME]`): hollow box in the cursor cell; mid-line compose shifts
-  the line right (ScrollDC) to preview insertion — correct for **insert-mode** children (Python REPL).
+  the line right (ScrollDC) to preview insertion — correct for **insert-mode** children (e.g. PowerShell).
   Verify: each syllable forms in the cursor cell with prior text in place, following text not hidden,
   restored on commit.
 
@@ -110,7 +118,7 @@ To reproduce `calc_cell_size` values (`cell_w`/`natw`/`kwid`):
 
 ## Debug harness (toggleable, default OFF; keep until told to remove)
 - Captures the cursor-row strip of ConBox's back buffer to PNG + logs state, to eye-verify Korean
-  IME / cursor. All debug code is marked `// [DEBUG]` (child I/O as `[임시 진단]`); grep to remove together.
+  IME / cursor. All debug code (including the child I/O dump) is marked `// [DEBUG]`; grep to remove together.
 - Switches (compile-time, both default 0, in `ConBox.cpp`): `#define DBG_HARNESS 0` (captures `cap_*` +
   `condbg.log`; drives `dbg_record`); `#define DBG_IO 0` (child I/O dump `conexe_io.log`; gates
   `DbgDumpIo` body via `#if`). Set to 1 + rebuild to enable.

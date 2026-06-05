@@ -1,4 +1,4 @@
-# ConBox — Software Requirements (SRS)
+﻿# ConBox — Software Requirements (SRS)
 
 Terse spec so Claude can grasp the work each session (not human-facing prose).
 Paths are relative to the project root. When a detail is unspecified, follow **Windows Terminal (wt.exe)**.
@@ -12,16 +12,17 @@ Paths are relative to the project root. When a detail is unspecified, follow **W
 - Two usage modes (both supported by the one class):
   - **Pure terminal view**: host feeds output bytes via `print()` and reads keystroke bytes via
     `set_input_sink()`. Usable with any byte source (file, socket, host-managed process).
-  - **ConPTY child runner**: `start(cmdline, cols, rows)` launches a console child and auto-wires
-    its I/O. It internally reuses the input/resize sinks, so the runner is a built-in driver layered
-    on the generic view interface. If `start()` is never called, the ConPTY members stay dormant.
+  - **ConPTY child runner**: `start(cmdline)` launches a console child and auto-wires its I/O,
+    sizing the child console to match the current grid. It internally reuses the input/resize sinks,
+    so the runner is a built-in driver layered on the generic view interface. If `start()` is never
+    called, the ConPTY members stay dormant.
 - **Target programs**: line-oriented **stdio** programs that occasionally emit *limited VT100*
-  (SGR colors, cursor moves, EL/ED, CR/LF) — the representative demo child is the **Python REPL**.
-  Full-screen TUIs (claude.exe, vim) are **best-effort, not the design target** (they work via the
-  same path but their app-specific cursor/redraw quirks are out of scope).
+  (SGR colors, cursor moves, EL/ED, CR/LF) — the representative demo child is **PowerShell** (an
+  interactive stdio shell). Full-screen TUIs (claude.exe, vim) are **best-effort, not the design
+  target** (they work via the same path but their app-specific cursor/redraw quirks are out of scope).
 - All string inputs are **UTF-8 `const char*`** (so C++ literals pass directly).
 - Portability unit: **ConBox.h + ConBox.cpp** (2 files). Requirements: MFC (Unicode); Win10 1809+
-  (ConPTY) only if `start()` is used; save both files as **UTF-8 BOM**.
+  (ConPTY) only if `start()` is used; both files are **ASCII** (comments ASCII-only, so no BOM needed).
 
 ---
 
@@ -36,8 +37,8 @@ int  grid_rows() const;   // current screen grid rows
 
 - `client_size_for_grid` returns the client pixel size to hold `cols` x `rows` cells including
   `set_margin` padding; cell px depends on font/DPI so call after `open()`.
-- `grid_cols`/`grid_rows` give the current grid; the host uses them to size the child console
-  (`start()` cols/rows) to match the view.
+- `grid_cols`/`grid_rows` give the current grid; `start()` internally reads them to size the child
+  console to match the view (no explicit cols/rows parameters needed).
 
 ---
 
@@ -46,7 +47,7 @@ int  grid_rows() const;   // current screen grid rows
 ```cpp
 void set_efont(const char* name, float size, const char* opts);  // English font
 void set_kfont(const char* name, float size, const char* opts);  // Korean font
-void set_kfont_fill(float fill_ratio, float emin_ratio);         // default (0.92, 1.0)
+void adjust(float h_ratio, float w_ratio);                        // scale cell h/w by ratio (1.0 = no change)
 ```
 
 - Size unit = **points** (fractional allowed, but rasterized to integer pixel height; some
@@ -54,18 +55,26 @@ void set_kfont_fill(float fill_ratio, float emin_ratio);         // default (0.9
 - Defaults (match wt.exe Claude profile): English = `Cascadia Mono, 12pt, normal`;
   Korean = `Malgun Gothic ("맑은 고딕"), size 0` (= match English height; see below).
 - `opts` string (LOGFONT attrs; a number before a letter is that attr's value):
-  `B`=Bold, `I`=Italic, `U`=Underline, `S`=Strikeout, `nW`=Weight n. e.g. `"BI"`, `"700W"`.
+  `B`=Bold (if a number is prefixed, e.g. `"700B"`, sets `lfWeight`; if no number, e.g. `"B"`, sets `FW_BOLD`),
+  `I`=Italic, `U`=Underline, `S`=Strikeout,
+  `Q`=Quality (0~6, default 0 if invalid or empty),
+  `W`=Width ratio (percentage, e.g. `"90W"`, default 100).
 - **Korean height-match mode** (set via `set_kfont` size):
   - size **<= 0**: match mode ON (default). Korean rasterized to the **same pixel height** as
     English (size value ignored). Line height tracks English so box-drawing rows abut vertically.
-    Korean keeps natural width (not squeezed); the English cell width is narrowed to that Korean
-    width (English condensed) so a Korean glyph nearly fills its 2 cells.
   - size **> 0**: match mode OFF. Korean at the given size; English natural width; line height =
     max of the two fonts.
-- `set_kfont_fill` (match mode only): `fill_ratio` = how much a Korean glyph fills its 2 cells
-  (raise → English cell narrower, tighter Korean spacing); `emin_ratio` = readability floor below
-  which English is not condensed (1.0 → English stays natural width, wt.exe-like). See
-  `calc_cell_size` in `Source/ConBox.cpp` (and the `[FONT]` item of its top "설계 개요" block).
+- **Grid cell width (`cell_w`) calculation**:
+  - `w_e` = English natural character width $\times$ `efont_width_pct` / 100
+  - `w_k` = Korean natural character width $\times$ `kfont_width_pct` / 100
+  - `max_w` = `max(2 * w_e, w_k)`
+  - `cell_w` = `(max_w + 1) / 2` (rounded up to prevent truncation)
+  - English font width is set to w_e, and Korean font width is set to w_k / 2 (base character width) for final GDI creation, preserving their individual width ratios inside the cell grid. However, if the width ratio (`opts` 'W') is 100% (default), `lfWidth` is left at 0 (natural width) to let GDI render the font at its natural width without scaling artifacts.
+- **`adjust(h_ratio, w_ratio)`**: scale cell dimensions by a ratio after font setup.
+  - `1.0` = no change; `0.9` = shrink 10%; `1.1` = enlarge 10%.
+  - Applied after font metrics are calculated; call after `set_efont`/`set_kfont` for effect.
+  - Affects grid recomputation: if called after `open()`, `cols`/`rows` are recalculated to fit the window.
+  - Persists until the next font change.
 
 ---
 
@@ -142,24 +151,40 @@ void set_bg_color(COLORREF bg);   // background
 ## 8. Cursor & IME
 
 ```cpp
-void set_cursor_blend(int bg_weight, int fg_weight);  // block color mix, default 6:4 (bg:fg)
+void set_cursor(int type);                            // shape; 0 = default (see below)
+void set_cursor_blend(int bg_weight, int fg_weight);  // block/underline color mix, default 4:6 (bg:fg)
 void set_cursor_blink(int interval_ms);               // toggle ms; 0 = always on
 ```
 
-- Cursor = a **block filling the cell**, colored by mixing bg:fg at `bg_weight:fg_weight` (near-bg).
-  Weights normalized (sum 0 ignored). Any glyph under the block is redrawn in fg on top so it shows.
-  A 2-cell (Korean) block redraws both covered glyphs.
+- **`set_cursor(type)`** — cursor shape. `0` = default; the default maps to the most recently
+  implemented shape (currently **fixed I-beam, 6**). Explicit types:
+  `1`=blinking block, `2`=fixed block, `3`=blinking underline, `4`=fixed underline,
+  `5`=blinking I-beam, `6`=fixed I-beam. **Odd = blinking, even = fixed.** Fixed types kill the blink
+  timer and stay solid; odd types blink per `set_cursor_blink`.
+- **Block** (1/2): fills the cell with the blend color; any glyph under it is redrawn in default fg on
+  top so it shows (a 2-cell Korean block redraws both covered glyphs).
+- **Underline** (3/4): a **3px-high bar at the cell bottom** in the blend color; the glyph stays
+  visible above it (no redraw).
+- **I-beam** (5/6): a vertical bar at the cell's **left edge** (the insertion point). Drawn in **pure
+  default fg** (not the blend). English = **1px** wide; Korean (2-cell) = **3px** wide.
+- Cursor color **blend** = mix of default bg and fg (set via `set_bg_color`/`set_color`, defaulting to
+  RGB(32,32,32)/RGB(200,200,200)) at `bg_weight:fg_weight`, default **4:6 (leans fg)**. Independent of
+  the SGR colors of the last printed text. Used by block/underline and the IME composing box outline;
+  the I-beam ignores it (pure fg).
 - **Blink** at the system caret rate (`GetCaretBlinkTime`); typing/move/output bumps it visible for a
   beat. `set_cursor_blink` overrides; if the system disables blink, stays always on.
-- Position is driven by the child (CUP etc.). If the child hides the cursor (DECTCEM `?25l`), no block.
+- Position is driven by the child (CUP etc.). If the child hides the cursor (DECTCEM `?25l`), no cursor.
 - **`child_caret` suppression**: if the child paints the cursor cell itself as a highlight (reverse
-  cell whose bg differs from its neighbors), ConBox does **not** draw its own block there (avoids a
+  cell whose bg differs from its neighbors), ConBox does **not** draw its own cursor there (avoids a
   double cursor). Full-surface themes (all cells same non-default bg) are not treated as a caret.
 - **IME composition (self-draw)**: the uncommitted composing glyph is drawn by ConBox in the cursor
-  cell (system inline suppressed) as a **hollow rectangle with a 2px outline** + the glyph in fg, no
-  blink while composing. When composing mid-line over existing text, the line pixels from the cursor
-  to the right edge are shifted right by the composition width to **preview the insertion** — correct
-  for **insert-mode** line editors (the target, e.g. Python REPL / readline); restored on commit.
+  cell (system inline suppressed) as a **hollow rectangle with a 1px outline** (blend color) + the
+  glyph in fg, no blink while composing. When composing mid-line over existing text, the line pixels
+  from the cursor to the right edge are shifted right by the composition width to **preview the
+  insertion** — correct for **insert-mode** line editors (the target, e.g. PowerShell PSReadLine /
+  readline); restored on commit. Block/underline cursors are **hidden** during composition (only the
+  hollow box shows); the **I-beam stays visible**, drawn (3px, pure fg) to the **right** of the box
+  (composing syllable inside the box, cursor just past it).
 - **IME hangul cursor width**: when the IME is in Korean (jamo) mode the cursor is a **2-cell** block
   (English mode = **1-cell**); reflected **immediately** on the 한/영 toggle (no keystroke needed).
 
@@ -186,7 +211,7 @@ Launches a console child via ConPTY (pseudo console) and connects its I/O to thi
 The child sees a real console, so line tools through full-screen TUIs run by one path.
 
 ```cpp
-bool start(const char* cmdline, int cols, int rows);  // launch child (cmdline UTF-8); call after open()
+bool start(const char* cmdline);                       // launch child (cmdline UTF-8); call after open()
 void write(const char* data, int len);                // bytes -> child stdin (input sink calls this)
 void resize(int cols, int rows);                       // ResizePseudoConsole (resize sink calls this)
 void stop();                                           // tear down child/PTY/pipes/timer (idempotent)
@@ -198,7 +223,8 @@ void set_input_sink(void (*sink)(const char* bytes, int len, void* user), void* 
 void set_resize_sink(void (*sink)(int cols, int rows, void* user), void* user);
 ```
 
-- `start` makes input/output pipes + a pseudo console, spawns the child (STARTUPINFOEX +
+- `start` reads the current grid size (`grid_cols()`, `grid_rows()`), then makes input/output pipes +
+  a pseudo console sized to match, spawns the child (STARTUPINFOEX +
   `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE_HANDLE`), and **internally registers itself** on the input
   sink (→`write`) and resize sink (→`resize`); an internal timer polls output into `print()`. Requires
   the window to exist (call after `open()`). If already running, restarts.
@@ -222,7 +248,7 @@ void set_resize_sink(void (*sink)(int cols, int rows, void* user), void* user);
 | PageUp / PageDown | `ESC[5~` / `ESC[6~` |
 | Shift+Tab | `ESC[Z` |
 | F1..F4 / F5..F12 | `ESC O P`..`S` / `ESC[15~`,`17~`..`24~` |
-| Ctrl+C | interrupt `0x03` |
+| Ctrl+C | if selection active → copy to clipboard + clear selection; else interrupt `0x03` |
 | Ctrl+V / paste | clipboard text to child stdin; if bracketed paste (`?2004h`) wrap in `ESC[200~`..`ESC[201~` |
 
 - Child mode sequences change input encoding: app cursor keys (DECCKM `?1`) switch arrow prefix
@@ -242,8 +268,25 @@ void set_resize_sink(void (*sink)(int cols, int rows, void* user), void* user);
 
 ## 11. Clipboard & Selection
 
-- `Ctrl+V` / right-click paste → child stdin (§10). `Ctrl+C` → interrupt `0x03`.
-- Mouse drag-select / double-click word-select / auto-copy on cell-grid coords: **not implemented**.
+```cpp
+// (no new public API — selection is entirely mouse/keyboard driven)
+```
+
+- **Mouse drag select**: left-button down starts a selection anchor (cell coordinates); dragging
+  extends the selection end in real-time with inverted (swapped fg/bg) rendering. On button-up the
+  selected text is **auto-copied** to the clipboard (CF_UNICODETEXT). Clicking without dragging (same
+  cell) clears the selection. `SetCapture`/`ReleaseCapture` ensure tracking outside the window.
+- **Selection text extraction** (`copy_selection`): walks rows from anchor to end, collects non-trail
+  (`ch!=0`) characters, trims trailing spaces per line, joins lines with CR+LF.
+- **Selection clear**: new output (`print`), typing, or any paste operation clears the selection.
+- **Ctrl+C** (terminal mode): if a selection is active, copies it to the clipboard and clears the
+  selection. If no selection, sends interrupt `0x03` to the child (standard terminal behavior).
+- **Ctrl+V**: pastes clipboard text to child stdin (bracketed paste if `?2004h`). Same as before.
+- **Right-click**: pastes clipboard text to child stdin (same as Ctrl+V). Selection is cleared first.
+- **Hit-test** (`hit_test`): converts client pixel coordinates to unified (scrollback+screen) row
+  index and cell column. Clamps to grid edges. Wide-char trail cells snap to their lead cell.
+- **IME interaction**: mouse-down and right-click force-finalize any active IME composition before
+  selection/paste (compose-finalize order maintained).
 
 ---
 
@@ -259,13 +302,14 @@ void set_resize_sink(void (*sink)(int cols, int rows, void* user), void* user);
 
 - An MFC dialog app (`CConBoxDlg`) hosts ConBox as a child window for portability testing
   (ConBox source stays demo-free).
-- No OK/Cancel; ConBox fills the client area with a **20px** margin. Titlebar has min/max; resizing
-  the window resizes ConBox.
+- No OK/Cancel; ConBox fills the client area with a **5px** bezel margin. Titlebar has min/max;
+  resizing the window resizes ConBox.
 - Startup sizes the main window so ConBox is **96 x 32 cells** (via `client_size_for_grid` + demo
-  margin + scrollbar/non-client), centered on the work area.
-- On startup the demo calls `con_box.start("python.exe", grid_cols(), grid_rows())` — the
-  representative target child (interactive Python REPL; ConPTY presents a tty so it starts
-  interactive). `set_exit_callback` closes the window when the child exits.
+  margin + scrollbar/non-client), centered on the work area. The demo also calls `adjust(0.9, 0.9)`
+  to shrink cells to 90%.
+- On startup the demo calls `con_box.set_cursor(0)` (default shape) after `open()`.
+- On startup the demo calls `con_box.start("powershell.exe")` (start() sizes the child console to the
+  current grid). `set_exit_callback` closes the window when the child exits.
 - The app is **System DPI Aware** (crisp at non-100% scaling) — set by the host
   (`SetProcessDPIAware()`), not the control, since DPI awareness is process-wide.
 
