@@ -114,8 +114,8 @@ public:
 	// (GetCaretBlinkTime).
 	void set_cursor_blink(int interval_ms);
 
-	// Set the cursor shape. 0 = default (currently mapped to fixed block; the default mapping is
-	// raised as new shapes are added). Explicit shapes:
+	// Set the cursor shape. 0 = default (= blinking underline, type 3, matching classic conhost.exe).
+	// Explicit shapes:
 	//   1=blinking block, 2=fixed block, 3=blinking underline, 4=fixed underline,
 	//   5=blinking I-beam, 6=fixed I-beam.
 	// Odd types blink (subject to set_cursor_blink / system rate); even types stay solid. Block and
@@ -410,6 +410,14 @@ private:
 	// the cursor cell itself (instead of system inline) to pin it to the cursor.
 	std::wstring comp_str;
 
+	// Set by OnImeComp when it commits a glyph (GCS_RESULTSTR sent to the child); consumed by OnKeyDown
+	// to fix the horizontal-arrow position after a commit (the commit advances the child cursor one
+	// glyph right). The IME often pre-commits on the arrow's WM_IME_COMPOSITION *before* the arrow's
+	// WM_KEYDOWN, so finalize_composition() inside OnKeyDown is then a no-op -- this flag catches that.
+	// Cleared by other input paths (OnChar, mouse) so it only applies to a commit immediately followed
+	// by an arrow.
+	bool ime_committed;
+
 	// Scroll region (DECSTBM), respected by LF/RI/IL/DL/SU/SD. Default is the whole screen [0, rows-1].
 	int scroll_top;
 	int scroll_bot;
@@ -426,6 +434,7 @@ private:
 	int  vt_nparam;
 	bool vt_priv;                 // CSI '?' (DEC private) marker
 	bool vt_gtlt;                 // CSI '<' '=' '>' prefix marker (2nd DA/kitty/XTMODKEYS; all ignored)
+	bool vt_space;                // CSI ' ' (0x20) intermediate marker; needed to spot DECSCUSR (CSI Ps SP q)
 
 	// Current SGR attributes applied by put_char (colors use cur_fg/cur_bg).
 	bool cur_bold;                // maps to bright color

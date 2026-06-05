@@ -42,7 +42,7 @@
 //   Key state: cur_row/cur_col (0-based screen cell cursor), view_top (top of view, unified index),
 //     cursor_visible (?25), saved_row/col (DECSC/RC), scroll_top/bot (DECSTBM region),
 //     alt_active/saved_main_* (alt screen), cols/rows, cell_w/h/base, margin_*, glyph_level,
-//     vt_state/params/priv/gtlt (parser; persists across chunked print()), cur_fg/bg/bold/reverse (SGR),
+//     vt_state/params/priv/gtlt/space (parser; persists across chunked print()), cur_fg/bg/bold/reverse (SGR),
 //     app_cursor_keys/bracketed_paste (input encoding the child turned on via DEC modes),
 //     back_dc/bmp (double buffer). ConPTY: h_pc/in_write/out_read/child_proc/child_running/exit_cb
 //     (dormant when start() is unused).
@@ -57,7 +57,8 @@
 //   print: UTF-8 -> UTF-16, each char fed to the vt_feed state machine; then scroll-to-bottom,
 //     bump cursor, repaint.
 //   vt_feed: GROUND (glyph -> put_char; C0: CR/LF/BS/TAB(mult of 8)/BEL ignored) / ESC (7,8=DECSC/RC,
-//     M=RI, [=CSI, ]=OSC) / CSI (accumulate params, ?=priv, <=>=gtlt, final byte -> dispatch_csi) /
+//     M=RI, [=CSI, ]=OSC) / CSI (accumulate params, ?=priv, <=>=gtlt, ' '=space (DECSCUSR), final byte
+//     -> dispatch_csi) /
 //     OSC (discard up to BEL/ST).
 //   dispatch_csi: drops the whole sequence if gtlt (private <>= sequence; avoids final-byte misparse).
 //     Otherwise cursor moves (CUU/CUD/CUF/CUB/CUP/HVP/CHA/VPA), erase ED/EL/ECH, SGR (m), modes h/l
@@ -86,12 +87,15 @@
 //
 // [IME] Korean composition (OnImeStart/Comp/End/Notify + comp_str in OnPaint)
 //   Only the committed part (GCS_RESULTSTR) goes to the child via send_input_wide. The uncommitted
-//   part (GCS_COMPSTR) is held in comp_str and drawn by ConBox (hollow 2px outline, pinned to the
+//   part (GCS_COMPSTR) is held in comp_str and drawn by ConBox (hollow 1px outline, pinned to the
 //   cursor cell; OnImeComp returns 0 to suppress system inline + WM_CHAR duplication). Mid-line
 //   composition shifts the line right via ScrollDC to preview insertion (for insert-mode children like
 //   the Python REPL). Order guarantee: finalize_composition force-commits with ImmNotifyIME
 //   (CPS_COMPLETE) right before a trigger key -> [completed][trigger]. Cursor width: is_hangul_mode
 //   (ImmGetConversionStatus IME_CMODE_NATIVE); OnImeNotify reflects the Korean/English toggle at once.
+//   A commit advances the child cursor one glyph right, so OnKeyDown corrects a plain Left/Right after
+//   a commit (swallow Right / double Left), gated by the ime_committed flag (OnImeComp sets it; the MS
+//   IME pre-commits before the arrow's WM_KEYDOWN so finalize's return value can't be used).
 //
 // [PTY] Child runner (start/write/resize/stop/pump/handle_child_exit; "child (ConPTY)" section below)
 //   start: CreatePtyPipes (pipes + CreatePseudoConsole) -> STARTUPINFOEX+attr -> CreateProcessW ->
@@ -539,6 +543,8 @@ CConBox::CConBox()
 	vt_nparam = 0;
 	vt_priv = false;
 	vt_gtlt = false;
+	vt_space = false;
+	ime_committed = false;
 	cur_bold = false;
 	cur_reverse = false;
 
@@ -871,10 +877,9 @@ void CConBox::set_cursor_blink(int interval_ms)
 
 void CConBox::set_cursor(int type)
 {
-	// type 0 = default; the default maps to the most-recently-finished shape stage (raised as the
-	// shapes are built out). Currently default = fixed I-beam (6).
+	// type 0 = default. Default = blinking underline (3), matching the classic conhost.exe cursor.
 	if (type == 0)
-		type = 6;
+		type = 3;
 	cursor_type = type;
 
 	// Even types are fixed (no blink) -> kill the timer and pin visible. Odd types blink at the
@@ -1469,6 +1474,7 @@ void CConBox::vt_feed(wchar_t wc)
 			vt_nparam = 0;
 			vt_priv = false;
 			vt_gtlt = false;
+			vt_space = false;
 			for (int k = 0; k < 16; ++k) vt_params[k] = 0;
 			return;
 		}
@@ -1506,7 +1512,9 @@ void CConBox::vt_feed(wchar_t wc)
 			vt_state = VT_GROUND;
 			return;
 		}
-		// Intermediate bytes (0x20-0x2F etc.) ignored; the sequence continues.
+		// Intermediate bytes (0x20-0x2F). Only ' ' (0x20) is tracked, to tell DECSCUSR (CSI Ps SP q)
+		// apart from a bare CSI q; the rest are ignored. The sequence continues either way.
+		if (wc == 0x20) vt_space = true;
 		return;
 
 	case VT_OSC:
@@ -1599,6 +1607,16 @@ void CConBox::dispatch_csi(wchar_t fin)
 		}
 		break;
 	}
+
+	case L'q':   // DECSCUSR (CSI Ps SP q): set cursor style. The SP intermediate is required (vt_space);
+		// a bare CSI q (e.g. DECLL) is a different command and is ignored here. VT style numbers map
+		// 1:1 to set_cursor types (0 = default = blinking block).
+		if (vt_space) {
+			int s = n ? n : 1;       // 0/absent -> 1 (blinking block)
+			if (s >= 1 && s <= 6)
+				set_cursor(s);
+		}
+		break;
 
 	case L'm': {   // SGR (color/attributes)
 		if (vt_nparam == 0) {
@@ -1912,6 +1930,7 @@ void CConBox::OnLButtonDown(UINT flags, CPoint pt)
 {
 	// Finalize any IME composition first (a click is also a composition-ending trigger).
 	finalize_composition();
+	ime_committed = false;   // a click is not an arrow; don't let it enable the arrow correction
 
 	sel_active = false;
 
@@ -1958,6 +1977,7 @@ void CConBox::OnMouseMove(UINT flags, CPoint pt)
 void CConBox::OnRButtonDown(UINT flags, CPoint pt)
 {
 	finalize_composition();
+	ime_committed = false;   // a click is not an arrow; don't let it enable the arrow correction
 	clear_selection();
 	// Paste the clipboard to the child stdin.
 	paste_clipboard();
@@ -2020,6 +2040,7 @@ LRESULT CConBox::OnImeComp(WPARAM w, LPARAM l)
 			r.resize(n);
 			ImmGetCompositionStringW(himc, GCS_RESULTSTR, &r[0], bytes);
 			send_input_wide(r.c_str(), n);
+			ime_committed = true;   // a glyph was just committed; OnKeyDown uses this to fix arrow moves
 		}
 		comp_str.clear();
 	}
@@ -2251,6 +2272,7 @@ void CConBox::OnChar(UINT ch, UINT rep, UINT flags)
 	// Terminal (raw) mode: no local edit/echo; send chars/control bytes to the child. (WM_CHAR is the
 	// post-layout/IME result, so it suits printable/control byte sending.)
 	if (input_sink != nullptr) {
+		ime_committed = false;   // a real keystroke breaks the "commit then arrow" sequence
 		for (UINT k = 0; k < rep; ++k) {
 			if (ch == 0x08) {
 				// Backspace -> DEL (0x7F) per readline/Unix convention.
@@ -2259,6 +2281,12 @@ void CConBox::OnChar(UINT ch, UINT rep, UINT flags)
 			else if (ch == L'\r' || ch == L'\n') {
 				// Enter -> CR (0x0D).
 				send_input_bytes("\r", 1);
+			}
+			else if (ch == 0x03 || ch == 0x16) {
+				// Ctrl+C (0x03) and Ctrl+V (0x16) are special-cased in terminal_keydown (copy/interrupt
+				// and clipboard paste). WM_KEYDOWN and WM_CHAR both fire, so dropping the WM_CHAR byte
+				// here avoids sending it twice -- otherwise the child re-pastes (Ctrl+V shows twice as
+				// PSReadLine treats 0x16 as its own paste) / double-interrupts.
 			}
 			else if (ch < 0x80) {
 				// Printable ASCII + other control bytes (Tab=0x09, Esc=0x1B, Ctrl+letter...) as one byte.
@@ -2288,16 +2316,38 @@ void CConBox::OnKeyDown(UINT vk, UINT rep, UINT flags)
 		bool tshift = (::GetKeyState(VK_SHIFT) & 0x8000) != 0;
 
 		// For a composition-ending trigger key, force-commit the IME first so the completed glyph is
-		// sent before the trigger (Requirements.md sec 10).
+		// sent before the trigger (Requirements.md sec 10). The MS Korean IME usually pre-commits on the
+		// arrow's WM_IME_COMPOSITION (OnImeComp sets ime_committed) *before* this WM_KEYDOWN, so
+		// finalize_composition() here is then a no-op; capture ime_committed (set by either path) to know
+		// a commit just happened, then consume it.
+		bool committed = ime_committed;
 		switch (vk) {
 		case VK_LEFT: case VK_RIGHT: case VK_UP: case VK_DOWN:
 		case VK_HOME: case VK_END: case VK_DELETE: case VK_INSERT:
 		case VK_PRIOR: case VK_NEXT: case VK_RETURN: case VK_TAB: case VK_ESCAPE:
-			finalize_composition();
+			if (finalize_composition())
+				committed = true;
 			break;
 		default:
 			break;
 		}
+		ime_committed = false;   // consumed: only a commit immediately before this key counts
+
+		// IME compose-finalize horizontal-arrow fix: committing the glyph inserts it and advances the
+		// child cursor one glyph to the RIGHT, so a plain Left/Right then lands one glyph off from the
+		// glyph's visible (composing) cell. Make the arrow act relative to that cell:
+		//   Right: the commit already moved right one glyph (== the intended right move) -> swallow it.
+		//   Left : send Left once more so the extra Left cancels the commit's advance and the normal
+		//          Left below then moves one glyph left (net -1).
+		// Only for unmodified arrows; Ctrl/Shift+arrow (word move / selection) keep their raw behavior.
+		bool plain = !tctrl && !tshift;
+		if (committed && plain && vk == VK_RIGHT) {
+			bump_cursor();
+			if (vk != VK_PROCESSKEY) dbg_dump("key");   // [DEBUG]
+			return;
+		}
+		if (committed && plain && vk == VK_LEFT)
+			terminal_keydown(VK_LEFT, false, false);    // extra Left offsets the commit's right advance
 
 		if (terminal_keydown(vk, tctrl, tshift))
 			bump_cursor();

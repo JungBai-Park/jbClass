@@ -122,7 +122,9 @@ void print(const char* text);   // UTF-8 bytes, interpreted as VT/ANSI escape se
   - Glyph output + **autowrap** at `cols`. A line feed at the bottom scrolls (top line → scrollback).
   - **C0**: `\r`, `\n`, `\b`, `\t` (next multiple-of-8 tab stop), BEL ignored.
   - **CSI**: cursor moves (CUU/CUD/CUF/CUB/CUP/HVP/CHA/VPA), erase (ED/EL), SGR, cursor save/restore,
-    show/hide (DECTCEM `?25`).
+    show/hide (DECTCEM `?25`), cursor style (**DECSCUSR** `CSI Ps SP q`; the space intermediate is
+    required, so a bare `CSI q` is not it). `Ps` 0..6 maps 1:1 to `set_cursor` types (0 → 1 = blinking
+    block), so a child can switch the cursor shape (§8).
   - **SGR**: 16 base colors + bold(bright) + reverse + **256-color & truecolor**; `0`/`39`/`49`
     reset to defaults. OSC (title etc.) ignored.
   - **Full-screen (best-effort)**: alt screen (`?1049`/`?1047`/`?47`, `?1048`), scroll region
@@ -156,8 +158,8 @@ void set_cursor_blend(int bg_weight, int fg_weight);  // block/underline color m
 void set_cursor_blink(int interval_ms);               // toggle ms; 0 = always on
 ```
 
-- **`set_cursor(type)`** — cursor shape. `0` = default; the default maps to the most recently
-  implemented shape (currently **fixed I-beam, 6**). Explicit types:
+- **`set_cursor(type)`** — cursor shape. `0` = default = **blinking underline (3)**, matching the
+  classic conhost.exe cursor. Explicit types:
   `1`=blinking block, `2`=fixed block, `3`=blinking underline, `4`=fixed underline,
   `5`=blinking I-beam, `6`=fixed I-beam. **Odd = blinking, even = fixed.** Fixed types kill the blink
   timer and stay solid; odd types blink per `set_cursor_blink`.
@@ -263,6 +265,12 @@ void set_resize_sink(void (*sink)(int cols, int rows, void* user), void* user);
   - **Pass criterion**: composing Korean then pressing an arrow must complete the glyph **in its
     composing cell** and *then* move (completing in the moved cell = fail). Verified by real typing
     (manual; needs a Korean keyboard).
+- **Horizontal-arrow correction**: committing the glyph inserts it and advances the child cursor one
+  glyph to the right, so a plain Left/Right would land one glyph off from the composing cell. ConBox
+  makes the arrow act relative to that cell: on **Right** it swallows the arrow (the commit already
+  moved right one glyph); on **Left** it sends Left **twice** (one cancels the commit's advance). So
+  after committing, Left lands on the previous glyph and Right on the next — net one-glyph moves.
+  Only for unmodified arrows (Ctrl/Shift+arrow keep raw behavior).
 
 ---
 

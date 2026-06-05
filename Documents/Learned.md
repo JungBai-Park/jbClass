@@ -58,8 +58,8 @@ To reproduce `calc_cell_size` values (`cell_w`/`natw`/`kwid`):
   lacks** those — don't default to Consolas.
 
 ## Cursor rendering
-- **`cursor_type`** (1..6) picks the shape; `set_cursor(type)` maps `0`→the current default (raised as
-  shapes were added; now 6=fixed I-beam). **Odd=blink, even=fixed** — `set_cursor`/`bump_cursor`/
+- **`cursor_type`** (1..6) picks the shape; `set_cursor(type)` maps `0`→the default (3=blinking
+  underline, like classic conhost.exe). **Odd=blink, even=fixed** — `set_cursor`/`bump_cursor`/
   `OnTimer` all gate the blink timer on `(cursor_type & 1)`. The shape itself is chosen in `OnPaint`'s
   cursor branch: `<=2` block, `<=4` underline, else I-beam.
 - color = `blend_cursor_color()` mixing `default_bg`:`default_fg` at `cursor_bg_weight:cursor_fg_weight` (default **4:6**, leans fg; `set_cursor_blend`). The default colors are stored in `default_fg` and `default_bg` (updated via `set_color`/`set_bg_color`), keeping the cursor blend independent of the SGR colors of the last printed text. Block/underline use the blend; **I-beam uses pure `default_fg`**. Width 2 cells if `is_hangul_mode()` else 1.
@@ -89,12 +89,30 @@ To reproduce `calc_cell_size` values (`cell_w`/`natw`/`kwid`):
 - **`vt_gtlt` lesson**: claude sends `ESC[<u` (kitty) / `ESC[>4;2m` (XTMODKEYS) — `<`/`=`/`>`-prefixed
   private CSI. Their final byte (`u`/`m`) must NOT be parsed as a standard command (`CSI u` =
   restore-cursor → jumped to 0,0). `dispatch_csi` drops the whole sequence when `vt_gtlt` is set.
+- **DECSCUSR (`vt_space`)**: cursor-style `CSI Ps SP q` needs the SP (0x20) intermediate to tell it
+  from a bare `CSI q`. The CSI parser tracks only `' '` (sets `vt_space`); `dispatch_csi`'s `q` case
+  acts only when `vt_space`. `Ps` 0..6 maps 1:1 to `set_cursor` (0→1). Test from the child:
+  `$e=[char]27; Write-Host "$e[5 q" -NoNewline` then Enter (note the space before `q`).
+
+## Input edge cases
+- **Ctrl+V / Ctrl+C double-send**: both `WM_KEYDOWN` and `WM_CHAR` fire. `terminal_keydown`
+  special-cases these (paste / copy-or-interrupt), so `OnChar` must **drop** their WM_CHAR control
+  bytes `0x16`/`0x03` — else the child gets them too (Ctrl+V shows twice: PSReadLine treats `0x16` as
+  its own paste; right-click pastes once because it has no WM_CHAR path). Other Ctrl+letters still go
+  through OnChar.
 
 ## Manual-only verification (Korean IME) — needs a Korean keyboard, can't auto-capture
 - **Compose-finalize order** (Requirements.md §10): composing then pressing arrow/Home/End must
   complete the syllable **in its composing cell** then move (`[completed][trigger]`). Done by
   `finalize_composition` (force `ImmNotifyIME(CPS_COMPLETE)` before the trigger key). `OnImeComp`'s
   `n==0` filter + `return 0` prevent double-send / WM_CHAR dup. Third-party IMEs may differ in CPS_COMPLETE timing.
+- **Horizontal-arrow correction** (Requirements.md §10): a commit advances the child cursor one glyph
+  right, so a plain Left/Right lands one glyph off (observed: Left = stay, Right = move two). Fix in
+  `OnKeyDown`: on Right **swallow** the arrow, on Left send Left **twice**. Key gotcha — can't gate on
+  `finalize_composition()`'s return: the MS Korean IME **pre-commits on the arrow's WM_IME_COMPOSITION
+  before the WM_KEYDOWN**, so `finalize` is then a no-op (returns false). Use the `ime_committed` flag
+  set by `OnImeComp` instead; `OnKeyDown` captures+clears it, and `OnChar`/mouse-down clear it so only
+  a commit *immediately* before an arrow triggers the fix. Assumes the child moves one glyph per arrow.
 - **IME cursor width**: hangul → 2-cell block, English → 1-cell, switching **immediately** on the
   한/영 key (before composing). `is_hangul_mode()` reads `IME_CMODE_NATIVE`; `OnImeNotify`/
   `IMN_SETCONVERSIONMODE` reflects it. (At a TUI prompt where the child paints its own caret,
