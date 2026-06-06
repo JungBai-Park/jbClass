@@ -80,10 +80,15 @@ public:
 	// Default (nothing set) is match mode on.
 	void set_kfont(const char* name, float size, const char* opts);
 
-	// Force-scale cell height/width by a ratio after font metrics are computed.
-	// 1.0 = unchanged, <1.0 shrinks, >1.0 enlarges. Persists until the next font change.
-	// Calling after open() recomputes cols/rows.
-	void adjust(float h_ratio, float w_ratio);
+	// Pad (or trim) each side of every cell by a pixel amount, applied after font metrics are computed.
+	// Positive adds margin on that side; negative eats into it. The font size is unchanged -- only the
+	// cell box grows/shrinks and the glyph shifts inside it:
+	//   left   : glyph moves right by 'left' (left margin appears before it); right pads the cell's right.
+	//   top    : glyph moves down by 'top' (top margin appears above it); bottom pads the cell's bottom.
+	// So cell_w += left+right, cell_h += top+bottom. Built-in block/box glyphs ignore the glyph offset
+	// and still fill the whole (padded) cell to stay gap-free. Persists until the next font change;
+	// calling after open() recomputes cols/rows.
+	void adjust(int left, int top, int right, int bottom);
 
 	// Choose how many box/block characters ConBox draws as shapes itself instead of via the font.
 	// Font block glyphs often leave gaps between adjacent cells (especially vertically); drawing the
@@ -384,8 +389,10 @@ private:
 	int cell_h;        // px height of one line cell
 	int cell_base;     // px from cell top to glyph baseline (baseline alignment)
 
-	float adjust_h;    // cell height scale (see adjust())
-	float adjust_w;    // cell width scale
+	int adjust_left;   // per-side cell padding in px (see adjust()); left/top also shift the glyph
+	int adjust_top;
+	int adjust_right;
+	int adjust_bottom;
 
 	int cols;
 	int rows;
@@ -460,11 +467,4 @@ private:
 	CBitmap* back_old_bmp;  // bitmap originally in back_dc (restored on teardown)
 	int back_w;             // current back_bmp size (change detection)
 	int back_h;
-
-	// [DEBUG] Korean/cursor render capture+log. Keep until told to remove; on removal delete this block
-	//         and the // [DEBUG] marked parts (helpers/calls/timer/init) in ConBox.cpp.
-	bool dbg_record;        // on/off (follows the DBG_HARNESS switch in the ctor, default false)
-	int dbg_seq;            // capture serial
-	bool dbg_input_seen;    // true after the first input (no output capture before that)
-	void dbg_dump(const char* tag);       // save the back buffer to BMP + log state
 };

@@ -47,7 +47,7 @@ int  grid_rows() const;   // current screen grid rows
 ```cpp
 void set_efont(const char* name, float size, const char* opts);  // English font
 void set_kfont(const char* name, float size, const char* opts);  // Korean font
-void adjust(float h_ratio, float w_ratio);                        // scale cell h/w by ratio (1.0 = no change)
+void adjust(int left, int top, int right, int bottom);            // per-side cell padding in px (>0 add, <0 trim)
 ```
 
 - Size unit = **points** (fractional allowed, but rasterized to integer pixel height; some
@@ -70,11 +70,16 @@ void adjust(float h_ratio, float w_ratio);                        // scale cell 
   - `max_w` = `max(2 * w_e, w_k)`
   - `cell_w` = `(max_w + 1) / 2` (rounded up to prevent truncation)
   - English font width is set to w_e, and Korean font width is set to w_k / 2 (base character width) for final GDI creation, preserving their individual width ratios inside the cell grid. However, if the width ratio (`opts` 'W') is 100% (default), `lfWidth` is left at 0 (natural width) to let GDI render the font at its natural width without scaling artifacts.
-- **`adjust(h_ratio, w_ratio)`**: scale cell dimensions by a ratio after font setup.
-  - `1.0` = no change; `0.9` = shrink 10%; `1.1` = enlarge 10%.
-  - Applied after font metrics are calculated; call after `set_efont`/`set_kfont` for effect.
-  - Affects grid recomputation: if called after `open()`, `cols`/`rows` are recalculated to fit the window.
-  - Persists until the next font change.
+- **`adjust(left, top, right, bottom)`**: pad (or trim) each cell side by a pixel amount after font
+  setup. Font size is unchanged; only the cell box grows/shrinks and the glyph shifts inside it.
+  - `>0` adds margin on that side, `<0` eats into it. `cell_w += left+right`, `cell_h += top+bottom`.
+  - `left` also shifts the glyph right (applied at the font `TextOutW` x); `top` also shifts it down
+    (via `cell_base += top`). `right`/`bottom` only enlarge the cell (no glyph shift). Equal `top`/
+    `bottom` (or `left`/`right`) centers the glyph in the padded cell.
+  - Built-in block/box glyphs ignore the glyph offset and still fill the whole (padded) cell (gap-free).
+  - Negative padding clamps `cell_w`/`cell_h` to >= 1px.
+  - Applied after font metrics; call after `set_efont`/`set_kfont`. If called after `open()`,
+    `cols`/`rows` are recomputed to fit the window. Persists until the next font change.
 
 ---
 
@@ -313,8 +318,8 @@ void set_resize_sink(void (*sink)(int cols, int rows, void* user), void* user);
 - No OK/Cancel; ConBox fills the client area with a **5px** bezel margin. Titlebar has min/max;
   resizing the window resizes ConBox.
 - Startup sizes the main window so ConBox is **96 x 32 cells** (via `client_size_for_grid` + demo
-  margin + scrollbar/non-client), centered on the work area. The demo also calls `adjust(0.9, 0.9)`
-  to shrink cells to 90%.
+  margin + scrollbar/non-client), centered on the work area. The demo also calls `adjust(0, -1, 0, -1)`
+  to trim 1px off the top/bottom of each cell (tighter line spacing).
 - On startup the demo calls `con_box.set_cursor(0)` (default shape) after `open()`.
 - On startup the demo calls `con_box.start("powershell.exe")` (start() sizes the child console to the
   current grid). `set_exit_callback` closes the window when the child exits.

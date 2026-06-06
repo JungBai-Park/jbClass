@@ -80,7 +80,7 @@ To reproduce `calc_cell_size` values (`cell_w`/`natw`/`kwid`):
 - **Child-exit detection can't use pipe EOF** (ConPTY's conhost holds the write end open). `pump`
   polls `WaitForSingleObject(child_proc.hProcess, 0)`; after draining output → `handle_child_exit`
   (`stop` then `exit_cb`; callback may `start()` again safely).
-- Output polling = ConBox's own window timer `PUMP_TIMER`(=3; distinct from CURSOR=1/DBG=2). Needs a
+- Output polling = ConBox's own window timer `PUMP_TIMER`(=3; distinct from CURSOR=1). Needs a
   running GUI message pump. The old message-only window is gone.
 - Lifetime: `CConBox::OnDestroy` (and the dtor, and demo's OnDestroy) call `stop()` first so polling
   never touches a dying window. Idempotent.
@@ -128,21 +128,6 @@ To reproduce `calc_cell_size` values (`cell_w`/`natw`/`kwid`):
 - Real cause: claude (Ink TUI) emits a leading `<08>` (backspace) before the first char echo **only at
   narrow grids** — an artifact of the debug **60×20** grid. At spec **96×32** it isn't sent → `❯ r`.
   **Not a ConBox VT bug** (the same bytes render the same on any terminal).
-- Check: in `conexe_io.log` a clean first echo is `?2026lr`; the narrow-grid symptom is `?2026l<08>r`
-  (don't confuse with the normal caret pattern `[30m[47m <08>`).
-- Keep the demo grid at **96×32**; never shrink it to make captures small (the harness crops instead).
-  This is **independent of terminal identity** — env vars (`WT_SESSION`/`TERM_PROGRAM`) and XTVERSION
-  responses were all tried and reverted. Don't chase that path again.
-
-## Debug harness (toggleable, default OFF; keep until told to remove)
-- Captures the cursor-row strip of ConBox's back buffer to PNG + logs state, to eye-verify Korean
-  IME / cursor. All debug code (including the child I/O dump) is marked `// [DEBUG]`; grep to remove together.
-- Switches (compile-time, both default 0, in `ConBox.cpp`): `#define DBG_HARNESS 0` (captures `cap_*` +
-  `condbg.log`; drives `dbg_record`); `#define DBG_IO 0` (child I/O dump `conexe_io.log`; gates
-  `DbgDumpIo` body via `#if`). Set to 1 + rebuild to enable.
-- When on: `dbg_dump(tag)` saves `Temp/cap_NNN_<tag>.png` (cursor row, full width, ±1 row — ~2KB at
-  96×32; full-buffer fallback if no cursor) + a `condbg.log` line (cursor (row,col), on/visible,
-  hangul, comp_str). `DbgDumpIo` dumps child IN/OUT bytes (ESC unescaped) to `conexe_io.log`. Captures
-  fire on input events + an 80ms output-settle debounce (`DBG_TIMER`).
-- Read captures directly (PNG); zoom with `System.Drawing` NearestNeighbor for detail. `condbg.log`
-  `seq` ↔ `cap_NNN` is 1:1.
+- Keep the demo grid at **96×32**; never shrink it. This is **independent of terminal identity** — env
+  vars (`WT_SESSION`/`TERM_PROGRAM`) and XTVERSION responses were all tried and reverted. Don't chase
+  that path again.

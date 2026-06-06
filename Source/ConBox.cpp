@@ -74,7 +74,8 @@
 //   Fixed cell_w/h/base from font metrics. cell_w = ceil(max(2*w_e, w_k)/2) where w_e/w_k are the
 //   width-ratio-adjusted English/Korean natural widths. English font is built to cell_w, Korean to
 //   2*cell_w for final rendering. Match mode (set_kfont size<=0, default): Korean height matched to
-//   English; off (size>0): Korean keeps its own height.
+//   English; off (size>0): Korean keeps its own height. adjust(l,t,r,b) then pads each cell side in px
+//   (cell_w+=l+r, cell_h+=t+b; left/top also shift the glyph; built-in block/box glyphs stay full-cell).
 //
 // [PAINT] Drawing (OnPaint, double buffered)
 //   Draw a whole frame into a memory DC then BitBlt (no flicker). Walk rows lines from view_top via
@@ -127,7 +128,7 @@
 #endif
 
 static const UINT_PTR CURSOR_TIMER = 1;
-// Child output polling timer (the one start() sets). 3 to stay distinct from CURSOR(1)/DBG(2).
+// Child output polling timer (the one start() sets). 3 to stay distinct from CURSOR(1).
 static const UINT_PTR PUMP_TIMER = 3;
 static const UINT PUMP_INTERVAL_MS = 16;   // output poll interval; 16~30 keeps the view smooth
 
@@ -139,94 +140,6 @@ static const COLORREF DEFAULT_BG = RGB(32, 32, 32);
 enum { VT_GROUND = 0, VT_ESC = 1, VT_CSI = 2, VT_OSC = 3 };
 
 static const int MAX_SCROLLBACK = 5000;
-
-// ===== [DEBUG] Korean/cursor render log+capture (on removal delete this block and the // [DEBUG] callers) =====
-// Harness enable switch: 0 = off (default), 1 = on (capture + state log on input/output). Set to 1 and
-// rebuild to enable. (Child I/O dump is a separate switch, DBG_IO, below.)
-#define DBG_HARNESS 0
-#include <cstdio>
-#include <cstdarg>
-#include <vector>
-#include <gdiplus.h>
-#pragma comment(lib, "gdiplus.lib")
-// One-shot timer for the deferred (echo-settle) capture. 2 to avoid clashing with CURSOR_TIMER(1).
-static const UINT_PTR DBG_TIMER = 2;
-static void DbgLog(const char* fmt, ...)
-{
-	FILE* fp = nullptr;
-	if (fopen_s(&fp, "D:\\Work\\Study\\ConBox\\Temp\\condbg.log", "ab") != 0 || fp == nullptr)
-		return;
-	SYSTEMTIME st; GetLocalTime(&st);
-	fprintf(fp, "%02d:%02d:%02d.%03d ", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
-	va_list ap; va_start(ap, fmt); vfprintf(fp, fmt, ap); va_end(ap);
-	fputc('\n', fp);
-	fclose(fp);
-}
-// Find the PNG encoder CLSID (standard GDI+ pattern).
-static int DbgGetEncoderClsid(const WCHAR* mime, CLSID* clsid)
-{
-	UINT num = 0, size = 0;
-	Gdiplus::GetImageEncodersSize(&num, &size);
-	if (size == 0) return -1;
-	std::vector<BYTE> buf(size);
-	Gdiplus::ImageCodecInfo* info = (Gdiplus::ImageCodecInfo*)buf.data();
-	Gdiplus::GetImageEncoders(num, size, info);
-	for (UINT i = 0; i < num; ++i)
-		if (wcscmp(info[i].MimeType, mime) == 0) { *clsid = info[i].Clsid; return (int)i; }
-	return -1;
-}
-// Save an HBITMAP (the back buffer) straight to PNG. GDI+ is lazily started once.
-static void DbgWritePng(HBITMAP hbmp, const char* path)
-{
-	if (hbmp == nullptr) return;
-	static bool inited = false;
-	static ULONG_PTR token = 0;
-	if (!inited) {
-		Gdiplus::GdiplusStartupInput input;
-		if (Gdiplus::GdiplusStartup(&token, &input, NULL) != Gdiplus::Ok) return;
-		inited = true;
-	}
-	WCHAR wpath[300];
-	MultiByteToWideChar(CP_ACP, 0, path, -1, wpath, 300);
-	Gdiplus::Bitmap* bmp = Gdiplus::Bitmap::FromHBITMAP(hbmp, NULL);
-	if (bmp != nullptr) {
-		CLSID clsid;
-		if (DbgGetEncoderClsid(L"image/png", &clsid) >= 0)
-			bmp->Save(wpath, &clsid, NULL);
-		delete bmp;
-	}
-}
-
-// [DEBUG] I/O dump enable switch: 0 = off (default), 1 = on (dump child IN/OUT bytes to conexe_io.log).
-// Set to 1 and rebuild to enable. (Screen capture is the DBG_HARNESS switch above.)
-#define DBG_IO 0
-
-// [DEBUG] Dump child I/O bytes in human-readable form to the Temp log (ESC/CR/LF/control as markers),
-// to eyeball the cursor control sequences the child sends. With DBG_IO 0 the body is not compiled, so
-// calls are no-ops.
-static void DbgDumpIo(const char* tag, const char* data, int len)
-{
-#if DBG_IO
-	FILE* fp = nullptr;
-	if (fopen_s(&fp, "D:\\Work\\Study\\ConBox\\Temp\\conexe_io.log", "ab") != 0 || fp == nullptr)
-		return;
-	fprintf(fp, "[%s %d] ", tag, len);
-	for (int i = 0; i < len; ++i) {
-		unsigned char c = (unsigned char)data[i];
-		if (c == 0x1B)      fputs("<ESC>", fp);
-		else if (c == 0x0D) fputs("<CR>", fp);
-		else if (c == 0x0A) fputs("<LF>\n", fp);   // also emit a real newline for readability
-		else if (c == 0x7F) fputs("<DEL>", fp);
-		else if (c < 0x20)  fprintf(fp, "<%02X>", c);
-		else                fputc(c, fp);
-	}
-	fputs("\n----\n", fp);
-	fclose(fp);
-#else
-	(void)tag; (void)data; (void)len;
-#endif
-}
-// ===== [DEBUG] end =====
 
 BEGIN_MESSAGE_MAP(CConBox, CWnd)
 	ON_WM_PAINT()
@@ -573,8 +486,10 @@ CConBox::CConBox()
 	efont_width_pct = 100;
 	kfont_width_pct = 100;
 
-	adjust_h = 1.0f;
-	adjust_w = 1.0f;
+	adjust_left = 0;
+	adjust_top = 0;
+	adjust_right = 0;
+	adjust_bottom = 0;
 
 	glyph_level = 1;
 
@@ -599,12 +514,6 @@ CConBox::CConBox()
 	back_old_bmp = nullptr;
 	back_w = 0;
 	back_h = 0;
-
-	// [DEBUG] Recording follows the DBG_HARNESS switch (default off). When dbg_record is false,
-	// dbg_dump and the settle timer (DBG_TIMER) do nothing.
-	dbg_record = (DBG_HARNESS != 0);
-	dbg_seq = 0;
-	dbg_input_seen = false;
 }
 
 CConBox::~CConBox()
@@ -757,9 +666,13 @@ void CConBox::calc_cell_size()
 	cell_h = (eh > kh) ? eh : kh;
 	cell_base = (ea > ka) ? ea : ka;
 
-	// Apply the adjust_* scale ratios.
-	cell_w = (int)(cell_w * adjust_w + 0.5f);
-	cell_h = (int)(cell_h * adjust_h + 0.5f);
+	// Apply the adjust() per-side pixel padding. left/right grow the cell width, top/bottom the height.
+	// top also pushes the glyph baseline down; left pushes the glyph right (added at TextOutW, since the
+	// glyph horizontal origin is the cell's left edge). bottom/right only enlarge the cell (no glyph
+	// shift). Negative values trim; clamp to keep the cell at least 1px.
+	cell_w += adjust_left + adjust_right;
+	cell_h += adjust_top + adjust_bottom;
+	cell_base += adjust_top;
 	if (cell_w < 1) cell_w = 1;
 	if (cell_h < 1) cell_h = 1;
 
@@ -799,11 +712,13 @@ void CConBox::set_kfont(const char* name, float size, const char* opts)
 	}
 }
 
-void CConBox::adjust(float h_ratio, float w_ratio)
+void CConBox::adjust(int left, int top, int right, int bottom)
 {
-	// Stored ratios persist until the next font change.
-	adjust_h = h_ratio;
-	adjust_w = w_ratio;
+	// Stored per-side pixel padding persists until the next font change.
+	adjust_left = left;
+	adjust_top = top;
+	adjust_right = right;
+	adjust_bottom = bottom;
 
 	if (::IsWindow(m_hWnd)) {
 		calc_cell_size();
@@ -920,67 +835,7 @@ void CConBox::OnTimer(UINT_PTR id)
 		pump();
 		return;
 	}
-	if (id == DBG_TIMER) {   // [DEBUG] capture the settled screen once ~80ms after output stops
-		KillTimer(DBG_TIMER);
-		dbg_dump("out");
-		return;
-	}
 	CWnd::OnTimer(id);
-}
-
-// [DEBUG] Save the current back buffer (exactly what is shown) to PNG and log cursor/composition state.
-void CConBox::dbg_dump(const char* tag)
-{
-	if (!dbg_record) return;
-	// A non-"out" capture is an input event; enable output-settle captures only after the first input
-	// (skip the child's boot output as noise).
-	if (strcmp(tag, "out") != 0)
-		dbg_input_seen = true;
-	if (GetSafeHwnd() != nullptr)
-		UpdateWindow();   // flush any pending paint into the back buffer before capturing
-	++dbg_seq;
-	char path[300];
-	sprintf_s(path, sizeof(path), "D:\\Work\\Study\\ConBox\\Temp\\cap_%03d_%s.png", dbg_seq, tag);
-
-	// Crop to the cursor row (full width, +-1 row) so the PNG stays small (easier to read). Width stays
-	// full so long Korean input fits; only height is narrowed. Fall back to the whole buffer if the
-	// cursor position is unavailable (rare).
-	CRect cur;
-	if (get_cursor_rect(cur) && back_w > 0 && back_h > 0) {
-		int left   = 0;
-		int right  = back_w;
-		int top    = cur.top    - cell_h;
-		int bottom = cur.bottom + cell_h;
-		if (top < 0) top = 0;
-		if (bottom > back_h) bottom = back_h;
-		int cw = right - left, ch = bottom - top;
-		if (cw > 0 && ch > 0) {
-			CDC crop_dc;
-			crop_dc.CreateCompatibleDC(&back_dc);
-			CBitmap crop_bmp;
-			crop_bmp.CreateCompatibleBitmap(&back_dc, cw, ch);
-			CBitmap* old = crop_dc.SelectObject(&crop_bmp);
-			crop_dc.BitBlt(0, 0, cw, ch, &back_dc, left, top, SRCCOPY);
-			crop_dc.SelectObject(old);
-			DbgWritePng((HBITMAP)crop_bmp.GetSafeHandle(), path);
-		}
-	}
-	else {
-		DbgWritePng((HBITMAP)back_bmp.GetSafeHandle(), path);
-	}
-
-	// Also log the composing string (comp_str) as UTF-8 and codepoints.
-	char comp_utf8[128] = { 0 };
-	if (!comp_str.empty())
-		WideCharToMultiByte(CP_UTF8, 0, comp_str.c_str(), (int)comp_str.size(),
-			comp_utf8, sizeof(comp_utf8) - 1, NULL, NULL);
-	char cps[160] = { 0 }; int off = 0;
-	for (size_t i = 0; i < comp_str.size() && off < (int)sizeof(cps) - 8; ++i)
-		off += sprintf_s(cps + off, sizeof(cps) - off, "U+%04X ", (unsigned)comp_str[i]);
-
-	DbgLog("[seq=%03d %s] cur=(%d,%d) on=%d vis=%d hangul=%d comp=\"%s\" %s",
-		dbg_seq, tag, cur_row, cur_col, cursor_on ? 1 : 0, cursor_visible ? 1 : 0,
-		is_hangul_mode() ? 1 : 0, comp_utf8, cps);
 }
 
 void CConBox::set_margin(int top, int left, int bottom, int right)
@@ -1406,11 +1261,6 @@ void CConBox::print(const char* text)
 	update_scrollbar();
 	bump_cursor();
 	Invalidate();
-
-	// [DEBUG] Restart the 80ms settle timer on each output; if no more output arrives OnTimer leaves
-	// one "out" capture (coalesces consecutive chunks). Nothing before the first input (boot).
-	if (dbg_record && dbg_input_seen && GetSafeHwnd() != nullptr)
-		SetTimer(DBG_TIMER, 80, NULL);
 }
 
 void CConBox::scroll_to_bottom()
@@ -2012,7 +1862,6 @@ LRESULT CConBox::OnImeStart(WPARAM w, LPARAM l)
 		ImmReleaseContext(m_hWnd, himc);
 	}
 	bump_cursor();
-	dbg_dump("imestart");   // [DEBUG]
 	// ConBox draws the composing glyph (OnImeComp stores comp_str, OnPaint draws it in the cursor cell).
 	// Above only positions the candidate list; system inline is not used.
 	return Default();
@@ -2068,7 +1917,6 @@ LRESULT CConBox::OnImeComp(WPARAM w, LPARAM l)
 		InvalidateRect(rc);
 	}
 	bump_cursor();
-	dbg_dump("ime");   // [DEBUG]
 	// Consume the message to suppress system inline display and the committed part's WM_CHAR/WM_IME_CHAR dup.
 	return 0;
 }
@@ -2085,7 +1933,6 @@ LRESULT CConBox::OnImeEnd(WPARAM w, LPARAM l)
 		InvalidateRect(rc);
 	}
 	bump_cursor();
-	dbg_dump("imeend");   // [DEBUG]
 	return Default();
 }
 
@@ -2300,7 +2147,6 @@ void CConBox::OnChar(UINT ch, UINT rep, UINT flags)
 			}
 		}
 		bump_cursor();
-		dbg_dump("char");   // [DEBUG]
 		return;
 	}
 
@@ -2343,7 +2189,6 @@ void CConBox::OnKeyDown(UINT vk, UINT rep, UINT flags)
 		bool plain = !tctrl && !tshift;
 		if (committed && plain && vk == VK_RIGHT) {
 			bump_cursor();
-			if (vk != VK_PROCESSKEY) dbg_dump("key");   // [DEBUG]
 			return;
 		}
 		if (committed && plain && vk == VK_LEFT)
@@ -2351,9 +2196,6 @@ void CConBox::OnKeyDown(UINT vk, UINT rep, UINT flags)
 
 		if (terminal_keydown(vk, tctrl, tshift))
 			bump_cursor();
-		// [DEBUG] A key handled by the IME (VK_PROCESSKEY) is already captured in OnImeComp; skip to
-		// avoid a duplicate.
-		if (vk != VK_PROCESSKEY) dbg_dump("key");
 		return;
 	}
 
@@ -2497,7 +2339,7 @@ void CConBox::OnPaint()
 				if (!drawn) {
 					dc.SelectObject(c.wide ? &kfont : &efont);
 					dc.SetTextColor(fg);
-					dc.TextOutW(px, py + cell_base, &c.ch, 1);
+					dc.TextOutW(px + adjust_left, py + cell_base, &c.ch, 1);
 				}
 			}
 
@@ -2560,7 +2402,7 @@ void CConBox::OnPaint()
 				bool cdrawn = (glyph_level >= 1 && DrawBlockElement(dc, wc, x, cur.top, cell_w, cell_h, cur_fg))
 				           || (glyph_level >= 2 && DrawBoxLine(dc, wc, x, cur.top, cell_w, cell_h, cur_fg));
 				if (!cdrawn)
-					dc.TextOutW(x, cur.top + cell_base, &wc, 1);
+					dc.TextOutW(x + adjust_left, cur.top + cell_base, &wc, 1);
 				x += (wide ? 2 : 1) * cell_w;
 			}
 
@@ -2626,7 +2468,7 @@ void CConBox::OnPaint()
 						bool cdrawn = (glyph_level >= 1 && DrawBlockElement(dc, cc.ch, x, cur.top, cell_w, cell_h, cur_fg))
 						           || (glyph_level >= 2 && DrawBoxLine(dc, cc.ch, x, cur.top, cell_w, cell_h, cur_fg));
 						if (!cdrawn)
-							dc.TextOutW(x, cur.top + cell_base, &cc.ch, 1);
+							dc.TextOutW(x + adjust_left, cur.top + cell_base, &cc.ch, 1);
 					}
 					x += w * cell_w;
 				}
@@ -2816,7 +2658,6 @@ void CConBox::write(const char* data, int len)
 {
 	if (in_write == nullptr || data == nullptr || len <= 0)
 		return;
-	DbgDumpIo("IN", data, len);   // [DEBUG] logged only when DBG_IO is 1
 	DWORD written = 0;
 	::WriteFile(in_write, data, (DWORD)len, &written, NULL);
 }
@@ -2920,7 +2761,6 @@ void CConBox::pump()
 			return;
 		}
 		buf[got] = '\0';   // print() expects null-terminated UTF-8
-		DbgDumpIo("OUT", buf, (int)got);   // [DEBUG] logged only when DBG_IO is 1
 		print(buf);
 		avail -= got;
 	}
