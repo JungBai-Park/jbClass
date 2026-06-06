@@ -22,8 +22,8 @@
 //   IME (Korean)    : OnImeStart, OnImeComp, OnImeEnd, OnImeNotify
 //   input           : set_input_sink, set_resize_sink, send_input_bytes, send_input_wide,
 //                     terminal_keydown, paste_clipboard, finalize_composition, OnChar, OnKeyDown
-//   mouse selection : hit_test, copy_selection, clear_selection, OnLButtonDown, OnLButtonUp,
-//                     OnMouseMove, OnRButtonDown
+//   mouse selection : hit_test, copy_selection, clear_selection, OnLButtonDown, OnLButtonDblClk,
+//                     OnLButtonUp, OnMouseMove, OnRButtonDown
 //   painting        : ensure_back_buffer, OnPaint
 //   child (ConPTY)  : Utf8ToWide/CreatePtyPipes(static), start, write, resize, stop, is_running,
 //                     set_exit_callback, pump, handle_child_exit, child_input_thunk/child_resize_thunk, OnDestroy
@@ -174,6 +174,7 @@ BEGIN_MESSAGE_MAP(CConBox, CWnd)
 	ON_WM_TIMER()
 	ON_WM_DESTROY()
 	ON_WM_LBUTTONDOWN()
+	ON_WM_LBUTTONDBLCLK()
 	ON_WM_LBUTTONUP()
 	ON_WM_MOUSEMOVE()
 	ON_WM_MOUSELEAVE()
@@ -527,6 +528,7 @@ CConBox::CConBox()
 
 	sel_active = false;
 	selecting = false;
+	sel_block = false;
 	sel_anchor_row = 0;
 	sel_anchor_col = 0;
 	sel_end_row = 0;
@@ -1946,36 +1948,62 @@ void CConBox::copy_selection()
 	if (!sel_active) return;
 
 	int total = (int)scrollback.size() + rows;
-
-	// Order anchor..end into (r0,c0)..(r1,c1) (anchor may be later).
-	int r0 = sel_anchor_row, c0 = sel_anchor_col;
-	int r1 = sel_end_row, c1 = sel_end_col;
-	if (r0 > r1 || (r0 == r1 && c0 > c1)) {
-		std::swap(r0, r1); std::swap(c0, c1);
-	}
-
 	std::wstring text;
-	for (int r = r0; r <= r1; ++r) {
-		if (r < 0 || r >= total) continue;
-		const Row& line = line_at(r);
-		int ncell = (int)line.size();
 
-		int cs = (r == r0) ? c0 : 0;
-		int ce = (r == r1) ? c1 : ncell - 1;
-		if (cs < 0) cs = 0;
-		if (ce >= ncell) ce = ncell - 1;
+	if (sel_block) {
+		// Rectangular block: sort rows and cols independently.
+		int rmin = sel_anchor_row, rmax = sel_end_row;
+		int cmin = sel_anchor_col, cmax = sel_end_col;
+		if (rmin > rmax) std::swap(rmin, rmax);
+		if (cmin > cmax) std::swap(cmin, cmax);
 
-		std::wstring row_text;
-		for (int i = cs; i <= ce; ++i) {
-			wchar_t ch = line[i].ch;
-			if (ch == 0) continue;   // trail cell of a wide glyph
-			row_text += ch;
+		for (int r = rmin; r <= rmax; ++r) {
+			if (r < 0 || r >= total) continue;
+			const Row& line = line_at(r);
+			int ncell = (int)line.size();
+
+			std::wstring row_text;
+			for (int i = cmin; i <= cmax; ++i) {
+				wchar_t ch = (i < ncell) ? line[i].ch : L' ';
+				if (ch == 0) continue;   // trail cell of a wide glyph
+				row_text += ch;
+			}
+			while (!row_text.empty() && row_text.back() == L' ')
+				row_text.pop_back();
+
+			if (r > rmin) text += L"\r\n";
+			text += row_text;
 		}
-		while (!row_text.empty() && row_text.back() == L' ')
-			row_text.pop_back();
+	} else {
+		// Linear selection: order anchor..end into (r0,c0)..(r1,c1).
+		int r0 = sel_anchor_row, c0 = sel_anchor_col;
+		int r1 = sel_end_row, c1 = sel_end_col;
+		if (r0 > r1 || (r0 == r1 && c0 > c1)) {
+			std::swap(r0, r1); std::swap(c0, c1);
+		}
 
-		if (r > r0) text += L"\r\n";
-		text += row_text;
+		for (int r = r0; r <= r1; ++r) {
+			if (r < 0 || r >= total) continue;
+			const Row& line = line_at(r);
+			int ncell = (int)line.size();
+
+			int cs = (r == r0) ? c0 : 0;
+			int ce = (r == r1) ? c1 : ncell - 1;
+			if (cs < 0) cs = 0;
+			if (ce >= ncell) ce = ncell - 1;
+
+			std::wstring row_text;
+			for (int i = cs; i <= ce; ++i) {
+				wchar_t ch = line[i].ch;
+				if (ch == 0) continue;   // trail cell of a wide glyph
+				row_text += ch;
+			}
+			while (!row_text.empty() && row_text.back() == L' ')
+				row_text.pop_back();
+
+			if (r > r0) text += L"\r\n";
+			text += row_text;
+		}
 	}
 
 	if (text.empty()) return;
@@ -2050,6 +2078,9 @@ void CConBox::OnLButtonDown(UINT flags, CPoint pt)
 
 	sel_active = false;
 
+	// Alt+drag = rectangular (block) selection; plain drag = linear selection.
+	sel_block = (::GetKeyState(VK_MENU) & 0x8000) != 0;
+
 	// Start drag: anchor and end at the same cell.
 	hit_test(pt, sel_anchor_row, sel_anchor_col);
 	sel_end_row = sel_anchor_row;
@@ -2057,6 +2088,55 @@ void CConBox::OnLButtonDown(UINT flags, CPoint pt)
 	selecting = true;
 
 	SetCapture();   // keep tracking outside the window
+	Invalidate();
+}
+
+void CConBox::OnLButtonDblClk(UINT flags, CPoint pt)
+{
+	// Double-click: select the "word" under the cursor (a maximal run of non-space cells).
+	// Whitespace class (ch==' ' or ch==0) expands over adjacent spaces; word class over non-spaces.
+	// The first click of the double-click already ran OnLButtonDown (which may have started a
+	// one-cell selection + SetCapture); we supersede it here by clearing selecting/capture first.
+	if (selecting) { ReleaseCapture(); selecting = false; }
+
+	// Gutter click: ignore (same gate as OnLButtonDown).
+	CRect track, thumb;
+	if (sbar_geometry(track, thumb)) {
+		CRect full; GetClientRect(&full);
+		if (CRect(full.right - SBAR_W, full.top, full.right, full.bottom).PtInRect(pt))
+			return;
+	}
+
+	int abs_row, col;
+	hit_test(pt, abs_row, col);
+
+	int total = (int)scrollback.size() + rows;
+	if (abs_row < 0 || abs_row >= total)
+		return;
+	const Row& row_data = line_at(abs_row);
+
+	// eff_ch: returns the effective char at col c (trail cell -> its lead's char; OOB -> space).
+	auto eff_ch = [&](int c) -> wchar_t {
+		if (c < 0 || c >= cols) return L' ';
+		wchar_t ch = (c < (int)row_data.size()) ? row_data[c].ch : L' ';
+		if (ch == 0 && c > 0)  // trail: return lead's char
+			ch = ((c-1) < (int)row_data.size()) ? row_data[c-1].ch : L' ';
+		return ch;
+	};
+
+	// Two classes: whitespace (space/empty) or word (everything else).
+	auto is_word = [](wchar_t ch) -> bool { return ch != L' ' && ch != 0; };
+	bool cls = is_word(eff_ch(col));
+
+	int c0 = col, c1 = col;
+	while (c0 > 0 && is_word(eff_ch(c0 - 1)) == cls) --c0;
+	while (c1 < cols - 1 && is_word(eff_ch(c1 + 1)) == cls) ++c1;
+
+	sel_anchor_row = abs_row; sel_anchor_col = c0;
+	sel_end_row    = abs_row; sel_end_col    = c1;
+	sel_block  = false;
+	sel_active = true;
+	copy_selection();
 	Invalidate();
 }
 
@@ -2617,13 +2697,19 @@ void CConBox::OnPaint()
 	// Draw visible lines top to bottom (unified index view_top+row).
 	int total = (int)scrollback.size() + rows;
 
-	// Pre-sort the selection range if active (anchor/end are stored unordered).
+	// Pre-sort the selection range if active. Block mode sorts rows and cols independently;
+	// linear mode sorts so (sr0,sc0) precedes (sr1,sc1) in reading order.
 	int sr0 = 0, sc0 = 0, sr1 = -1, sc1 = -1;   // sr1 < sr0 means no selection
 	if (sel_active) {
 		sr0 = sel_anchor_row; sc0 = sel_anchor_col;
 		sr1 = sel_end_row;    sc1 = sel_end_col;
-		if (sr0 > sr1 || (sr0 == sr1 && sc0 > sc1)) {
-			std::swap(sr0, sr1); std::swap(sc0, sc1);
+		if (sel_block) {
+			if (sr0 > sr1) std::swap(sr0, sr1);
+			if (sc0 > sc1) std::swap(sc0, sc1);
+		} else {
+			if (sr0 > sr1 || (sr0 == sr1 && sc0 > sc1)) {
+				std::swap(sr0, sr1); std::swap(sc0, sc1);
+			}
 		}
 	}
 
@@ -2651,14 +2737,17 @@ void CConBox::OnPaint()
 			// Inside the selection, swap fg/bg for the inverted look.
 			if (sel_active && idx >= sr0 && idx <= sr1) {
 				bool in_sel = false;
-				if (sr0 == sr1)
-					in_sel = (i >= sc0 && i <= sc1);       // same line
-				else if (idx == sr0)
-					in_sel = (i >= sc0);                    // first line: from start
-				else if (idx == sr1)
-					in_sel = (i <= sc1);                    // last line: to end
-				else
-					in_sel = true;                          // middle line: all
+				if (sel_block) {
+					in_sel = (i >= sc0 && i <= sc1);        // rectangle: col range every row
+				} else if (sr0 == sr1) {
+					in_sel = (i >= sc0 && i <= sc1);        // same line
+				} else if (idx == sr0) {
+					in_sel = (i >= sc0);                    // first line: from start col
+				} else if (idx == sr1) {
+					in_sel = (i <= sc1);                    // last line: to end col
+				} else {
+					in_sel = true;                          // middle lines: all cells
+				}
 				if (in_sel) std::swap(fg, bg);
 			}
 

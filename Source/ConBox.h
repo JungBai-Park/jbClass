@@ -194,6 +194,7 @@ protected:
 	// Mouse drag selection: down anchors, drag extends, up copies to clipboard. A button-down inside the
 	// overlay-scrollbar gutter is diverted to thumb drag / track paging instead of selection.
 	afx_msg void OnLButtonDown(UINT flags, CPoint pt);
+	afx_msg void OnLButtonDblClk(UINT flags, CPoint pt);
 	afx_msg void OnLButtonUp(UINT flags, CPoint pt);
 	afx_msg void OnMouseMove(UINT flags, CPoint pt);
 	afx_msg void OnMouseLeave();   // clears gutter hover so the overlay scrollbar can fade
@@ -465,6 +466,7 @@ private:
 	// unordered; sorted when drawing/copying.
 	bool sel_active;        // a selection exists (shown + clipboard target)
 	bool selecting;         // dragging with the left button down (SetCapture active)
+	bool sel_block;         // true = rectangular (Alt+drag); false = linear drag / word select
 	int sel_anchor_row;     // unified-index row
 	int sel_anchor_col;
 	int sel_end_row;
