@@ -122,6 +122,27 @@ To reproduce `calc_cell_size` values (`cell_w`/`natw`/`kwid`):
   Verify: each syllable forms in the cursor cell with prior text in place, following text not hidden,
   restored on commit.
 
+## config() and ANSI palette
+- `config()` is implemented in `ConBox.cpp` ("config" section). Section headers in the INI are
+  cosmetic; all keys matched by name only. Relative path resolved against EXE dir (not CWD).
+- `Xterm256ToRgb` signature changed to `static COLORREF Xterm256ToRgb(int n, const COLORREF* pal)`.
+  The old `static const COLORREF base16[16]` local was removed; callers pass `ansi_colors` (member).
+  All 5 call sites in `dispatch_csi` pass `ansi_colors`.
+- `ansi_colors[16]` is a private member initialized in the constructor to the same values as the
+  former hardcoded `base16[]`. Configurable via `color0..color15` in the INI file.
+- `ParseColor` parses `#RRGGBB` strings; on failure returns the `def` argument unchanged.
+- **`ParseIni` must strip inline comments**: `key = value ; comment` — the `;` and everything after
+  it must be truncated before storing the value (`strchr(v, ';')` + null-terminate). Without this,
+  auto-generated INI files (which have Korean inline comments) corrupt string values like `efont_name`
+  on the second run, causing GDI to fall back to a substitute font with different metrics.
+- `CreateDefaultIni()` writes Korean UTF-8 comments as `\xNN` hex escapes to keep `.cpp` pure ASCII.
+  Default INI filename is `ConBox.ini` (formerly `Config.ini`).
+
+## scrollback container
+- `scrollback` is `std::deque<Row>` (not `std::vector`) so front removal when the cap is exceeded
+  is O(1) (`pop_front()`) rather than O(n) (`erase(begin, begin+over)`). Cap default = 5000 lines,
+  configurable via `scrollback_cap` in INI.
+
 ## claude input-line "eaten space / orphan reverse cell" = NON-BUG — do NOT re-investigate
 - Symptom (once misdiagnosed as a ConBox bug): the first typed char ate the `❯ ` prompt space (`❯r`)
   and left an orphan reverse cell.

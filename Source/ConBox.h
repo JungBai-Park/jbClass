@@ -47,6 +47,7 @@
 
 #include <afxwin.h>   // MFC core (CWnd, CDC, CFont); also pulls in windows.h (ConPTY HPCON etc.)
 #include <vector>
+#include <deque>
 #include <string>
 
 // One screen cell. A double-width glyph (Korean/CJK) occupies a lead cell (ch=glyph, wide=true)
@@ -384,6 +385,8 @@ private:
 	COLORREF default_fg; // default RGB(200,200,200)
 	COLORREF default_bg; // default RGB(32,32,32)
 
+	COLORREF ansi_colors[16]; // xterm 256-color index 0-15 (base ANSI palette); configurable via color0..color15
+
 	COLORREF cur_fg;     // current SGR foreground
 	COLORREF cur_bg;     // current SGR background
 
@@ -429,7 +432,7 @@ private:
 	// off the top. Cursor (cur_row, cur_col) is a 0-based on-screen cell coord (VT absolute moves).
 	int max_scrollback;           // scrollback line cap (configurable via config(); default 5000)
 	std::vector<Row> screen;
-	std::vector<Row> scrollback;  // oldest lines trimmed when size exceeds max_scrollback
+	std::deque<Row> scrollback;   // oldest lines trimmed when size exceeds max_scrollback; deque for O(1) front removal
 	int view_top;                 // top of view = unified (scrollback + screen) index (wheel/scrollbar)
 	int cur_row;                  // 0..rows-1
 	int cur_col;                  // 0..cols

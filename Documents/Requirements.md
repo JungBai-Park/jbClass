@@ -88,7 +88,12 @@ void adjust(int left, int top, int right, int bottom);            // per-side ce
 - Screen is a fixed **`cols` x `rows` cell grid**; every glyph is drawn at a cell (no variable-width).
 - Korean/CJK glyphs are **double width** (2 cells: lead + empty trail).
 - Recompute `cols`/`rows` on font or window-size change. **Autowrap** at right edge.
-- Vertical **scrollbar shown only when scrollback exists** (content exceeds the screen).
+- **Overlay scrollbar** (no native WS_VSCROLL — that would shrink the client and reflow the grid on
+  first appearance): a rounded-thumb bar is drawn over the right edge of the content when scrollback
+  exists; fades out when idle. Up/down triangle buttons at the top/bottom of the gutter scroll by
+  one line each. Thumb drag and gutter-click (page scroll) are also supported.
+- **Mouse cursor**: always `IDC_ARROW` (like wt.exe). The window does not switch to `IDC_IBEAM` even
+  when hovering over text.
 
 ```cpp
 void set_margin(int top, int left = -1, int bottom = -1, int right = -1);  // default 10px all sides
@@ -289,8 +294,15 @@ void set_resize_sink(void (*sink)(int cols, int rows, void* user), void* user);
   extends the selection end in real-time with inverted (swapped fg/bg) rendering. On button-up the
   selected text is **auto-copied** to the clipboard (CF_UNICODETEXT). Clicking without dragging (same
   cell) clears the selection. `SetCapture`/`ReleaseCapture` ensure tracking outside the window.
-- **Selection text extraction** (`copy_selection`): walks rows from anchor to end, collects non-trail
-  (`ch!=0`) characters, trims trailing spaces per line, joins lines with CR+LF.
+- **Double-click word select**: double-clicking a cell selects the word under the cursor
+  (contiguous non-space run). Wide (Korean/CJK) chars are treated as whole units (trail cell snaps
+  to the lead). The word is auto-copied to the clipboard.
+- **Alt+drag block (rectangular) select**: holding Alt while dragging selects a rectangle instead
+  of a linear span. Copy extracts a fixed-width slice per row (no trailing-space trim per row).
+  Alt is sampled on button-down; releasing Alt mid-drag does not change the mode.
+- **Selection text extraction** (`copy_selection`): linear — walks rows from anchor to end, collects
+  non-trail (`ch!=0`) characters, trims trailing spaces per line, joins lines with CR+LF.
+  Block — extracts a fixed-width rectangle per row.
 - **Selection clear**: new output (`print`), typing, or any paste operation clears the selection.
 - **Ctrl+C** (terminal mode): if a selection is active, copies it to the clipboard and clears the
   selection. If no selection, sends interrupt `0x03` to the child (standard terminal behavior).
@@ -317,17 +329,59 @@ void set_resize_sink(void (*sink)(int cols, int rows, void* user), void* user);
   (ConBox source stays demo-free).
 - No OK/Cancel; ConBox fills the client area with a **5px** bezel margin. Titlebar has min/max;
   resizing the window resizes ConBox.
-- Startup sizes the main window so ConBox is **96 x 32 cells** (via `client_size_for_grid` + demo
-  margin + scrollbar/non-client), centered on the work area. The demo also calls `adjust(0, -1, 0, -1)`
-  to trim 1px off the top/bottom of each cell (tighter line spacing).
-- On startup the demo calls `con_box.set_cursor(0)` (default shape) after `open()`.
-- On startup the demo calls `con_box.start("powershell.exe")` (start() sizes the child console to the
-  current grid). `set_exit_callback` closes the window when the child exits.
+- On startup `con_box.config("../../Documents/Config.ini")` is called before `open()`; all font,
+  color, cursor, margin, grid-size, and cmdline settings come from the INI file. Individual
+  `set_efont`/`set_kfont`/`adjust`/`set_cursor`/`start("powershell.exe")` calls were removed from
+  the demo; use the config file instead.
+- Startup sizes the main window so ConBox is **`config_cols()` x `config_rows()` cells** (default
+  96 x 32) via `client_size_for_grid`, centered on the work area.
+- `set_exit_callback` closes the window when the child exits.
 - The app is **System DPI Aware** (crisp at non-100% scaling) — set by the host
   (`SetProcessDPIAware()`), not the control, since DPI awareness is process-wide.
 
 ---
 
-## 14. Reference
+## 14. Config File (`config()`)
+
+```cpp
+void config(const char* path = nullptr);  // load INI; nullptr -> "ConBox.ini" next to EXE
+int         config_cols()    const;        // grid_cols from last config() (default 96)
+int         config_rows()    const;        // grid_rows from last config() (default 32)
+const char* config_cmdline() const;        // cmdline from last config() (default "powershell.exe")
+```
+
+- Sections are cosmetic; keys are matched by **name only** (section-agnostic).
+- Relative path resolved against **EXE directory**, not the working directory.
+- If the file does not exist it is **auto-created** with compiled-in defaults; this call then
+  returns without applying anything (settings stay at constructor defaults).
+- Call **before `open()`** so fonts/margins are set before the first layout.
+- `config_cols`/`config_rows`/`config_cmdline` return the values read; the host uses them to call
+  `resize_to_grid` and `start()` after `open()`.
+
+### Configurable keys
+
+| Key | API | Default |
+|-----|-----|---------|
+| `efont_name`, `efont_size`, `efont_opts` | `set_efont` | Cascadia Mono, 12, "" |
+| `kfont_name`, `kfont_size`, `kfont_opts` | `set_kfont` | Malgun Gothic, 0 (match), "B" |
+| `margin_top/left/bottom/right` | `set_margin` | 10 each |
+| `adjust_left/top/right/bottom` | `adjust` | 0 each |
+| `fg`, `bg` | `set_color`, `set_bg_color` | #C8C8C8, #202020 |
+| `color0`..`color15` | `ansi_colors[i]` | xterm default base16 (see below) |
+| `cursor_type` | `set_cursor` | 0 (→ 3 blinking underline) |
+| `cursor_blend_bg`, `cursor_blend_fg` | `set_cursor_blend` | 4, 6 |
+| `cursor_blink_ms` | `set_cursor_blink` | 0 (system rate) |
+| `builtin_glyphs` | `set_builtin_glyphs` | 1 |
+| `scrollback_cap` | `max_scrollback` | 5000 |
+| `grid_cols`, `grid_rows` | stored in `cfg_cols`/`cfg_rows` | 96, 32 |
+| `cmdline` | stored in `cfg_cmdline` | powershell.exe |
+
+- **`color0..color15`**: xterm 256-color index 0-15 (the ANSI 16-color base palette). Format `#RRGGBB`.
+  Defaults match the classic xterm colors (black/red/green/yellow/blue/magenta/cyan/white ×2 bright).
+  Changing these recolors all SGR 30-37/40-47/90-97/100-107 output.
+
+---
+
+## 15. Reference
 
 - For any behavior not specified here, follow **Windows Terminal (wt.exe)**.

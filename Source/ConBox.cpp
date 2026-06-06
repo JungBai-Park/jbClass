@@ -39,7 +39,7 @@
 //   screen: vector<Row>      current screen, always rows lines x cols cells. Row = vector<CharInfo>.
 //   CharInfo{ wchar_t ch; COLORREF fg,bg; bool wide; }  wide = lead cell of a double-width glyph
 //     (the next cell is its trail, ch=0).
-//   scrollback: vector<Row>  lines pushed off the top (capped at max_scrollback, oldest dropped).
+//   scrollback: deque<Row>   lines pushed off the top (capped at max_scrollback, oldest dropped; deque for O(1) pop_front).
 //   main_saved: vector<Row>  main screen backed up on alt-screen entry (swapped back on leave).
 //   Key state: cur_row/cur_col (0-based screen cell cursor), view_top (top of view, unified index),
 //     cursor_visible (?25), saved_row/col (DECSC/RC), scroll_top/bot (DECSTBM region),
@@ -541,6 +541,15 @@ CConBox::CConBox()
 	cfg_rows = 32;
 	cfg_cmdline = "powershell.exe";
 
+	// Default 16-color ANSI palette (matches the hardcoded base16[] in Xterm256ToRgb).
+	static const COLORREF def16[16] = {
+		RGB(0, 0, 0),       RGB(205, 0, 0),     RGB(0, 205, 0),     RGB(205, 205, 0),
+		RGB(0, 0, 238),     RGB(205, 0, 205),   RGB(0, 205, 205),   RGB(229, 229, 229),
+		RGB(127, 127, 127), RGB(255, 0, 0),     RGB(0, 255, 0),     RGB(255, 255, 0),
+		RGB(92, 92, 255),   RGB(255, 0, 255),   RGB(0, 255, 255),   RGB(255, 255, 255)
+	};
+	memcpy(ansi_colors, def16, sizeof(def16));
+
 	// Overlay scrollbar starts hidden (alpha 0); shown on user scroll / hover.
 	sbar_alpha = 0;
 	sbar_hold_until = 0;
@@ -612,9 +621,12 @@ static std::map<std::string, std::string> ParseIni(const wchar_t* path)
 		while (!key.empty() && (key.back() == ' ' || key.back() == '\t')) key.pop_back();
 		for (char& c : key) c = (char)tolower((unsigned char)c);
 
-		// Value: everything after '=', leading-trimmed, trailing newline stripped.
+		// Value: everything after '=', leading-trimmed, inline comment and trailing whitespace stripped.
 		char* v = eq + 1;
 		while (*v == ' ' || *v == '\t') ++v;
+		// Strip inline comment (ConBox INI values never contain ';').
+		char* semi = strchr(v, ';');
+		if (semi) *semi = '\0';
 		std::string val(v);
 		while (!val.empty() && (val.back() == '\r' || val.back() == '\n' || val.back() == ' ')) val.pop_back();
 
@@ -636,52 +648,74 @@ static COLORREF ParseColor(const std::string& s, COLORREF def)
 }
 
 // Write a default INI file to path (called on first run when no config exists).
-// Section headers are cosmetic only; the parser ignores them.
+// Korean comments in the file are UTF-8; expressed here as \xNN escapes to keep this
+// .cpp source pure ASCII. Each Korean syllable = 3 bytes (0xE?/0xED first, 0x80-0xBF rest).
 static void CreateDefaultIni(const wchar_t* path)
 {
 	FILE* f = nullptr;
 	_wfopen_s(&f, path, L"w");
 	if (!f) return;
 	fputs(
-		"; ConBox configuration file\n"
-		"; Section headers are visual only -- keys are matched by name, not section.\n"
+		"; ConBox \xEC\x84\xA4\xEC\xA0\x95 \xED\x8C\x8C\xEC\x9D\xBC\n"
+		"; \xEC\x84\xB9\xEC\x85\x98 \xEC\x9D\xB4\xEB\xA6\x84\xEC\x9D\x80 \xEB\xAC\xB4\xEC\x8B\x9C\xEB\x90\xA9\xEB\x8B\x88\xEB\x8B\xA4 -- \xED\x82\xA4 \xEC\x9D\xB4\xEB\xA6\x84\xEC\x9C\xBC\xEB\xA1\x9C\xEB\xA7\x8C \xEC\x9D\xB8\xEC\x8B\x9D\xED\x95\xA9\xEB\x8B\x88\xEB\x8B\xA4.\n"
 		"\n"
 		"[font]\n"
-		"efont_name    = Cascadia Mono\n"
-		"efont_size    = 12\n"
-		"efont_opts    =\n"
-		"kfont_name    = Malgun Gothic\n"
-		"kfont_size    = 0\n"
-		"kfont_opts    = B\n"
+		"; \xED\x8F\xB0\xED\x8A\xB8 \xED\x81\xAC\xEA\xB8\xB0\xEB\x8A\x94 \xED\x8F\xAC\xEC\x9D\xB8\xED\x8A\xB8(pt) \xEB\x8B\xA8\xEC\x9C\x84. opts: B=\xEA\xB5\xB5\xEA\xB2\x8C, I=\xEA\xB8\xB0\xEC\x9A\xB8\xEC\x9E\x84, 90W=\xEB\x84\x88\xEB\xB9\x84 90%\n"
+		"efont_name    = Cascadia Mono   ; \xEC\x98\x81\xEB\xAC\xB8 \xED\x8F\xB0\xED\x8A\xB8 \xEC\x9D\xB4\xEB\xA6\x84\n"
+		"efont_size    = 12              ; \xEC\x98\x81\xEB\xAC\xB8 \xED\x8F\xB0\xED\x8A\xB8 \xED\x81\xAC\xEA\xB8\xB0 (\xED\x8F\xAC\xEC\x9D\xB8\xED\x8A\xB8)\n"
+		"efont_opts    =                 ; \xEC\x98\x81\xEB\xAC\xB8 \xED\x8F\xB0\xED\x8A\xB8 \xEC\x98\xB5\xEC\x85\x98\n"
+		"kfont_name    = Malgun Gothic   ; \xED\x95\x9C\xEA\xB8\x80 \xED\x8F\xB0\xED\x8A\xB8 \xEC\x9D\xB4\xEB\xA6\x84\n"
+		"kfont_size    = 0               ; 0 \xEC\x9D\xB4\xED\x95\x98: \xEC\x98\x81\xEB\xAC\xB8 \xEB\x86\x92\xEC\x9D\xB4\xEC\x97\x90 \xEB\xA7\x9E\xEC\xB6\xA4 / \xEC\x96\x91\xEC\x88\x98: \xED\x81\xAC\xEA\xB8\xB0 \xEC\xA7\x81\xEC\xA0\x91 \xEC\xA7\x80\xEC\xA0\x95\n"
+		"kfont_opts    = B               ; \xED\x95\x9C\xEA\xB8\x80 \xED\x8F\xB0\xED\x8A\xB8 \xEC\x98\xB5\xEC\x85\x98\n"
 		"\n"
 		"[layout]\n"
-		"margin_top    = 10\n"
-		"margin_left   = 10\n"
-		"margin_bottom = 10\n"
-		"margin_right  = 10\n"
-		"adjust_left   = 0\n"
-		"adjust_top    = 0\n"
-		"adjust_right  = 0\n"
-		"adjust_bottom = 0\n"
-		"grid_cols     = 96\n"
-		"grid_rows     = 32\n"
+		"; \xEB\xA7\x88\xEC\xA7\x84: \xEC\xBD\x98\xED\x85\x90\xEC\xB8\xA0\xEC\x99\x80 \xEC\xB0\xBD \xEA\xB0\x80\xEC\x9E\xA5\xEC\x9E\x90\xEB\xA6\xAC \xEC\x82\xAC\xEC\x9D\xB4 \xEC\x97\xAC\xEB\xB0\xB1(px). adjust: \xEC\x85\x80 \xED\x81\xAC\xEA\xB8\xB0 \xEB\xAF\xB8\xEC\x84\xB8\xEC\xA1\xB0\xEC\xA0\x95(px, \xEC\x9D\x8C\xEC\x88\x98=\xEC\xA4\x84\xEC\x9E\x84)\n"
+		"margin_top    = 10              ; \xEC\x9C\x84\xEC\xAA\xBD \xEC\x97\xAC\xEB\xB0\xB1\n"
+		"margin_left   = 10              ; \xEC\x99\xBC\xEC\xAA\xBD \xEC\x97\xAC\xEB\xB0\xB1\n"
+		"margin_bottom = 10              ; \xEC\x95\x84\xEB\x9E\x98\xEC\xAA\xBD \xEC\x97\xAC\xEB\xB0\xB1\n"
+		"margin_right  = 10              ; \xEC\x98\xA4\xEB\xA5\xB8\xEC\xAA\xBD \xEC\x97\xAC\xEB\xB0\xB1\n"
+		"adjust_left   = 0               ; \xEC\x85\x80 \xEC\x99\xBC\xEC\xAA\xBD \xED\x8C\xA8\xEB\x94\xA9 (\xEA\xB8\x80\xEC\x9E\x90\xEB\x8F\x84 \xEC\x98\xA4\xEB\xA5\xB8\xEC\xAA\xBD\xEC\x9C\xBC\xEB\xA1\x9C \xEC\x9D\xB4\xEB\x8F\x99)\n"
+		"adjust_top    = 0               ; \xEC\x85\x80 \xEC\x9C\x84\xEC\xAA\xBD \xED\x8C\xA8\xEB\x94\xA9 (\xEA\xB8\x80\xEC\x9E\x90\xEB\x8F\x84 \xEC\x95\x84\xEB\x9E\x98\xEB\xA1\x9C \xEC\x9D\xB4\xEB\x8F\x99)\n"
+		"adjust_right  = 0               ; \xEC\x85\x80 \xEC\x98\xA4\xEB\xA5\xB8\xEC\xAA\xBD \xED\x8C\xA8\xEB\x94\xA9\n"
+		"adjust_bottom = 0               ; \xEC\x85\x80 \xEC\x95\x84\xEB\x9E\x98\xEC\xAA\xBD \xED\x8C\xA8\xEB\x94\xA9\n"
+		"grid_cols     = 96              ; \xEA\xB0\x80\xEB\xA1\x9C \xEC\xB9\xB8 \xEC\x88\x98\n"
+		"grid_rows     = 32              ; \xEC\x84\xB8\xEB\xA1\x9C \xEC\xA4\x84 \xEC\x88\x98\n"
 		"\n"
 		"[colors]\n"
-		"fg = #C8C8C8\n"
-		"bg = #202020\n"
+		"; \xEC\x83\x89\xEC\x83\x81 \xED\x98\x95\xEC\x8B\x9D: #RRGGBB\n"
+		"fg            = #C8C8C8         ; \xEA\xB8\xB0\xEB\xB3\xB8 \xEA\xB8\x80\xEC\x9E\x90\xEC\x83\x89\n"
+		"bg            = #202020         ; \xEA\xB8\xB0\xEB\xB3\xB8 \xEB\xB0\xB0\xEA\xB2\xBD\xEC\x83\x89\n"
+		"; ANSI 16\xEC\x83\x89 \xED\x8C\x94\xEB\xA0\x88\xED\x8A\xB8 (SGR 30~37/90~97 \xEC\x83\x89\xEC\x83\x81)\n"
+		"color0        = #000000         ; \xEA\xB2\x80\xEC\xA0\x95\n"
+		"color1        = #CD0000         ; \xEB\xB9\xA8\xEA\xB0\x95\n"
+		"color2        = #00CD00         ; \xEC\xB4\x88\xEB\xA1\x9D\n"
+		"color3        = #CDCD00         ; \xEB\x85\xB8\xEB\x9E\x91\n"
+		"color4        = #0000EE         ; \xED\x8C\x8C\xEB\x9E\x91\n"
+		"color5        = #CD00CD         ; \xEC\x9E\x90\xED\x99\x8D\n"
+		"color6        = #00CDCD         ; \xEC\xB2\xAD\xEB\xA1\x9D\n"
+		"color7        = #E5E5E5         ; \xED\x9D\xB0\xEC\x83\x89(\xEB\xB0\x9D\xEC\x9D\x80)\n"
+		"color8        = #7F7F7F         ; \xED\x9A\x8C\xEC\x83\x89(\xEB\xB0\x9D\xEC\x9D\x80 \xEA\xB2\x80\xEC\xA0\x95)\n"
+		"color9        = #FF0000         ; \xEB\xB0\x9D\xEC\x9D\x80 \xEB\xB9\xA8\xEA\xB0\x95\n"
+		"color10       = #00FF00         ; \xEB\xB0\x9D\xEC\x9D\x80 \xEC\xB4\x88\xEB\xA1\x9D\n"
+		"color11       = #FFFF00         ; \xEB\xB0\x9D\xEC\x9D\x80 \xEB\x85\xB8\xEB\x9E\x91\n"
+		"color12       = #5C5CFF         ; \xEB\xB0\x9D\xEC\x9D\x80 \xED\x8C\x8C\xEB\x9E\x91\n"
+		"color13       = #FF00FF         ; \xEB\xB0\x9D\xEC\x9D\x80 \xEC\x9E\x90\xED\x99\x8D\n"
+		"color14       = #00FFFF         ; \xEB\xB0\x9D\xEC\x9D\x80 \xEC\xB2\xAD\xEB\xA1\x9D\n"
+		"color15       = #FFFFFF         ; \xED\x9D\xB0\xEC\x83\x89\n"
 		"\n"
 		"[cursor]\n"
-		"cursor_type     = 0\n"
-		"cursor_blend_bg = 4\n"
-		"cursor_blend_fg = 6\n"
-		"cursor_blink_ms = 0\n"
+		"; \xEC\xBB\xA4\xEC\x84\x9C \xEB\xAA\xA8\xEC\x96\x91: \xED\x99\x80\xEC\x88\x98=\xEA\xB9\x9C\xEB\xB9\xA1\xEC\x9E\x84, \xEC\xA7\x9D\xEC\x88\x98=\xEA\xB3\xA0\xEC\xA0\x95\n"
+		"cursor_type     = 0             ; 0=\xEA\xB8\xB0\xEB\xB3\xB8(3), 1=\xEA\xB9\x9C\xEB\xB9\xA1\xEB\xB8\x94\xEB\xA1\x9D, 2=\xEA\xB3\xA0\xEC\xA0\x95\xEB\xB8\x94\xEB\xA1\x9D, 3=\xEA\xB9\x9C\xEB\xB9\xA1\xEB\xB0\x91\xEC\xA4\x84, 4=\xEA\xB3\xA0\xEC\xA0\x95\xEB\xB0\x91\xEC\xA4\x84, 5=\xEA\xB9\x9C\xEB\xB9\xA1I\xEB\xB9\x94, 6=\xEA\xB3\xA0\xEC\xA0\x95I\xEB\xB9\x94\n"
+		"cursor_blend_bg = 4             ; \xEC\xBB\xA4\xEC\x84\x9C \xEC\x83\x89\xEC\x83\x81 - \xEB\xB0\xB0\xEA\xB2\xBD\xEC\x83\x89 \xEB\xB9\x84\xEC\xA4\x91\n"
+		"cursor_blend_fg = 6             ; \xEC\xBB\xA4\xEC\x84\x9C \xEC\x83\x89\xEC\x83\x81 - \xEA\xB8\x80\xEC\x9E\x90\xEC\x83\x89 \xEB\xB9\x84\xEC\xA4\x91\n"
+		"cursor_blink_ms = 0             ; \xEA\xB9\x9C\xEB\xB9\xA1\xEC\x9E\x84 \xEA\xB0\x84\xEA\xB2\xA9(ms). 0 = \xEC\x8B\x9C\xEC\x8A\xA4\xED\x85\x9C \xEC\x84\xA4\xEC\xA0\x95 \xEB\x94\xB0\xEB\xA6\x84\n"
 		"\n"
 		"[rendering]\n"
-		"builtin_glyphs = 1\n"
-		"scrollback_cap = 5000\n"
+		"builtin_glyphs = 1              ; 0=\xED\x8F\xB0\xED\x8A\xB8, 1=\xEB\xB8\x94\xEB\xA1\x9D\xEB\xAC\xB8\xEC\x9E\x90 \xEC\xA7\x81\xEC\xA0\x91\xEA\xB7\xB8\xEB\xA6\xBC(\xEA\xB8\xB0\xEB\xB3\xB8), 2=\xEB\xB0\x95\xEC\x8A\xA4\xEC\x84\xA0\xEA\xB9\x8C\xEC\xA7\x80 \xEC\xA7\x81\xEC\xA0\x91\xEA\xB7\xB8\xEB\xA6\xBC\n"
+		"scrollback_cap = 5000           ; \xEC\x8A\xA4\xED\x81\xAC\xEB\xA1\xA4\xEB\xB0\xB1 \xEC\xB5\x9C\xEB\x8C\x80 \xEC\xA4\x84 \xEC\x88\x98\n"
 		"\n"
 		"[child]\n"
-		"cmdline = powershell.exe\n",
+		"cmdline = powershell.exe        ; \xEC\x8B\xA4\xED\x96\x89\xED\x95\xA0 \xEC\x9E\x90\xEC\x8B\x9D \xED\x94\x84\xEB\xA1\x9C\xEC\x84\xB8\xEC\x8A\xA4 \xEB\xAA\x85\xEB\xA0\xB9\xEC\xA4\x84\n",
 		f);
 	fclose(f);
 }
@@ -735,6 +769,14 @@ void CConBox::config(const char* path)
 	// Colors
 	if (const std::string* s = get("fg")) set_color(ParseColor(*s, default_fg));
 	if (const std::string* s = get("bg")) set_bg_color(ParseColor(*s, default_bg));
+
+	// ANSI palette color0..color15 (xterm 256-color index 0-15)
+	char pal_key[10];
+	for (int i = 0; i < 16; i++) {
+		sprintf_s(pal_key, sizeof(pal_key), "color%d", i);
+		if (const std::string* s = get(pal_key))
+			ansi_colors[i] = ParseColor(*s, ansi_colors[i]);
+	}
 
 	// Cursor
 	set_cursor(geti("cursor_type", 0));
@@ -1333,9 +1375,8 @@ void CConBox::scroll_up_region(int n)
 		for (int i = 0; i < n; ++i)
 			scrollback.push_back(screen[i]);
 
-		int over = (int)scrollback.size() - max_scrollback;
-		if (over > 0)
-			scrollback.erase(scrollback.begin(), scrollback.begin() + over);
+		while ((int)scrollback.size() > max_scrollback)
+			scrollback.pop_front();  // O(1) with deque
 	}
 
 	scroll_lines_up(scroll_top, scroll_bot, n);
@@ -1523,18 +1564,13 @@ void CConBox::scroll_to_bottom()
 }
 
 // Convert an xterm 256-color index to COLORREF: 0-15 base, 16-231 6x6x6 cube, 232-255 grayscale.
-static COLORREF Xterm256ToRgb(int n)
+static COLORREF Xterm256ToRgb(int n, const COLORREF* pal)
 {
-	static const COLORREF base16[16] = {
-		RGB(0, 0, 0),       RGB(205, 0, 0),     RGB(0, 205, 0),     RGB(205, 205, 0),
-		RGB(0, 0, 238),     RGB(205, 0, 205),   RGB(0, 205, 205),   RGB(229, 229, 229),
-		RGB(127, 127, 127), RGB(255, 0, 0),     RGB(0, 255, 0),     RGB(255, 255, 0),
-		RGB(92, 92, 255),   RGB(255, 0, 255),   RGB(0, 255, 255),   RGB(255, 255, 255)
-	};
+	// pal points to ansi_colors[16] (caller-owned; runtime-configurable via config color0..color15).
 	if (n < 0) n = 0;
 	if (n > 255) n = 255;
 	if (n < 16)
-		return base16[n];
+		return pal[n];
 	if (n < 232) {
 		int i = n - 16;
 		int r = i / 36, g = (i / 6) % 6, b = i % 6;
@@ -1734,17 +1770,17 @@ void CConBox::dispatch_csi(wchar_t fin)
 			else if (p == 22) cur_bold = false;
 			else if (p == 7) cur_reverse = true;
 			else if (p == 27) cur_reverse = false;
-			else if (p >= 30 && p <= 37) cur_fg = Xterm256ToRgb((cur_bold ? 8 : 0) + (p - 30));
-			else if (p >= 40 && p <= 47) cur_bg = Xterm256ToRgb(p - 40);
-			else if (p >= 90 && p <= 97) cur_fg = Xterm256ToRgb(8 + (p - 90));
-			else if (p >= 100 && p <= 107) cur_bg = Xterm256ToRgb(8 + (p - 100));
+			else if (p >= 30 && p <= 37) cur_fg = Xterm256ToRgb((cur_bold ? 8 : 0) + (p - 30), ansi_colors);
+			else if (p >= 40 && p <= 47) cur_bg = Xterm256ToRgb(p - 40, ansi_colors);
+			else if (p >= 90 && p <= 97) cur_fg = Xterm256ToRgb(8 + (p - 90), ansi_colors);
+			else if (p >= 100 && p <= 107) cur_bg = Xterm256ToRgb(8 + (p - 100), ansi_colors);
 			else if (p == 39) cur_fg = default_fg;
 			else if (p == 49) cur_bg = default_bg;
 			else if (p == 38 || p == 48) {
 				// Extended color: 38;5;n (256) or 38;2;r;g;b (truecolor). 48 = background.
 				COLORREF col = (p == 38) ? cur_fg : cur_bg;
 				if (i + 1 < vt_nparam && vt_params[i + 1] == 5) {
-					if (i + 2 < vt_nparam) col = Xterm256ToRgb(vt_params[i + 2]);
+					if (i + 2 < vt_nparam) col = Xterm256ToRgb(vt_params[i + 2], ansi_colors);
 					i += 2;
 				}
 				else if (i + 1 < vt_nparam && vt_params[i + 1] == 2) {
