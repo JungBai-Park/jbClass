@@ -17,7 +17,8 @@
 //                     insert_lines, delete_lines, insert_chars, delete_chars,
 //                     enter_alt_screen, leave_alt_screen, put_char, print, scroll_to_bottom, update_scrollbar
 //   VT parser       : Xterm256ToRgb(static), vt_feed, dispatch_csi
-//   window messages : OnEraseBkgnd, OnSize, OnGetDlgCode, OnVScroll, OnMouseWheel
+//   window messages : OnEraseBkgnd, OnSize, OnGetDlgCode, OnMouseWheel
+//   overlay scrollbar: sbar_geometry, sbar_show, draw_overlay_scrollbar, OnMouseLeave
 //   IME (Korean)    : OnImeStart, OnImeComp, OnImeEnd, OnImeNotify
 //   input           : set_input_sink, set_resize_sink, send_input_bytes, send_input_wide,
 //                     terminal_keydown, paste_clipboard, finalize_composition, OnChar, OnKeyDown
@@ -85,6 +86,9 @@
 //   Korean mode, 1 in English) and redraw the covered glyph(s) on top. child_caret (the child paints
 //   the cursor cell as reverse = its bg differs from neighbors) suppresses the ConBox block (avoids a
 //   double cursor).
+//   Overlay scrollbar: last, draw_overlay_scrollbar AlphaBlends a thumb over the right edge (no native
+//   WS_VSCROLL, so the client never shrinks). Auto-hide/fade via SBAR_TIMER; shown on user scroll/hover
+//   (sbar_show), dragged via the mouse handlers. sbar_geometry derives the track/thumb from view_top.
 //
 // [IME] Korean composition (OnImeStart/Comp/End/Notify + comp_str in OnPaint)
 //   Only the committed part (GCS_RESULTSTR) goes to the child via send_input_wide. The uncommitted
@@ -119,6 +123,7 @@
 #include <string>
 #include <imm.h>            // Korean IME (Input Method Manager)
 #pragma comment(lib, "imm32.lib")
+#pragma comment(lib, "msimg32.lib")   // AlphaBlend (overlay scrollbar fade)
 
 // Some SDK configurations expose CreatePseudoConsole/HPCON but not this attribute macro, so define it
 // if missing (ProcThreadAttributePseudoConsole=22 | PROC_THREAD_ATTRIBUTE_INPUT(0x00020000); a fixed
@@ -131,6 +136,23 @@ static const UINT_PTR CURSOR_TIMER = 1;
 // Child output polling timer (the one start() sets). 3 to stay distinct from CURSOR(1).
 static const UINT_PTR PUMP_TIMER = 3;
 static const UINT PUMP_INTERVAL_MS = 16;   // output poll interval; 16~30 keeps the view smooth
+// Overlay scrollbar fade timer. 4 to stay distinct from CURSOR(1)/PUMP(3).
+static const UINT_PTR SBAR_TIMER = 4;
+
+// Overlay scrollbar geometry/fade tuning (px / ms / alpha). Tuned to read like wt.exe: a slim, rounded,
+// translucent thumb hugging (but slightly inset from) the right edge, brighter on hover.
+static const int   SBAR_W          = 14;   // gutter (hit-test) width at the right edge
+static const int   SBAR_THUMB_W    = 6;    // visible thumb width (right-aligned inside the gutter)
+static const int   SBAR_INSET      = 3;    // gap from the client's right edge to the thumb
+static const int   SBAR_RADIUS     = 3;    // thumb corner radius (rounded ends)
+static const int   SBAR_BTN_H      = SBAR_W;  // arrow button height (square; track runs between them)
+static const int   SBAR_MIN_THUMB  = 24;   // minimum thumb height so it stays grabbable
+static const DWORD SBAR_HOLD_MS    = 700;  // stay fully visible this long after the last activity
+static const UINT  SBAR_FADE_TICK_MS = 33; // fade animation tick (~30 fps)
+static const int   SBAR_FADE_STEP  = 24;   // alpha removed per tick once fading (gentle ~0.35s fade)
+static const int   SBAR_OP_IDLE    = 110;  // max thumb opacity when shown (translucent, wt-like)
+static const int   SBAR_OP_HOVER   = 200;  // brighter when hovering / dragging
+static const COLORREF SBAR_THUMB_COLOR = RGB(200, 200, 200);   // light gray, blended over content
 
 // VT default colors: where SGR 0 (reset) and 39/49 return to (also the Requirements default). Tuned to
 // look like wt.exe's Campbell scheme on 90% acrylic (light-gray text on dark-gray, not pure black).
@@ -148,13 +170,13 @@ BEGIN_MESSAGE_MAP(CConBox, CWnd)
 	ON_WM_CHAR()
 	ON_WM_KEYDOWN()
 	ON_WM_GETDLGCODE()
-	ON_WM_VSCROLL()
 	ON_WM_MOUSEWHEEL()
 	ON_WM_TIMER()
 	ON_WM_DESTROY()
 	ON_WM_LBUTTONDOWN()
 	ON_WM_LBUTTONUP()
 	ON_WM_MOUSEMOVE()
+	ON_WM_MOUSELEAVE()
 	ON_WM_RBUTTONDOWN()
 	ON_MESSAGE(WM_IME_STARTCOMPOSITION, &CConBox::OnImeStart)
 	ON_MESSAGE(WM_IME_COMPOSITION, &CConBox::OnImeComp)
@@ -510,6 +532,13 @@ CConBox::CConBox()
 	sel_end_row = 0;
 	sel_end_col = 0;
 
+	// Overlay scrollbar starts hidden (alpha 0); shown on user scroll / hover.
+	sbar_alpha = 0;
+	sbar_hold_until = 0;
+	sbar_hover = false;
+	sbar_dragging = false;
+	sbar_drag_off = 0;
+
 	// Double-buffer cache is created on the first OnPaint.
 	back_old_bmp = nullptr;
 	back_w = 0;
@@ -528,17 +557,20 @@ CConBox::~CConBox()
 
 void CConBox::open(CWnd* parent, int x0, int y0, int x1, int y1)
 {
-	// Register a dedicated window class. No background brush (we paint it). I-Beam cursor for text.
+	// Register a dedicated window class. No background brush (we paint it). Arrow cursor (like wt.exe).
 	// CS_HREDRAW|CS_VREDRAW so a resize repaints the whole control.
 	LPCTSTR cls = AfxRegisterWndClass(
 		CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS,
-		::LoadCursor(nullptr, IDC_IBEAM),
+		::LoadCursor(nullptr, IDC_ARROW),
 		nullptr,
 		nullptr);
 
 	CRect rc(x0, y0, x1, y1);
+	// No WS_VSCROLL: a native vertical scrollbar would shrink the client area the first time scrollback
+	// appears, reflowing the grid and resizing the child PTY (a visible flash). Instead the overlay
+	// scrollbar (draw_overlay_scrollbar) is painted over the right edge and never reserves client space.
 	CreateEx(0, cls, _T(""),
-		WS_CHILD | WS_VISIBLE | WS_VSCROLL,
+		WS_CHILD | WS_VISIBLE,
 		rc, parent, 0);
 
 	// Fonts are fixed now (defaults if the host set none), so compute cell size and grid.
@@ -833,6 +865,29 @@ void CConBox::OnTimer(UINT_PTR id)
 	if (id == PUMP_TIMER) {
 		// Child (ConPTY) output polling. start() set this; no child means no timer.
 		pump();
+		return;
+	}
+	if (id == SBAR_TIMER) {
+		// Overlay scrollbar fade. Held fully visible while hovering/dragging or within the hold window;
+		// otherwise alpha decays each tick until 0, then the timer stops.
+		if (sbar_dragging || sbar_hover) {
+			sbar_hold_until = ::GetTickCount() + SBAR_HOLD_MS;   // keep it up
+			return;
+		}
+		if ((int)(::GetTickCount() - sbar_hold_until) < 0)
+			return;   // still inside the hold window: stay opaque
+		sbar_alpha -= SBAR_FADE_STEP;
+		if (sbar_alpha <= 0) {
+			sbar_alpha = 0;
+			KillTimer(SBAR_TIMER);
+		}
+		CRect track, thumb;
+		if (sbar_geometry(track, thumb)) {
+			CRect full;
+			GetClientRect(&full);
+			CRect gutter(full.right - SBAR_W, full.top, full.right, full.bottom);
+			InvalidateRect(&gutter, FALSE);
+		}
 		return;
 	}
 	CWnd::OnTimer(id);
@@ -1565,36 +1620,28 @@ void CConBox::dispatch_csi(wchar_t fin)
 
 void CConBox::update_scrollbar()
 {
+	// No native scrollbar (the overlay bar is what the user sees). This now only clamps/pins view_top;
+	// the overlay's visibility is driven by sbar_show()/SBAR_TIMER, its geometry by sbar_geometry().
 	if (!::IsWindow(m_hWnd))
 		return;
 
-	// On the alt screen, scrollback is frozen/hidden: hide the bar and pin the view to the screen start.
+	// On the alt screen, scrollback is frozen/hidden: pin the view to the screen start.
 	if (alt_active) {
-		ShowScrollBar(SB_VERT, FALSE);
 		view_top = (int)scrollback.size();
 		return;
 	}
 
 	int total = (int)scrollback.size() + rows;
 	if (total <= rows) {
-		// No scrollback (screen only): hide the bar, pin to top.
-		ShowScrollBar(SB_VERT, FALSE);
+		// No scrollback (screen only): pin to top.
 		view_top = 0;
 		return;
 	}
 
-	// Content overflows: show the bar and set range/page/pos.
-	ShowScrollBar(SB_VERT, TRUE);
-
-	SCROLLINFO si;
-	ZeroMemory(&si, sizeof(si));
-	si.cbSize = sizeof(si);
-	si.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
-	si.nMin = 0;
-	si.nMax = total - 1;       // last screen-line index
-	si.nPage = rows;
-	si.nPos = view_top;
-	SetScrollInfo(SB_VERT, &si, TRUE);
+	// Content overflows: keep view_top within [0, scrollback size].
+	int maxtop = (int)scrollback.size();
+	if (view_top < 0) view_top = 0;
+	if (view_top > maxtop) view_top = maxtop;
 }
 
 BOOL CConBox::OnEraseBkgnd(CDC* dc)
@@ -1623,44 +1670,223 @@ UINT CConBox::OnGetDlgCode()
 	return DLGC_WANTALLKEYS | DLGC_WANTCHARS | DLGC_WANTARROWS | DLGC_WANTTAB;
 }
 
-void CConBox::OnVScroll(UINT code, UINT pos, CScrollBar* sb)
+// ===== Overlay scrollbar (auto-hide/fade) =====
+
+// Compute the gutter (track) and thumb rects for the current view. Returns false when there is nothing
+// to scroll (no scrollback, or the alt screen owns the surface), in which case the bar is not drawn.
+bool CConBox::sbar_geometry(CRect& track, CRect& thumb) const
 {
-	// Scrollback view is frozen on the alt screen; ignore scroll input.
 	if (alt_active)
+		return false;
+	int total = (int)scrollback.size() + rows;
+	int maxtop = total - rows;            // == scrollback size
+	if (maxtop <= 0)
+		return false;
+
+	CRect rc;
+	GetClientRect(&rc);
+	if (rc.Height() <= 0 || rc.Width() <= 0)
+		return false;
+
+	// Gutter is a thin strip at the right edge (mostly over the right margin, so it barely covers text).
+	// Track runs between the two arrow buttons (each SBAR_BTN_H px tall at the gutter top/bottom).
+	track.SetRect(rc.right - SBAR_W, rc.top + SBAR_BTN_H, rc.right, rc.bottom - SBAR_BTN_H);
+
+	int track_h = track.Height();
+	if (track_h <= 0)
+		return false;
+	int thumb_h = (int)((double)track_h * rows / total);
+	if (thumb_h < SBAR_MIN_THUMB) thumb_h = SBAR_MIN_THUMB;
+	if (thumb_h > track_h)        thumb_h = track_h;
+
+	int thumb_y = track.top + (int)((double)(track_h - thumb_h) * view_top / maxtop);
+	if (thumb_y < track.top)               thumb_y = track.top;
+	if (thumb_y > track.bottom - thumb_h)  thumb_y = track.bottom - thumb_h;
+
+	// Thumb is a slim bar near the edge, inset by SBAR_INSET (does not touch the very right edge).
+	int tx = track.right - SBAR_INSET - SBAR_THUMB_W;
+	thumb.SetRect(tx, thumb_y, tx + SBAR_THUMB_W, thumb_y + thumb_h);
+	return true;
+}
+
+// Make the overlay fully opaque and (re)start the fade timer. Called on user scroll and gutter hover.
+void CConBox::sbar_show()
+{
+	if (!::IsWindow(m_hWnd))
+		return;
+	CRect track, thumb;
+	if (!sbar_geometry(track, thumb))
+		return;   // nothing to scroll -> nothing to show
+	sbar_alpha = 255;
+	sbar_hold_until = ::GetTickCount() + SBAR_HOLD_MS;
+	SetTimer(SBAR_TIMER, SBAR_FADE_TICK_MS, NULL);
+	CRect full;
+	GetClientRect(&full);
+	CRect gutter(full.right - SBAR_W, full.top, full.right, full.bottom);
+	InvalidateRect(&gutter, FALSE);
+}
+
+// Fill `rc` with a translucent rounded rectangle in `color`. Uses a 32bpp top-down DIB section with a
+// per-pixel alpha channel so the corners are genuinely rounded (a 1x1 stretch can only do hard edges).
+// baseAlpha = per-pixel opacity (0..255) when fully shown; fadeAlpha = the current fade level applied on
+// top via AlphaBlend's SourceConstantAlpha. Colors are premultiplied by baseAlpha as AC_SRC_ALPHA needs.
+static void DrawRoundedThumb(CDC& dc, const CRect& rc, COLORREF color, int baseAlpha, int radius, BYTE fadeAlpha)
+{
+	int w = rc.Width(), h = rc.Height();
+	if (w <= 0 || h <= 0)
+		return;
+	if (radius > w / 2) radius = w / 2;
+	if (radius > h / 2) radius = h / 2;
+	if (radius < 0)     radius = 0;
+
+	BITMAPINFO bi;
+	ZeroMemory(&bi, sizeof(bi));
+	bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+	bi.bmiHeader.biWidth = w;
+	bi.bmiHeader.biHeight = -h;   // top-down
+	bi.bmiHeader.biPlanes = 1;
+	bi.bmiHeader.biBitCount = 32;
+	bi.bmiHeader.biCompression = BI_RGB;
+
+	void* bits = nullptr;
+	HBITMAP dib = ::CreateDIBSection(dc.GetSafeHdc(), &bi, DIB_RGB_COLORS, &bits, NULL, 0);
+	if (dib == NULL)
 		return;
 
-	int maxtop = (int)scrollback.size();
-	if (maxtop < 0) maxtop = 0;
-
-	int nt = view_top;
-	switch (code) {
-	case SB_LINEUP:   nt -= 1;    break;
-	case SB_LINEDOWN: nt += 1;    break;
-	case SB_PAGEUP:   nt -= rows; break;
-	case SB_PAGEDOWN: nt += rows; break;
-	case SB_TOP:      nt = 0;      break;
-	case SB_BOTTOM:   nt = maxtop; break;
-	case SB_THUMBTRACK:
-	case SB_THUMBPOSITION: {
-		// Read the actual drag position.
-		SCROLLINFO si;
-		ZeroMemory(&si, sizeof(si));
-		si.cbSize = sizeof(si);
-		si.fMask = SIF_TRACKPOS;
-		GetScrollInfo(SB_VERT, &si);
-		nt = si.nTrackPos;
-		break;
-	}
-	default: break;
+	int pr = GetRValue(color) * baseAlpha / 255;   // premultiplied channels
+	int pg = GetGValue(color) * baseAlpha / 255;
+	int pb = GetBValue(color) * baseAlpha / 255;
+	DWORD inside = ((DWORD)baseAlpha << 24) | ((DWORD)pr << 16) | ((DWORD)pg << 8) | (DWORD)pb;
+	DWORD* px = (DWORD*)bits;
+	for (int y = 0; y < h; ++y) {
+		for (int x = 0; x < w; ++x) {
+			// Inside the rounded rect unless this pixel falls in a corner quadrant outside its radius.
+			int cx = -1, cy = -1;
+			if      (x < radius && y < radius)             { cx = radius;        cy = radius; }
+			else if (x >= w - radius && y < radius)        { cx = w - radius - 1; cy = radius; }
+			else if (x < radius && y >= h - radius)        { cx = radius;        cy = h - radius - 1; }
+			else if (x >= w - radius && y >= h - radius)   { cx = w - radius - 1; cy = h - radius - 1; }
+			bool in = true;
+			if (cx >= 0) {
+				int dx = x - cx, dy = y - cy;
+				in = (dx * dx + dy * dy) <= radius * radius;
+			}
+			px[y * w + x] = in ? inside : 0;
+		}
 	}
 
-	if (nt < 0) nt = 0;
-	if (nt > maxtop) nt = maxtop;
-	if (nt != view_top) {
-		view_top = nt;
-		update_scrollbar();
-		Invalidate();
+	CDC mem;
+	mem.CreateCompatibleDC(&dc);
+	HGDIOBJ old = ::SelectObject(mem.GetSafeHdc(), dib);
+	BLENDFUNCTION bf;
+	bf.BlendOp = AC_SRC_OVER;
+	bf.BlendFlags = 0;
+	bf.SourceConstantAlpha = fadeAlpha;
+	bf.AlphaFormat = AC_SRC_ALPHA;
+	dc.AlphaBlend(rc.left, rc.top, w, h, &mem, 0, 0, w, h, bf);
+	::SelectObject(mem.GetSafeHdc(), old);
+	::DeleteObject(dib);
+}
+
+// Draw a filled up or down pointing triangle into `rc`, using the same DIB/AlphaBlend path as
+// DrawRoundedThumb. The triangle vertices are padded 3px from the rect edges.
+static void DrawTriangle(CDC& dc, const CRect& rc, COLORREF color, int baseAlpha, BYTE fadeAlpha, bool up)
+{
+	int w = rc.Width(), h = rc.Height();
+	if (w <= 0 || h <= 0)
+		return;
+
+	BITMAPINFO bi;
+	ZeroMemory(&bi, sizeof(bi));
+	bi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+	bi.bmiHeader.biWidth       = w;
+	bi.bmiHeader.biHeight      = -h;
+	bi.bmiHeader.biPlanes      = 1;
+	bi.bmiHeader.biBitCount    = 32;
+	bi.bmiHeader.biCompression = BI_RGB;
+
+	void* bits = nullptr;
+	HBITMAP dib = ::CreateDIBSection(dc.GetSafeHdc(), &bi, DIB_RGB_COLORS, &bits, NULL, 0);
+	if (!dib)
+		return;
+
+	int pr = GetRValue(color) * baseAlpha / 255;
+	int pg = GetGValue(color) * baseAlpha / 255;
+	int pb = GetBValue(color) * baseAlpha / 255;
+	DWORD col = ((DWORD)baseAlpha << 24) | ((DWORD)pr << 16) | ((DWORD)pg << 8) | (DWORD)pb;
+	DWORD* px = (DWORD*)bits;
+
+	// Triangle vertices (padded 3px from rect edges); tip at top for up, bottom for down.
+	const int pad = 3;
+	int v0x = w / 2,     v0y = up ? pad       : h - 1 - pad;   // tip
+	int v1x = pad,       v1y = up ? h-1-pad   : pad;            // base left
+	int v2x = w-1-pad,   v2y = v1y;                             // base right
+
+	for (int y = 0; y < h; ++y) {
+		for (int x = 0; x < w; ++x) {
+			int d0 = (v1x-v0x)*(y-v0y) - (v1y-v0y)*(x-v0x);
+			int d1 = (v2x-v1x)*(y-v1y) - (v2y-v1y)*(x-v1x);
+			int d2 = (v0x-v2x)*(y-v2y) - (v0y-v2y)*(x-v2x);
+			bool in = (d0 >= 0 && d1 >= 0 && d2 >= 0) || (d0 <= 0 && d1 <= 0 && d2 <= 0);
+			px[y * w + x] = in ? col : 0;
+		}
 	}
+
+	CDC mem;
+	mem.CreateCompatibleDC(&dc);
+	HGDIOBJ old = ::SelectObject(mem.GetSafeHdc(), dib);
+	BLENDFUNCTION bf;
+	bf.BlendOp             = AC_SRC_OVER;
+	bf.BlendFlags          = 0;
+	bf.SourceConstantAlpha = fadeAlpha;
+	bf.AlphaFormat         = AC_SRC_ALPHA;
+	dc.AlphaBlend(rc.left, rc.top, w, h, &mem, 0, 0, w, h, bf);
+	::SelectObject(mem.GetSafeHdc(), old);
+	::DeleteObject(dib);
+}
+
+// Composite the overlay scrollbar into the back buffer (called last in OnPaint, on top of glyphs/cursor).
+// A translucent rounded thumb (brighter when hovering/dragging); a faint groove behind it while active.
+// Arrow buttons at gutter top/bottom scroll by 1 line on click. All fade via sbar_alpha.
+void CConBox::draw_overlay_scrollbar(CDC& dc)
+{
+	if (sbar_alpha <= 0)
+		return;
+	CRect track, thumb;
+	if (!sbar_geometry(track, thumb))
+		return;
+
+	bool active = (sbar_hover || sbar_dragging);
+
+	// Faint groove behind the thumb while active (subtle, rectangular; hard edges are fine here).
+	if (active) {
+		CDC src;
+		src.CreateCompatibleDC(&dc);
+		CBitmap bmp;
+		bmp.CreateCompatibleBitmap(&dc, 1, 1);
+		CBitmap* oldb = src.SelectObject(&bmp);
+		src.SetPixel(0, 0, RGB(80, 80, 80));
+		BLENDFUNCTION bf;
+		bf.BlendOp = AC_SRC_OVER;
+		bf.BlendFlags = 0;
+		bf.AlphaFormat = 0;
+		bf.SourceConstantAlpha = (BYTE)(sbar_alpha / 5);
+		CRect groove(thumb.left - 1, track.top, track.right - SBAR_INSET + 1, track.bottom);
+		dc.AlphaBlend(groove.left, groove.top, groove.Width(), groove.Height(), &src, 0, 0, 1, 1, bf);
+		src.SelectObject(oldb);
+	}
+
+	// The thumb: translucent (idle) or brighter (hover/drag), rounded, fading by sbar_alpha.
+	int opcap = active ? SBAR_OP_HOVER : SBAR_OP_IDLE;
+	DrawRoundedThumb(dc, thumb, SBAR_THUMB_COLOR, opcap, SBAR_RADIUS, (BYTE)sbar_alpha);
+
+	// Arrow buttons at gutter top/bottom (same opacity as thumb).
+	CRect rc_full;
+	GetClientRect(&rc_full);
+	CRect btn_up(rc_full.right - SBAR_W, rc_full.top, rc_full.right, rc_full.top + SBAR_BTN_H);
+	CRect btn_dn(rc_full.right - SBAR_W, rc_full.bottom - SBAR_BTN_H, rc_full.right, rc_full.bottom);
+	DrawTriangle(dc, btn_up, SBAR_THUMB_COLOR, opcap, (BYTE)sbar_alpha, true);
+	DrawTriangle(dc, btn_dn, SBAR_THUMB_COLOR, opcap, (BYTE)sbar_alpha, false);
 }
 
 BOOL CConBox::OnMouseWheel(UINT flags, short zDelta, CPoint pt)
@@ -1679,6 +1905,7 @@ BOOL CConBox::OnMouseWheel(UINT flags, short zDelta, CPoint pt)
 	if (nt != view_top) {
 		view_top = nt;
 		update_scrollbar();
+		sbar_show();   // user scroll -> flash the overlay bar
 		Invalidate();
 	}
 	return TRUE;
@@ -1782,6 +2009,45 @@ void CConBox::OnLButtonDown(UINT flags, CPoint pt)
 	finalize_composition();
 	ime_committed = false;   // a click is not an arrow; don't let it enable the arrow correction
 
+	// Overlay scrollbar: a press anywhere in the gutter drives the bar, not text selection.
+	// Buttons scroll 1 line; thumb drag; track click pages. Done before sel state so a scroll
+	// gesture never starts/clears a selection.
+	CRect track, thumb;
+	if (sbar_geometry(track, thumb)) {
+		CRect full;
+		GetClientRect(&full);
+		CRect gutter(full.right - SBAR_W, full.top, full.right, full.bottom);
+		if (gutter.PtInRect(pt)) {
+			int maxtop = (int)scrollback.size();
+			CRect btn_up(gutter.left, gutter.top, gutter.right, gutter.top + SBAR_BTN_H);
+			CRect btn_dn(gutter.left, gutter.bottom - SBAR_BTN_H, gutter.right, gutter.bottom);
+			if (btn_up.PtInRect(pt)) {
+				// Arrow up: scroll one line toward older content.
+				int nt = view_top - 1;
+				if (nt < 0) nt = 0;
+				if (nt != view_top) { view_top = nt; update_scrollbar(); Invalidate(); }
+			} else if (btn_dn.PtInRect(pt)) {
+				// Arrow down: scroll one line toward newer content.
+				int nt = view_top + 1;
+				if (nt > maxtop) nt = maxtop;
+				if (nt != view_top) { view_top = nt; update_scrollbar(); Invalidate(); }
+			} else if (thumb.PtInRect(pt)) {
+				// Grab the thumb; keep the grab offset so it does not jump under the cursor.
+				sbar_dragging = true;
+				sbar_drag_off = pt.y - thumb.top;
+				SetCapture();
+			} else {
+				// Press in the empty track: page toward the click.
+				int nt = view_top + ((pt.y < thumb.top) ? -rows : rows);
+				if (nt < 0) nt = 0;
+				if (nt > maxtop) nt = maxtop;
+				if (nt != view_top) { view_top = nt; update_scrollbar(); Invalidate(); }
+			}
+			sbar_show();
+			return;
+		}
+	}
+
 	sel_active = false;
 
 	// Start drag: anchor and end at the same cell.
@@ -1796,6 +2062,14 @@ void CConBox::OnLButtonDown(UINT flags, CPoint pt)
 
 void CConBox::OnLButtonUp(UINT flags, CPoint pt)
 {
+	// End a thumb drag (if any) before the selection path.
+	if (sbar_dragging) {
+		sbar_dragging = false;
+		ReleaseCapture();
+		sbar_show();   // restart the hold/fade now that dragging stopped
+		return;
+	}
+
 	if (!selecting) return;
 
 	hit_test(pt, sel_end_row, sel_end_col);
@@ -1817,11 +2091,74 @@ void CConBox::OnLButtonUp(UINT flags, CPoint pt)
 
 void CConBox::OnMouseMove(UINT flags, CPoint pt)
 {
+	// Dragging the overlay thumb: map the cursor y to view_top (inverse of sbar_geometry's thumb_y).
+	if (sbar_dragging) {
+		CRect track, thumb;
+		if (sbar_geometry(track, thumb)) {
+			int maxtop = (int)scrollback.size();
+			int span = track.Height() - thumb.Height();   // travel range of the thumb top
+			int ty = pt.y - sbar_drag_off - track.top;
+			int nt = (span > 0) ? (int)((double)ty * maxtop / span + 0.5) : 0;
+			if (nt < 0) nt = 0;
+			if (nt > maxtop) nt = maxtop;
+			if (nt != view_top) { view_top = nt; update_scrollbar(); Invalidate(); }
+		}
+		sbar_show();
+		return;
+	}
+
+	// Hover anywhere in the gutter (buttons + track; when not selecting): show the bar and arm
+	// WM_MOUSELEAVE so it fades on exit.
+	if (!selecting) {
+		CRect track, thumb;
+		bool has = sbar_geometry(track, thumb);
+		CRect gutter_rc;
+		if (has) {
+			CRect full;
+			GetClientRect(&full);
+			gutter_rc.SetRect(full.right - SBAR_W, full.top, full.right, full.bottom);
+		}
+		bool in = has && gutter_rc.PtInRect(pt);
+		if (in && !sbar_hover) {
+			sbar_hover = true;
+			TRACKMOUSEEVENT tme;
+			tme.cbSize = sizeof(tme);
+			tme.dwFlags = TME_LEAVE;
+			tme.hwndTrack = m_hWnd;
+			tme.dwHoverTime = 0;
+			::TrackMouseEvent(&tme);
+			sbar_show();
+		}
+		else if (!in && sbar_hover) {
+			sbar_hover = false;   // off the gutter (still in the window): let the hold/fade run
+			if (has) InvalidateRect(&gutter_rc, FALSE);
+		}
+	}
+
 	if (!selecting) return;
 
 	hit_test(pt, sel_end_row, sel_end_col);
 	sel_active = true;
 	Invalidate();
+}
+
+void CConBox::OnMouseLeave()
+{
+	// Left the window: drop gutter hover so the overlay can fade. The fade timer is already running
+	// (started by sbar_show on hover); just refresh the hold window so it lingers briefly, then fades.
+	if (sbar_hover) {
+		sbar_hover = false;
+		sbar_hold_until = ::GetTickCount() + SBAR_HOLD_MS;
+		if (::IsWindow(m_hWnd))
+			SetTimer(SBAR_TIMER, SBAR_FADE_TICK_MS, NULL);
+		CRect track, thumb;
+		if (sbar_geometry(track, thumb)) {
+			CRect full;
+			GetClientRect(&full);
+			CRect gutter(full.right - SBAR_W, full.top, full.right, full.bottom);
+			InvalidateRect(&gutter, FALSE);
+		}
+	}
 }
 
 void CConBox::OnRButtonDown(UINT flags, CPoint pt)
@@ -2225,6 +2562,7 @@ void CConBox::OnKeyDown(UINT vk, UINT rep, UINT flags)
 	if (nt != view_top) {
 		view_top = nt;
 		update_scrollbar();
+		sbar_show();   // keyboard scroll -> flash the overlay bar
 		Invalidate();
 	}
 }
@@ -2494,6 +2832,9 @@ void CConBox::OnPaint()
 			}   // if (!child_caret)
 		}
 	}
+
+	// Overlay scrollbar on top of everything (only when alpha > 0; auto-hidden otherwise).
+	draw_overlay_scrollbar(dc);
 
 	// Blit the finished frame to the screen at once (no flicker). The bitmap stays a live member (freed
 	// in the dtor), so it is not detached here.
@@ -2792,5 +3133,6 @@ void CConBox::OnDestroy()
 {
 	// Clean up child/polling timer before the window is destroyed (so polling never touches a dying window).
 	stop();
+	KillTimer(SBAR_TIMER);
 	CWnd::OnDestroy();
 }

@@ -140,12 +140,9 @@ void CConBoxDlg::resize_to_grid(int cols, int rows)
         return;
 
     // 가로 cols 칸 x 세로 rows 줄을 담는 데 필요한 ConBox 클라이언트 픽셀(안쪽 여백 포함).
+    // ConBox 는 오버레이 스크롤바(클라이언트를 잠식하지 않음)를 쓰므로 스크롤바 폭 보정이 불필요하다.
     int bw = 0, bh = 0;
     con_box.client_size_for_grid(cols, rows, bw, bh);
-
-    // ConBox 는 세로 스크롤바를 가진 자식 창이라, 스크롤바가 보일 때는 그 폭만큼
-    // 클라이언트가 줄어 칸 수가 모자란다. 스크롤바 폭을 미리 더해 칸 수를 보장한다.
-    bw += ::GetSystemMetrics(SM_CXVSCROLL);
 
     // 데모는 ConBox 를 사방 5px 마진(베젤)으로 배치하므로(layout_children 과 같은 값),
     // 대화상자 클라이언트는 그만큼 더 크다.

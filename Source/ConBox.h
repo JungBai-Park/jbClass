@@ -190,12 +190,13 @@ protected:
 	afx_msg void OnChar(UINT ch, UINT rep, UINT flags);
 	afx_msg void OnKeyDown(UINT vk, UINT rep, UINT flags);
 	afx_msg UINT OnGetDlgCode();
-	afx_msg void OnVScroll(UINT code, UINT pos, CScrollBar* sb);
 	afx_msg BOOL OnMouseWheel(UINT flags, short zDelta, CPoint pt);
-	// Mouse drag selection: down anchors, drag extends, up copies to clipboard.
+	// Mouse drag selection: down anchors, drag extends, up copies to clipboard. A button-down inside the
+	// overlay-scrollbar gutter is diverted to thumb drag / track paging instead of selection.
 	afx_msg void OnLButtonDown(UINT flags, CPoint pt);
 	afx_msg void OnLButtonUp(UINT flags, CPoint pt);
 	afx_msg void OnMouseMove(UINT flags, CPoint pt);
+	afx_msg void OnMouseLeave();   // clears gutter hover so the overlay scrollbar can fade
 	// Right click pastes the clipboard to the child stdin.
 	afx_msg void OnRButtonDown(UINT flags, CPoint pt);
 	afx_msg void OnTimer(UINT_PTR id);
@@ -225,8 +226,16 @@ private:
 
 	void scroll_to_bottom();
 
-	// Update scrollbar range/pos; hide it when all content is visible.
+	// Clamp view_top and pin it on the alt screen / when there is no scrollback. (No native scrollbar;
+	// the overlay bar below is what the user sees.) Kept as update_scrollbar() since many sites call it.
 	void update_scrollbar();
+
+	// Overlay scrollbar helpers (auto-hide/fade). geometry: compute the gutter (track) and thumb rects
+	// from the current view; false when nothing to scroll (no scrollback or alt screen). show: make the
+	// bar fully opaque and (re)start the fade timer. draw: AlphaBlend it into the back buffer in OnPaint.
+	bool sbar_geometry(CRect& track, CRect& thumb) const;
+	void sbar_show();
+	void draw_overlay_scrollbar(CDC& dc);
 
 	// VT parser: feed one char (or control byte) into the state machine. Interprets ESC/CSI/OSC and
 	// routes other chars to put_char. State is a member, so it persists across print() chunks.
@@ -460,6 +469,17 @@ private:
 	int sel_anchor_col;
 	int sel_end_row;
 	int sel_end_col;
+
+	// === Overlay scrollbar (auto-hide/fade, wt-style) ===
+	// No native WS_VSCROLL (it would shrink the client and reflow the grid on first appearance). The bar
+	// is drawn into the back buffer over the right edge and never reserves client space, so cols stays
+	// fixed. It is shown on user scroll (wheel/PageUp-Down/Ctrl+Home-End) or gutter hover, then fades.
+	// Geometry is derived on demand from view_top/scrollback/rows (no stored metrics).
+	int sbar_alpha;          // current opacity 0..255; 0 = hidden (not drawn)
+	DWORD sbar_hold_until;   // GetTickCount() deadline; fade starts once past it (unless hover/drag)
+	bool sbar_hover;         // mouse is over the gutter (held visible while true)
+	bool sbar_dragging;      // dragging the thumb (held visible; SetCapture active)
+	int sbar_drag_off;       // px from thumb top to the grab point (so the thumb does not jump)
 
 	// Double-buffer cache reused by OnPaint (not recreated each frame).
 	CDC back_dc;            // persistent memory DC
