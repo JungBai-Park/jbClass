@@ -11,6 +11,7 @@
 //                     set_efont, set_kfont, set_builtin_glyphs
 //   color/cursor    : set_color, set_bg_color, set_cursor_blend, set_cursor_blink, set_cursor, bump_cursor, OnTimer
 //   margin          : set_margin, client_size_for_grid
+//   config          : config, CreateDefaultIni(static), ResolveIniPath(static), ParseIni(static), ParseColor(static)
 //   cursor geometry : blend_cursor_color, cursor_screen_pos, get_cursor_rect, is_hangul_mode
 //   grid/output     : update_metrics, blank_row, reset_screen, line_at, clamp_cursor, erase_cells,
 //                     scroll_lines_up/down, scroll_up_region, scroll_down_region, line_feed,
@@ -38,7 +39,7 @@
 //   screen: vector<Row>      current screen, always rows lines x cols cells. Row = vector<CharInfo>.
 //   CharInfo{ wchar_t ch; COLORREF fg,bg; bool wide; }  wide = lead cell of a double-width glyph
 //     (the next cell is its trail, ch=0).
-//   scrollback: vector<Row>  lines pushed off the top (capped at MAX_SCROLLBACK, oldest dropped).
+//   scrollback: vector<Row>  lines pushed off the top (capped at max_scrollback, oldest dropped).
 //   main_saved: vector<Row>  main screen backed up on alt-screen entry (swapped back on leave).
 //   Key state: cur_row/cur_col (0-based screen cell cursor), view_top (top of view, unified index),
 //     cursor_visible (?25), saved_row/col (DECSC/RC), scroll_top/bot (DECSTBM region),
@@ -121,6 +122,7 @@
 
 #include "ConBox.h"
 #include <string>
+#include <map>
 #include <imm.h>            // Korean IME (Input Method Manager)
 #pragma comment(lib, "imm32.lib")
 #pragma comment(lib, "msimg32.lib")   // AlphaBlend (overlay scrollbar fade)
@@ -161,7 +163,7 @@ static const COLORREF DEFAULT_BG = RGB(32, 32, 32);
 
 enum { VT_GROUND = 0, VT_ESC = 1, VT_CSI = 2, VT_OSC = 3 };
 
-static const int MAX_SCROLLBACK = 5000;
+// MAX_SCROLLBACK is now the instance member max_scrollback (configurable via config()).
 
 BEGIN_MESSAGE_MAP(CConBox, CWnd)
 	ON_WM_PAINT()
@@ -534,6 +536,11 @@ CConBox::CConBox()
 	sel_end_row = 0;
 	sel_end_col = 0;
 
+	max_scrollback = 5000;
+	cfg_cols = 96;
+	cfg_rows = 32;
+	cfg_cmdline = "powershell.exe";
+
 	// Overlay scrollbar starts hidden (alpha 0); shown on user scroll / hover.
 	sbar_alpha = 0;
 	sbar_hold_until = 0;
@@ -555,6 +562,194 @@ CConBox::~CConBox()
 	// Restore the original bitmap so back_bmp is not destroyed while still selected into back_dc.
 	if (back_old_bmp)
 		back_dc.SelectObject(back_old_bmp);
+}
+
+// ===== Config file loader =====
+// Resolve a UTF-8 INI path to a wide absolute path. Relative paths are anchored at the EXE
+// directory (not the working directory) so the config file travels with the executable.
+static std::wstring ResolveIniPath(const char* utf8)
+{
+	int n = ::MultiByteToWideChar(CP_UTF8, 0, utf8, -1, nullptr, 0);
+	std::wstring w(n, 0);
+	::MultiByteToWideChar(CP_UTF8, 0, utf8, -1, w.data(), n);
+	if (!w.empty() && w.back() == 0) w.pop_back();   // strip the null terminator
+
+	// Absolute path: has a drive letter (x:\...) or starts with a UNC slash.
+	bool absolute = (w.size() >= 2 && w[1] == L':') || (!w.empty() && w[0] == L'\\');
+	if (absolute) return w;
+
+	// Relative: prepend the directory that contains the EXE.
+	wchar_t exe[MAX_PATH] = {};
+	::GetModuleFileNameW(nullptr, exe, MAX_PATH);
+	std::wstring dir(exe);
+	size_t slash = dir.rfind(L'\\');
+	if (slash != std::wstring::npos) dir.resize(slash + 1); else dir.clear();
+	return dir + w;
+}
+
+// Parse an INI file into a key->value map. Section headers are silently ignored so the caller
+// can match keys regardless of which section they appear in.  key names are lower-cased.
+static std::map<std::string, std::string> ParseIni(const wchar_t* path)
+{
+	std::map<std::string, std::string> m;
+	FILE* f = nullptr;
+	_wfopen_s(&f, path, L"r");
+	if (!f) return m;
+
+	char line[512];
+	while (fgets(line, (int)sizeof(line), f)) {
+		// Trim leading whitespace.
+		char* p = line;
+		while (*p == ' ' || *p == '\t') ++p;
+		// Skip empty lines, comments, and section headers.
+		if (*p == '\0' || *p == '\r' || *p == '\n' || *p == ';' || *p == '#' || *p == '[') continue;
+
+		char* eq = strchr(p, '=');
+		if (!eq) continue;
+
+		// Key: everything before '=', trailing-trimmed.
+		std::string key(p, eq);
+		while (!key.empty() && (key.back() == ' ' || key.back() == '\t')) key.pop_back();
+		for (char& c : key) c = (char)tolower((unsigned char)c);
+
+		// Value: everything after '=', leading-trimmed, trailing newline stripped.
+		char* v = eq + 1;
+		while (*v == ' ' || *v == '\t') ++v;
+		std::string val(v);
+		while (!val.empty() && (val.back() == '\r' || val.back() == '\n' || val.back() == ' ')) val.pop_back();
+
+		if (!key.empty()) m[key] = val;
+	}
+	fclose(f);
+	return m;
+}
+
+// Parse "#RRGGBB" hex color string to COLORREF.  Returns def on failure.
+static COLORREF ParseColor(const std::string& s, COLORREF def)
+{
+	if (s.size() == 7 && s[0] == '#') {
+		unsigned int v = 0;
+		if (sscanf_s(s.c_str() + 1, "%x", &v) == 1)
+			return RGB((v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF);
+	}
+	return def;
+}
+
+// Write a default INI file to path (called on first run when no config exists).
+// Section headers are cosmetic only; the parser ignores them.
+static void CreateDefaultIni(const wchar_t* path)
+{
+	FILE* f = nullptr;
+	_wfopen_s(&f, path, L"w");
+	if (!f) return;
+	fputs(
+		"; ConBox configuration file\n"
+		"; Section headers are visual only -- keys are matched by name, not section.\n"
+		"\n"
+		"[font]\n"
+		"efont_name    = Cascadia Mono\n"
+		"efont_size    = 12\n"
+		"efont_opts    =\n"
+		"kfont_name    = Malgun Gothic\n"
+		"kfont_size    = 0\n"
+		"kfont_opts    = B\n"
+		"\n"
+		"[layout]\n"
+		"margin_top    = 10\n"
+		"margin_left   = 10\n"
+		"margin_bottom = 10\n"
+		"margin_right  = 10\n"
+		"adjust_left   = 0\n"
+		"adjust_top    = 0\n"
+		"adjust_right  = 0\n"
+		"adjust_bottom = 0\n"
+		"grid_cols     = 96\n"
+		"grid_rows     = 32\n"
+		"\n"
+		"[colors]\n"
+		"fg = #C8C8C8\n"
+		"bg = #202020\n"
+		"\n"
+		"[cursor]\n"
+		"cursor_type     = 0\n"
+		"cursor_blend_bg = 4\n"
+		"cursor_blend_fg = 6\n"
+		"cursor_blink_ms = 0\n"
+		"\n"
+		"[rendering]\n"
+		"builtin_glyphs = 1\n"
+		"scrollback_cap = 5000\n"
+		"\n"
+		"[child]\n"
+		"cmdline = powershell.exe\n",
+		f);
+	fclose(f);
+}
+
+// Load settings from an INI file.  Sections are ignored; keys are matched by name only.
+// Relative paths are resolved against the EXE directory.  If the file does not exist it is
+// created with compiled-in defaults and this call returns (settings stay at their defaults).
+void CConBox::config(const char* path)
+{
+	const char* src = (path && *path) ? path : "ConBox.ini";
+	std::wstring wide_path = ResolveIniPath(src);
+
+	if (::GetFileAttributesW(wide_path.c_str()) == INVALID_FILE_ATTRIBUTES) {
+		CreateDefaultIni(wide_path.c_str());
+		return;   // defaults already set in the constructor
+	}
+
+	std::map<std::string, std::string> m = ParseIni(wide_path.c_str());
+	auto get = [&](const char* k) -> const std::string* {
+		auto it = m.find(k);
+		return (it != m.end()) ? &it->second : nullptr;
+	};
+	auto geti = [&](const char* k, int def) -> int {
+		const std::string* s = get(k);
+		if (!s || s->empty()) return def;
+		try { return std::stoi(*s); } catch (...) { return def; }
+	};
+
+	// Font
+	std::string efont_name = "Cascadia Mono", efont_opts = "";
+	float efont_size = 12.0f;
+	std::string kfont_name = "Malgun Gothic", kfont_opts = "B";
+	float kfont_size = 0.0f;
+	if (const std::string* s = get("efont_name")) efont_name = *s;
+	if (const std::string* s = get("efont_size")) { try { efont_size = std::stof(*s); } catch (...) {} }
+	if (const std::string* s = get("efont_opts")) efont_opts = *s;
+	if (const std::string* s = get("kfont_name")) kfont_name = *s;
+	if (const std::string* s = get("kfont_size")) { try { kfont_size = std::stof(*s); } catch (...) {} }
+	if (const std::string* s = get("kfont_opts")) kfont_opts = *s;
+	set_efont(efont_name.c_str(), efont_size, efont_opts.c_str());
+	set_kfont(kfont_name.c_str(), kfont_size, kfont_opts.c_str());
+
+	// Layout
+	int mt = geti("margin_top", 10), ml = geti("margin_left", 10);
+	int mb = geti("margin_bottom", 10), mr = geti("margin_right", 10);
+	set_margin(mt, ml, mb, mr);
+	int al = geti("adjust_left", 0), at = geti("adjust_top", 0);
+	int ar = geti("adjust_right", 0), ab = geti("adjust_bottom", 0);
+	adjust(al, at, ar, ab);
+
+	// Colors
+	if (const std::string* s = get("fg")) set_color(ParseColor(*s, default_fg));
+	if (const std::string* s = get("bg")) set_bg_color(ParseColor(*s, default_bg));
+
+	// Cursor
+	set_cursor(geti("cursor_type", 0));
+	set_cursor_blend(geti("cursor_blend_bg", 4), geti("cursor_blend_fg", 6));
+	set_cursor_blink(geti("cursor_blink_ms", 0));
+
+	// Rendering
+	set_builtin_glyphs(geti("builtin_glyphs", 1));
+	int cap = geti("scrollback_cap", 5000);
+	if (cap > 0) max_scrollback = cap;
+
+	// Host-consumed values (stored; accessed via config_cols/rows/cmdline)
+	cfg_cols = geti("grid_cols", 96);
+	cfg_rows = geti("grid_rows", 32);
+	if (const std::string* s = get("cmdline")) { if (!s->empty()) cfg_cmdline = *s; }
 }
 
 void CConBox::open(CWnd* parent, int x0, int y0, int x1, int y1)
@@ -1138,7 +1333,7 @@ void CConBox::scroll_up_region(int n)
 		for (int i = 0; i < n; ++i)
 			scrollback.push_back(screen[i]);
 
-		int over = (int)scrollback.size() - MAX_SCROLLBACK;
+		int over = (int)scrollback.size() - max_scrollback;
 		if (over > 0)
 			scrollback.erase(scrollback.begin(), scrollback.begin() + over);
 	}

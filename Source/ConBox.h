@@ -141,6 +141,19 @@ public:
 	int grid_cols() const { return cols; }
 	int grid_rows() const { return rows; }
 
+	// Load settings from an INI file (section-agnostic key matching). path is UTF-8; a relative
+	// path is resolved against the EXE directory (not the working directory). nullptr defaults to
+	// "ConBox.ini". If the file does not exist, it is created with compiled-in defaults and this
+	// call returns without changing any settings (they stay at their defaults).
+	void config(const char* path = nullptr);
+
+	// Grid size and child cmdline read from the last config() call. The host uses these to size
+	// the window (resize_to_grid) and launch the child (start()), so it does not need to hard-code
+	// those values anymore.
+	int         config_cols()    const { return cfg_cols; }
+	int         config_rows()    const { return cfg_rows; }
+	const char* config_cmdline() const { return cfg_cmdline.c_str(); }
+
 	// Set the input sink (raw/terminal mode). Once set, ConBox does not locally edit/echo; it encodes
 	// keys/chars to VT sequences and UTF-8 bytes and pushes them to sink (for the child's stdin). user
 	// is an opaque context returned on each call. nullptr reverts to read-only viewer mode.
@@ -414,8 +427,9 @@ private:
 
 	// Cell grid. screen = current screen (always rows lines x cols cells). scrollback = lines pushed
 	// off the top. Cursor (cur_row, cur_col) is a 0-based on-screen cell coord (VT absolute moves).
+	int max_scrollback;           // scrollback line cap (configurable via config(); default 5000)
 	std::vector<Row> screen;
-	std::vector<Row> scrollback;  // trimmed past a cap
+	std::vector<Row> scrollback;  // oldest lines trimmed when size exceeds max_scrollback
 	int view_top;                 // top of view = unified (scrollback + screen) index (wheel/scrollbar)
 	int cur_row;                  // 0..rows-1
 	int cur_col;                  // 0..cols
@@ -482,6 +496,11 @@ private:
 	bool sbar_hover;         // mouse is over the gutter (held visible while true)
 	bool sbar_dragging;      // dragging the thumb (held visible; SetCapture active)
 	int sbar_drag_off;       // px from thumb top to the grab point (so the thumb does not jump)
+
+	// config() result cache: grid size and cmdline stored for the host to query after config().
+	int         cfg_cols;
+	int         cfg_rows;
+	std::string cfg_cmdline;
 
 	// Double-buffer cache reused by OnPaint (not recreated each frame).
 	CDC back_dc;            // persistent memory DC

@@ -59,36 +59,20 @@ BOOL CConBoxDlg::OnInitDialog()
     if (CWnd* cancel = GetDlgItem(IDCANCEL))
         cancel->DestroyWindow();
 
-    // 폰트는 창 생성 전에 지정한다. 값은 ConBox 기본값과 동일하며, API 사용 예시를 겸한다.
-    // 한글은 크기를 0 으로 주어 영문 높이에 맞추는 match 모드로 둔다(기본 동작).
-    // (영문 Cascadia Mono 는 둥근 모서리 ╭╮╰╯ 와 로고의 사분면 블록 ▛▜▘▝ 글리프를 가져
-    //  도표가 깨지지 않는다. Consolas 에는 이 글리프들이 없다.)
-    con_box.set_efont("Cascadia Mono", 12, "");
-    con_box.set_kfont("Malgun Gothic",  0, "B");
-
-
+    // config() 로 폰트, 색상, 커서, 마진, 그리드 크기, 자식 명령줄을 한 번에 불러온다.
+    // 파일이 없으면 기본값으로 자동 생성된다.
+    con_box.config("..\\..\\Documents\\Config.ini");
 
     // ConBox 를 자식 창으로 만든다. (위치/크기는 아래 resize_to_grid 가 정한다.)
     con_box.open(this, 0, 0, 10, 10);
 
-    // 셀의 상하 여백을 1px씩 깎아 행 간격을 좁힌다 (adjust: left, top, right, bottom 픽셀 단위)
-    con_box.adjust(0, -1, 0, -1);
+    // config 에서 읽은 그리드 크기로 메인 창 크기를 조정한다.
+    resize_to_grid(con_box.config_cols(), con_box.config_rows());
 
-    // 커서 모양을 설정한다. (0 = 기본값; 현재 단계의 기본 모양으로 매핑된다.)
-    con_box.set_cursor(0);
-
-    // 위에서 지정한 폰트 설정 기준으로 ConBox 가 96x32 칸(영문)이 되도록 메인 창
-    // 크기를 다시 잡고 화면 중앙으로 옮긴다. (셀 크기는 open 에서 확정되었다.)
-    resize_to_grid(96, 32);
-
-    // 초기 화면은 비워 두고, ConBox 가 직접 PowerShell 을 ConPTY 로 실행한다.
-    // start() 가 입력(ConBox->자식)·출력(자식->ConBox)·리사이즈를 모두 자동 연결하므로, 이후
-    // ConBox 에 타이핑하면 PowerShell 로 전달되고 결과가 ConBox 에 표시된다. 로컬 에코는 자동으로 꺼진다.
-    // 자식이 종료되면 메인 윈도우를 닫도록 콜백을 건다.
+    // 자식 프로세스를 기동한다. config 에서 읽은 명령줄을 사용한다.
     con_box.set_exit_callback(&CConBoxDlg::on_child_exit, this);
-    // 자식의 작업 디렉토리를 프로젝트 루트로 옮긴 뒤 실행한다(자식이 cwd 를 상속).
     SetCurrentDirectory(_T("D:\\Work\\Study\\ConBox"));
-    con_box.start("powershell.exe");
+    con_box.start(con_box.config_cmdline());
 
     // 키보드 입력을 받도록 ConBox 에 포커스를 준다.
     con_box.SetFocus();
