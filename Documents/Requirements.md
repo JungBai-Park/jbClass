@@ -10,19 +10,24 @@ Paths are relative to the project root. When a detail is unspecified, follow **W
 - `CConBox` (`Source/ConBox.h` / `ConBox.cpp`): a portable MFC `CWnd`-derived terminal control.
   **Single class** — the former ConPTY runner `CConExe` is merged in; `ConExe.h/.cpp` were removed.
 - Two usage modes (both supported by the one class):
-  - **Pure terminal view**: host feeds output bytes via `print()` and reads keystroke bytes via
-    `set_input_sink()`. Usable with any byte source (file, socket, host-managed process).
+  - **Pure terminal view**: host feeds output bytes via `print()` and optionally reads keystroke
+    bytes via `set_input_sink()`. Usable with any byte source (file, socket, host-managed process).
+    Can be used with or without input sink: without it (no `set_input_sink` or with `nullptr`),
+    ConBox acts as a **log/diagnostic message display** (output only, all window messages and timers
+    work normally, child process not required).
   - **ConPTY child runner**: `start(cmdline)` launches a console child and auto-wires its I/O,
     sizing the child console to match the current grid. It internally reuses the input/resize sinks,
     so the runner is a built-in driver layered on the generic view interface. If `start()` is never
-    called, the ConPTY members stay dormant.
+    called, the ConPTY members stay dormant and the control functions as a pure view.
 - **Target programs**: line-oriented **stdio** programs that occasionally emit *limited VT100*
   (SGR colors, cursor moves, EL/ED, CR/LF) — the representative demo child is **PowerShell** (an
   interactive stdio shell). Full-screen TUIs (claude.exe, vim) are **best-effort, not the design
   target** (they work via the same path but their app-specific cursor/redraw quirks are out of scope).
 - All string inputs are **UTF-8 `const char*`** (so C++ literals pass directly).
 - Portability unit: **ConBox.h + ConBox.cpp** (2 files). Requirements: MFC (Unicode); Win10 1809+
-  (ConPTY) only if `start()` is used; both files are **ASCII** (comments ASCII-only, so no BOM needed).
+  (ConPTY API) **only if `start()` is called** — the control functions as a pure view (log/diagnostic
+  display) on any Win10 without ConPTY if `start()` is never invoked. Both files are **ASCII**
+  (comments ASCII-only, so no BOM needed).
 
 ---
 

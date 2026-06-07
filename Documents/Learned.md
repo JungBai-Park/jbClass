@@ -175,20 +175,29 @@ To reproduce `calc_cell_size` values (`cell_w`/`natw`/`kwid`):
   vars (`WT_SESSION`/`TERM_PROGRAM`) and XTVERSION responses were all tried and reverted. Don't chase
   that path again.
 
-## VT100 escape sequences — implementation notes (INCOMPLETE)
-- **IND (ESC D)**: index. Intended: cursor moves down 1 line; column stays. At scroll region
-  bottom, scroll. Code implemented in vt_feed (VT_ESC case, 1675-1680) BUT **NOT WORKING**.
-  Cursor does not move despite code present. RI (ESC M) works, so issue is specific to IND logic.
-- **NEL (ESC E)**: next line (CR + LF). Intended: cursor to col 0 then down. Code implemented
-  (1682-1688) BUT **NOT WORKING**. Same issue as IND. Related to IND problem.
-- **RIS (ESC c)**: reset to initial state. ✅ WORKING. Clears screen, cursor to 0,0, resets SGR,
-  modes, scroll region, alt screen. Does NOT clear scrollback. Implemented 1684-1694.
-- **CNL (CSI Pn E)**: cursor next line. ✅ WORKING. Move down Pn, col to 0. dispatch_csi:1764.
-- **CPL (CSI Pn F)**: cursor previous line. ✅ WORKING. Move up Pn, col to 0. dispatch_csi:1765.
-- **Unresolved IND/NEL issue**: Code is syntactically correct, compiles, in right location (VT_ESC),
-  but has zero effect. RI works, RIS works, LF works, line_feed() function is fine. Suggests either
-  (a) vt_feed never receives D/E in VT_ESC state, (b) conditions (cur_row == scroll_bot, cur_row <
-  rows-1) always false at time of call, (c) hidden compiler/state issue. Needs debug output (OutputDebugString)
-  to confirm code is reached. See ToDoList.md for full investigation notes.
-- Test scripts: `Temp/test_vt.ps1`, `Temp/quick_test.ps1`, `Temp/test_lf.ps1`, `Temp/test_ris.ps1`,
-  `Temp/test_ri.ps1` (all UTF-8 with BOM).
+## VT100 IND/NEL "not working" = NON-BUG (ConPTY artifact) — do NOT re-investigate
+- Earlier sessions marked IND (ESC D) / NEL (ESC E) as "NOT WORKING": a PowerShell child printed
+  ESC D / ESC E via `[System.Console]::Write` and the result stayed on one line. This was
+  misdiagnosed as a ConBox parser bug.
+- **The parser is correct.** Verified by feeding `"Row1\x1bDRow2"` etc. straight to `print()` (no
+  child): IND moved cur_row down keeping the column, NEL did CR+LF, RI/RIS/CNL/CPL all correct.
+  IND/NEL/RI live in vt_feed VT_ESC; CNL/CPL in dispatch_csi.
+- **Real cause**: the system conhost behind `CreatePseudoConsole` does NOT forward the child's
+  ESC D / ESC E. It absorbs them into its own screen buffer and re-encodes the result as CUP +
+  text (logged ConBox-side raw input had ZERO `ESC D` bytes; it arrived as `ESC[r;cH ...text`).
+  So ConBox never receives IND/NEL through the ConPTY path; nothing to fix in ConBox.
+- **Why wt.exe differs**: wt.exe ships a newer bundled `OpenConsole.exe` (v1.24, ...
+  `Microsoft.WindowsTerminal_*\OpenConsole.exe`) as its ConPTY backend; ConBox's
+  `CreatePseudoConsole` hard-calls the inbox `\\?\C:\Windows\system32\conhost.exe`
+  (v10.0.19041, older), confirmed via the child process tree. The two backends re-encode
+  differently. This is a known limitation (microsoft/terminal #5334): kernel32
+  CreatePseudoConsole cannot be pointed at a custom conhost path.
+- **Using OpenConsole would require** either a redistributable conpty.dll (not present on this
+  box; WindowsTerminal ships only `OpenConsoleProxy.dll`, a COM proxy without CreatePseudoConsole),
+  or hand-spawning OpenConsole.exe as a ConPTY server (low-level ConDrv handle creation via ntdll
+  NtCreateFile on `\Device\ConDrv\Server` + `\Reference`, per winconpty.cpp). Large, version-
+  sensitive work; deferred as low priority. Don't retry the "fix IND in ConBox" path.
+- **Debugging method that worked** (better than screen capture): a compile-gated file logger
+  (`dbg_log` -> `Temp/debug.log`) tracing each char into vt_feed / put_char / line_feed plus the
+  raw bytes into `print()`, driven by direct `print()` test strings (no child) for determinism.
+  Removed after use; re-add the same pattern if a future VT issue needs tracing.

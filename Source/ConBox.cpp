@@ -2176,6 +2176,15 @@ void CConBox::draw_overlay_scrollbar(CDC& dc)
 
 	bool active = (sbar_hover || sbar_dragging);
 
+	// Pick thumb/groove shades that contrast with the current background so the bar stays visible on
+	// both dark and light backgrounds (the fixed dark grays were invisible on white). Perceived
+	// luminance of default_bg decides: bright bg -> dark thumb + light groove, dark bg -> the original
+	// light thumb + dark groove. The groove is a fainter mid-shade so it reads as a subtle track.
+	int bg_lum = (GetRValue(default_bg) * 299 + GetGValue(default_bg) * 587 + GetBValue(default_bg) * 114) / 1000;
+	bool light_bg = (bg_lum > 128);
+	COLORREF thumb_color  = light_bg ? RGB(96, 96, 96)    : SBAR_THUMB_COLOR;
+	COLORREF groove_color = light_bg ? RGB(176, 176, 176) : RGB(80, 80, 80);
+
 	// Faint groove behind the thumb while active (subtle, rectangular; hard edges are fine here).
 	if (active) {
 		CDC src;
@@ -2183,7 +2192,7 @@ void CConBox::draw_overlay_scrollbar(CDC& dc)
 		CBitmap bmp;
 		bmp.CreateCompatibleBitmap(&dc, 1, 1);
 		CBitmap* oldb = src.SelectObject(&bmp);
-		src.SetPixel(0, 0, RGB(80, 80, 80));
+		src.SetPixel(0, 0, groove_color);
 		BLENDFUNCTION bf;
 		bf.BlendOp = AC_SRC_OVER;
 		bf.BlendFlags = 0;
@@ -2196,15 +2205,15 @@ void CConBox::draw_overlay_scrollbar(CDC& dc)
 
 	// The thumb: translucent (idle) or brighter (hover/drag), rounded, fading by sbar_alpha.
 	int opcap = active ? SBAR_OP_HOVER : SBAR_OP_IDLE;
-	DrawRoundedThumb(dc, thumb, SBAR_THUMB_COLOR, opcap, SBAR_RADIUS, (BYTE)sbar_alpha);
+	DrawRoundedThumb(dc, thumb, thumb_color, opcap, SBAR_RADIUS, (BYTE)sbar_alpha);
 
 	// Arrow buttons at gutter top/bottom (same opacity as thumb).
 	CRect rc_full;
 	GetClientRect(&rc_full);
 	CRect btn_up(rc_full.right - SBAR_W, rc_full.top, rc_full.right, rc_full.top + SBAR_BTN_H);
 	CRect btn_dn(rc_full.right - SBAR_W, rc_full.bottom - SBAR_BTN_H, rc_full.right, rc_full.bottom);
-	DrawTriangle(dc, btn_up, SBAR_THUMB_COLOR, opcap, (BYTE)sbar_alpha, true);
-	DrawTriangle(dc, btn_dn, SBAR_THUMB_COLOR, opcap, (BYTE)sbar_alpha, false);
+	DrawTriangle(dc, btn_up, thumb_color, opcap, (BYTE)sbar_alpha, true);
+	DrawTriangle(dc, btn_dn, thumb_color, opcap, (BYTE)sbar_alpha, false);
 }
 
 BOOL CConBox::OnMouseWheel(UINT flags, short zDelta, CPoint pt)
