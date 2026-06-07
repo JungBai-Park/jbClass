@@ -17,6 +17,9 @@
 //   - Every string API takes UTF-8 (const char*) so C++ string literals pass directly.
 //   - Self-contained: includes its own headers, does not depend on a precompiled header.
 //   - Save .h/.cpp as ASCII (comments are ASCII-only) so encoding is unambiguous.
+//   - SGR text attributes: bold/italic use font variants (efont/kfont _bold/_italic/_bold_italic),
+//     underline/strike are drawn as 1px decoration lines, blink toggled by BLINK_TIMER (500ms).
+//     Stored per cell in CharInfo::flags (CELL_BOLD/ITALIC/UNDERLINE/STRIKE/BLINK).
 //
 // --- Usage (inside the host parent window) ---
 //     CConBox box;                            // usually held as a member
@@ -50,13 +53,25 @@
 #include <deque>
 #include <string>
 
-// One screen cell. A double-width glyph (Korean/CJK) occupies a lead cell (ch=glyph, wide=true)
+// One screen cell. A double-width glyph (Korean/CJK) occupies a lead cell (CELL_WIDE set)
 // and the next cell is its trail (ch=0, skipped by the renderer). An empty cell is ch=L' '.
+// Layout: ch(2)+flags(1)+pad(1)+fg(4)+bg(4) = 12 bytes (was 16 with bool wide at the end).
 struct CharInfo {
 	wchar_t  ch;     // UTF-16 char; 0 = trail cell of a wide glyph (render skips it)
+	uint8_t  flags;  // bit field: CELL_WIDE | CELL_BOLD | CELL_ITALIC | CELL_UNDERLINE | CELL_STRIKE | CELL_BLINK
+	// 1 byte compiler padding here (aligns fg to offset 4)
 	COLORREF fg;
 	COLORREF bg;
-	bool     wide;   // lead cell of a double-width glyph
+};
+
+// CharInfo::flags bit masks.
+enum {
+	CELL_WIDE      = 0x01,   // lead cell of a double-width (Korean/CJK) glyph
+	CELL_BOLD      = 0x02,   // SGR 1
+	CELL_ITALIC    = 0x04,   // SGR 3
+	CELL_UNDERLINE = 0x08,   // SGR 4; drawn as a 1px line at cell bottom
+	CELL_STRIKE    = 0x10,   // SGR 9; drawn as a 1px line at cell middle
+	CELL_BLINK     = 0x20,   // SGR 5/6; glyph toggled by BLINK_TIMER
 };
 
 typedef std::vector<CharInfo> Row;
@@ -214,6 +229,8 @@ protected:
 	afx_msg void OnMouseLeave();   // clears gutter hover so the overlay scrollbar can fade
 	// Right click pastes the clipboard to the child stdin.
 	afx_msg void OnRButtonDown(UINT flags, CPoint pt);
+	// Drag-and-drop: sends dropped file paths to child stdin (quoted if the path contains spaces).
+	afx_msg void OnDropFiles(HDROP hdrop);
 	afx_msg void OnTimer(UINT_PTR id);
 	// Korean IME. In terminal mode only committed text is sent to the child; the in-progress
 	// composition is held in comp_str and drawn by ConBox in the cursor cell (system inline is
@@ -398,8 +415,14 @@ private:
 	int cursor_type;       // shape: 1=blink block,2=fixed block,3=blink underline,4=fixed underline,
 	                       // 5=blink I-beam,6=fixed I-beam. Odd=blinking, even=fixed (see set_cursor).
 
-	CFont efont;
+	CFont efont;              // normal (base)
+	CFont efont_bold;         // SGR bold variant
+	CFont efont_italic;       // SGR italic variant
+	CFont efont_bold_italic;  // SGR bold+italic variant
 	CFont kfont;
+	CFont kfont_bold;
+	CFont kfont_italic;
+	CFont kfont_bold_italic;
 	LOGFONTW efont_lf;
 	LOGFONTW kfont_lf; // keeps the user's original size/style
 
@@ -471,8 +494,14 @@ private:
 	bool vt_space;                // CSI ' ' (0x20) intermediate marker; needed to spot DECSCUSR (CSI Ps SP q)
 
 	// Current SGR attributes applied by put_char (colors use cur_fg/cur_bg).
-	bool cur_bold;                // maps to bright color
+	bool cur_bold;
+	bool cur_italic;
+	bool cur_underline;
+	bool cur_strike;
+	bool cur_blink;
 	bool cur_reverse;             // swap fg/bg
+
+	bool blink_on;                // blink visibility state, toggled by BLINK_TIMER
 
 	// Input modes the child turns on via DEC private modes; change key encoding / paste.
 	bool app_cursor_keys;         // DECCKM (?1): arrows as ESC O x instead of ESC [ x

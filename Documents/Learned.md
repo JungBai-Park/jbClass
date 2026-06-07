@@ -57,6 +57,28 @@ To reproduce `calc_cell_size` values (`cell_w`/`natw`/`kwid`):
   Default is **Cascadia Mono** (has rounded corners U+256D.., quadrant blocks U+2598..); **Consolas
   lacks** those — don't default to Consolas.
 
+## SGR text attributes (bold/italic/underline/strike/blink)
+- **CharInfo structure**: `bool wide` → `uint8_t flags` (saves 4 bytes/cell: 16→12 bytes; struct is
+  ch(2)+flags(1)+pad(1)+fg(4)+bg(4)). Bits: CELL_WIDE(1) | CELL_BOLD(2) | CELL_ITALIC(4) |
+  CELL_UNDERLINE(8) | CELL_STRIKE(16) | CELL_BLINK(32).
+- **Font variants**: `efont_bold`, `efont_italic`, `efont_bold_italic` (kfont variants too) created
+  once in `set_efont`/`set_kfont`/`apply_default_fonts`. Bold weight selection: if base `lfWeight >= 600`
+  (already semi-bold/bold), use FW_EXTRABOLD(800) for visual enhancement; else FW_BOLD(700). Allows
+  already-bold fonts (e.g. Malgun Gothic B) to become thicker on SGR bold.
+- **BLINK_TIMER** (ID=2, 500ms): separate from CURSOR_TIMER(1), PUMP_TIMER(3), SBAR_TIMER(4). Toggles
+  `blink_on`, invalidates whole screen (blink cells may be anywhere). SGR blink cells render glyph
+  only when `blink_on=true`; decoration lines (underline/strike) always drawn.
+- **OnPaint rendering**: for each cell, select font based on (CELL_WIDE, CELL_BOLD, CELL_ITALIC) → 4-way
+  branch to one of {efont, efont_bold, efont_italic, efont_bold_italic, kfont, ...}. After glyph,
+  draw underline (1px at cell bottom) / strike (1px at middle) if flags set, in cell's fg color.
+  Blink glyphs are omitted (cell background filled, glyph skipped) when `!blink_on`.
+- **SGR parsing** (`dispatch_csi`): SGR 1/22 (bold), 3/23 (italic), 4/24 (underline), 5,6/25 (blink),
+  9/29 (strike), 7/27 (reverse) all stored as separate `cur_*` flags. SGR 0 resets all.
+  **Removed bold-as-bright**: old SGR 30-37 color selection no longer adds 8 when `cur_bold`. Bold
+  now only affects font, not color.
+- **Verification**: run `Temp/verify_sgr.ps1` in PowerShell (within ConBox) to see English/Korean
+  bold/italic/underline/strike/blink rendered side-by-side.
+
 ## Cursor rendering
 - **`cursor_type`** (1..6) picks the shape; `set_cursor(type)` maps `0`→the default (3=blinking
   underline, like classic conhost.exe). **Odd=blink, even=fixed** — `set_cursor`/`bump_cursor`/
@@ -152,3 +174,21 @@ To reproduce `calc_cell_size` values (`cell_w`/`natw`/`kwid`):
 - Keep the demo grid at **96×32**; never shrink it. This is **independent of terminal identity** — env
   vars (`WT_SESSION`/`TERM_PROGRAM`) and XTVERSION responses were all tried and reverted. Don't chase
   that path again.
+
+## VT100 escape sequences — implementation notes (INCOMPLETE)
+- **IND (ESC D)**: index. Intended: cursor moves down 1 line; column stays. At scroll region
+  bottom, scroll. Code implemented in vt_feed (VT_ESC case, 1675-1680) BUT **NOT WORKING**.
+  Cursor does not move despite code present. RI (ESC M) works, so issue is specific to IND logic.
+- **NEL (ESC E)**: next line (CR + LF). Intended: cursor to col 0 then down. Code implemented
+  (1682-1688) BUT **NOT WORKING**. Same issue as IND. Related to IND problem.
+- **RIS (ESC c)**: reset to initial state. ✅ WORKING. Clears screen, cursor to 0,0, resets SGR,
+  modes, scroll region, alt screen. Does NOT clear scrollback. Implemented 1684-1694.
+- **CNL (CSI Pn E)**: cursor next line. ✅ WORKING. Move down Pn, col to 0. dispatch_csi:1764.
+- **CPL (CSI Pn F)**: cursor previous line. ✅ WORKING. Move up Pn, col to 0. dispatch_csi:1765.
+- **Unresolved IND/NEL issue**: Code is syntactically correct, compiles, in right location (VT_ESC),
+  but has zero effect. RI works, RIS works, LF works, line_feed() function is fine. Suggests either
+  (a) vt_feed never receives D/E in VT_ESC state, (b) conditions (cur_row == scroll_bot, cur_row <
+  rows-1) always false at time of call, (c) hidden compiler/state issue. Needs debug output (OutputDebugString)
+  to confirm code is reached. See ToDoList.md for full investigation notes.
+- Test scripts: `Temp/test_vt.ps1`, `Temp/quick_test.ps1`, `Temp/test_lf.ps1`, `Temp/test_ris.ps1`,
+  `Temp/test_ri.ps1` (all UTF-8 with BOM).

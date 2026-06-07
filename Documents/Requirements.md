@@ -131,20 +131,39 @@ void print(const char* text);   // UTF-8 bytes, interpreted as VT/ANSI escape se
 - Handles:
   - Glyph output + **autowrap** at `cols`. A line feed at the bottom scrolls (top line → scrollback).
   - **C0**: `\r`, `\n`, `\b`, `\t` (next multiple-of-8 tab stop), BEL ignored.
-  - **CSI**: cursor moves (CUU/CUD/CUF/CUB/CUP/HVP/CHA/VPA), erase (ED/EL), SGR, cursor save/restore,
+  - **CSI**: cursor moves (CUU/CUD/CUF/CUB/CUP/HVP/CHA/VPA/**CNL/CPL**), erase (ED/EL), SGR, cursor save/restore,
     show/hide (DECTCEM `?25`), cursor style (**DECSCUSR** `CSI Ps SP q`; the space intermediate is
     required, so a bare `CSI q` is not it). `Ps` 0..6 maps 1:1 to `set_cursor` types (0 → 1 = blinking
     block), so a child can switch the cursor shape (§8).
-  - **SGR**: 16 base colors + bold(bright) + reverse + **256-color & truecolor**; `0`/`39`/`49`
-    reset to defaults. OSC (title etc.) ignored.
+  - **SGR**: 16 base colors + bold/italic/underline/strikethrough/blink (see §8 for rendering) + reverse
+    + **256-color & truecolor**; `0`/`39`/`49` reset to defaults. OSC (title etc.) ignored.
   - **Full-screen (best-effort)**: alt screen (`?1049`/`?1047`/`?47`, `?1048`), scroll region
     (DECSTBM `CSI r`), IL/DL (`CSI L`/`M`), ICH/DCH (`CSI @`/`P`), ECH (`CSI X`), SU/SD (`CSI S`/`T`).
   - **Queries → child stdin**: DSR cursor pos (`CSI 6 n` → `ESC[row;colR`), terminal status
     (`CSI 5 n`), DA (`CSI c` → VT102-compatible).
+  - **2-char ESC**: DECSC/DECRC (`7`/`8`), RI (`M`), **RIS (`c`)** (resets terminal), ~~IND (`D`), NEL (`E`)~~
+    (implemented but not working; see §6 notes).
   - **Ignored (to avoid misparse)**: `<`/`=`/`>`-prefixed private sequences (2nd DA, kitty keyboard,
     XTMODKEYS, XTVERSION). Their final byte must **not** be mistaken for a standard command
     (e.g. `ESC[<u` must not act as cursor-restore).
 - New output forces the view **scrolled to the bottom**.
+
+---
+
+## 6. Output: Implementation Status
+
+**Fully working:**
+- C0 controls: CR, LF, BS, TAB, BEL
+- CSI cursor moves: A, B, C, D (CUU/CUD/CUF/CUB), G, ` (CHA), H, f (CUP/HVP), d (VPA), **E, F (CNL/CPL)**
+- CSI erase: J, K, X (ED/EL/ECH)
+- Full-screen: L, M, @, P, S, T (IL/DL/ICH/DCH/SU/SD), r (DECSTBM)
+- SGR, modes (h/l), cursor style (q), save/restore (s/u), queries (n, c)
+- 2-char ESC: 7, 8 (DECSC/DECRC), M (RI), **c (RIS)**
+
+**Not working (code present but ineffective):**
+- **2-char ESC D (IND)** — code at ConBox.cpp:1675–1680; cursor does not move
+- **2-char ESC E (NEL)** — code at ConBox.cpp:1682–1688; cursor does not move
+- Root cause unknown; requires debugging with OutputDebugString
 
 ---
 
@@ -160,7 +179,28 @@ void set_bg_color(COLORREF bg);   // background
 
 ---
 
-## 8. Cursor & IME
+## 8. Text Attributes (SGR) & Cursor & IME
+
+### Text Attributes (SGR)
+
+SGR supports text styling attributes applied per cell:
+- **Bold** (SGR 1/22): font weight. If base font weight >= 600 (semi-bold or heavier), bold becomes
+  FW_EXTRABOLD (800) for visible enhancement; otherwise FW_BOLD (700). This allows already-bold fonts
+  (e.g. Malgun Gothic B) to get noticeably thicker on SGR bold.
+- **Italic** (SGR 3/23): font slant (lfItalic = 1).
+- **Underline** (SGR 4/24): drawn as a 1px solid line at the cell bottom, in the cell's foreground color.
+- **Strikethrough** (SGR 9/29): drawn as a 1px solid line at the cell's vertical middle, in the cell's
+  foreground color.
+- **Blink** (SGR 5, 6/25): text toggles visibility at 500ms interval (BLINK_TIMER). Cell glyphs are
+  omitted when blink is "off" (500ms toggle rate); decoration lines (underline/strike) are always drawn.
+- **Reverse** (SGR 7/27): swaps foreground ↔ background (no change to bold/italic/underline/strike/blink).
+- **Reset** (SGR 0): clears all attributes and colors.
+
+Attributes are stored per cell in the grid (CharInfo::flags) so they persist across scrollback and
+survive viewport changes. Bold/italic use pre-created font variants to avoid GDI font construction
+per character. Underline/strike are rasterized each frame (inexpensive 1px fills).
+
+### Cursor & IME
 
 ```cpp
 void set_cursor(int type);                            // shape; 0 = default (see below)
@@ -312,6 +352,11 @@ void set_resize_sink(void (*sink)(int cols, int rows, void* user), void* user);
   index and cell column. Clamps to grid edges. Wide-char trail cells snap to their lead cell.
 - **IME interaction**: mouse-down and right-click force-finalize any active IME composition before
   selection/paste (compose-finalize order maintained).
+- **Drag-and-drop files**: dropping files onto the window types their paths to child stdin (wt.exe
+  behavior). A path with no spaces is sent bare; a path containing spaces is wrapped in `"..."`.
+  Multiple files are space-separated. Any active IME composition is finalized and the selection is
+  cleared before the paths are typed. Implemented via `WM_DROPFILES` / `DragAcceptFiles`; no new
+  public API.
 
 ---
 

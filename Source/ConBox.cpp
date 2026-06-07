@@ -24,7 +24,7 @@
 //   input           : set_input_sink, set_resize_sink, send_input_bytes, send_input_wide,
 //                     terminal_keydown, paste_clipboard, finalize_composition, OnChar, OnKeyDown
 //   mouse selection : hit_test, copy_selection, clear_selection, OnLButtonDown, OnLButtonDblClk,
-//                     OnLButtonUp, OnMouseMove, OnRButtonDown
+//                     OnLButtonUp, OnMouseMove, OnRButtonDown, OnDropFiles
 //   painting        : ensure_back_buffer, OnPaint
 //   child (ConPTY)  : Utf8ToWide/CreatePtyPipes(static), start, write, resize, stop, is_running,
 //                     set_exit_callback, pump, handle_child_exit, child_input_thunk/child_resize_thunk, OnDestroy
@@ -37,14 +37,14 @@
 //
 // [DM] Data model (cell grid)
 //   screen: vector<Row>      current screen, always rows lines x cols cells. Row = vector<CharInfo>.
-//   CharInfo{ wchar_t ch; COLORREF fg,bg; bool wide; }  wide = lead cell of a double-width glyph
-//     (the next cell is its trail, ch=0).
+//   CharInfo{ wchar_t ch; uint8_t flags; COLORREF fg,bg; }  flags: CELL_WIDE|BOLD|ITALIC|UNDERLINE|STRIKE|BLINK
+//     CELL_WIDE = lead cell of double-width glyph (trail has ch=0).
 //   scrollback: deque<Row>   lines pushed off the top (capped at max_scrollback, oldest dropped; deque for O(1) pop_front).
 //   main_saved: vector<Row>  main screen backed up on alt-screen entry (swapped back on leave).
 //   Key state: cur_row/cur_col (0-based screen cell cursor), view_top (top of view, unified index),
 //     cursor_visible (?25), saved_row/col (DECSC/RC), scroll_top/bot (DECSTBM region),
 //     alt_active/saved_main_* (alt screen), cols/rows, cell_w/h/base, margin_*, glyph_level,
-//     vt_state/params/priv/gtlt/space (parser; persists across chunked print()), cur_fg/bg/bold/reverse (SGR),
+//     vt_state/params/priv/gtlt/space (parser; persists across chunked print()), cur_fg/bg/bold/italic/underline/strike/blink/reverse (SGR),
 //     app_cursor_keys/bracketed_paste (input encoding the child turned on via DEC modes),
 //     back_dc/bmp (double buffer). ConPTY: h_pc/in_write/out_read/child_proc/child_running/exit_cb
 //     (dormant when start() is unused).
@@ -59,11 +59,10 @@
 //   print: UTF-8 -> UTF-16, each char fed to the vt_feed state machine; then scroll-to-bottom,
 //     bump cursor, repaint.
 //   vt_feed: GROUND (glyph -> put_char; C0: CR/LF/BS/TAB(mult of 8)/BEL ignored) / ESC (7,8=DECSC/RC,
-//     M=RI, [=CSI, ]=OSC) / CSI (accumulate params, ?=priv, <=>=gtlt, ' '=space (DECSCUSR), final byte
-//     -> dispatch_csi) /
-//     OSC (discard up to BEL/ST).
+//     D=IND, E=NEL, M=RI, c=RIS, [=CSI, ]=OSC) / CSI (accumulate params, ?=priv, <=>=gtlt, ' '=space
+//     (DECSCUSR), final byte -> dispatch_csi) / OSC (discard up to BEL/ST).
 //   dispatch_csi: drops the whole sequence if gtlt (private <>= sequence; avoids final-byte misparse).
-//     Otherwise cursor moves (CUU/CUD/CUF/CUB/CUP/HVP/CHA/VPA), erase ED/EL/ECH, SGR (m), modes h/l
+//     Otherwise cursor moves (CUU/CUD/CUF/CUB/CUP/HVP/CHA/VPA/CNL/CPL), erase ED/EL/ECH, SGR (m), modes h/l
 //     (?25, ?1049/47, ?1048, ?1, ?2004), save/restore (s/u), full-screen (DECSTBM r, IL/DL, ICH/DCH,
 //     SU/SD), queries (DSR n -> CPR/status to input sink, DA c -> VT102).
 //   put_char: autowrap past width, swap colors when reverse, wide glyph sets the next cell to trail.
@@ -135,10 +134,12 @@
 #endif
 
 static const UINT_PTR CURSOR_TIMER = 1;
-// Child output polling timer (the one start() sets). 3 to stay distinct from CURSOR(1).
+// SGR blink (CELL_BLINK) visibility toggle. 2 is unused by other timers.
+static const UINT_PTR BLINK_TIMER = 2;
+// Child output polling timer (the one start() sets). 3 to stay distinct from CURSOR(1)/BLINK(2).
 static const UINT_PTR PUMP_TIMER = 3;
 static const UINT PUMP_INTERVAL_MS = 16;   // output poll interval; 16~30 keeps the view smooth
-// Overlay scrollbar fade timer. 4 to stay distinct from CURSOR(1)/PUMP(3).
+// Overlay scrollbar fade timer. 4 to stay distinct from CURSOR(1)/BLINK(2)/PUMP(3).
 static const UINT_PTR SBAR_TIMER = 4;
 
 // Overlay scrollbar geometry/fade tuning (px / ms / alpha). Tuned to read like wt.exe: a slim, rounded,
@@ -181,6 +182,7 @@ BEGIN_MESSAGE_MAP(CConBox, CWnd)
 	ON_WM_MOUSEMOVE()
 	ON_WM_MOUSELEAVE()
 	ON_WM_RBUTTONDOWN()
+	ON_WM_DROPFILES()
 	ON_MESSAGE(WM_IME_STARTCOMPOSITION, &CConBox::OnImeStart)
 	ON_MESSAGE(WM_IME_COMPOSITION, &CConBox::OnImeComp)
 	ON_MESSAGE(WM_IME_ENDCOMPOSITION, &CConBox::OnImeEnd)
@@ -484,7 +486,12 @@ CConBox::CConBox()
 	vt_space = false;
 	ime_committed = false;
 	cur_bold = false;
+	cur_italic = false;
+	cur_underline = false;
+	cur_strike = false;
+	cur_blink = false;
 	cur_reverse = false;
+	blink_on = true;
 
 	// Input modes default off; the child turns them on.
 	app_cursor_keys = false;
@@ -674,8 +681,8 @@ static void CreateDefaultIni(const wchar_t* path)
 		"margin_left   = 10              ; \xEC\x99\xBC\xEC\xAA\xBD \xEC\x97\xAC\xEB\xB0\xB1\n"
 		"margin_bottom = 10              ; \xEC\x95\x84\xEB\x9E\x98\xEC\xAA\xBD \xEC\x97\xAC\xEB\xB0\xB1\n"
 		"margin_right  = 10              ; \xEC\x98\xA4\xEB\xA5\xB8\xEC\xAA\xBD \xEC\x97\xAC\xEB\xB0\xB1\n"
-		"adjust_left   = 0               ; \xEC\x85\x80 \xEC\x99\xBC\xEC\xAA\xBD \xED\x8C\xA8\xEB\x94\xA9 (\xEA\xB8\x80\xEC\x9E\x90\xEB\x8F\x84 \xEC\x98\xA4\xEB\xA5\xB8\xEC\xAA\xBD\xEC\x9C\xBC\xEB\xA1\x9C \xEC\x9D\xB4\xEB\x8F\x99)\n"
-		"adjust_top    = 0               ; \xEC\x85\x80 \xEC\x9C\x84\xEC\xAA\xBD \xED\x8C\xA8\xEB\x94\xA9 (\xEA\xB8\x80\xEC\x9E\x90\xEB\x8F\x84 \xEC\x95\x84\xEB\x9E\x98\xEB\xA1\x9C \xEC\x9D\xB4\xEB\x8F\x99)\n"
+		"adjust_left   = 0               ; \xEC\x85\x80 \xEC\x99\xBC\xEC\xAA\xBD \xED\x8C\xA8\xEB\x94\xA9\n"
+		"adjust_top    = 0               ; \xEC\x85\x80 \xEC\x9C\x84\xEC\xAA\xBD \xED\x8C\xA8\xEB\x94\xA9\n"
 		"adjust_right  = 0               ; \xEC\x85\x80 \xEC\x98\xA4\xEB\xA5\xB8\xEC\xAA\xBD \xED\x8C\xA8\xEB\x94\xA9\n"
 		"adjust_bottom = 0               ; \xEC\x85\x80 \xEC\x95\x84\xEB\x9E\x98\xEC\xAA\xBD \xED\x8C\xA8\xEB\x94\xA9\n"
 		"grid_cols     = 96              ; \xEA\xB0\x80\xEB\xA1\x9C \xEC\xB9\xB8 \xEC\x88\x98\n"
@@ -818,10 +825,15 @@ void CConBox::open(CWnd* parent, int x0, int y0, int x1, int y1)
 	update_metrics();
 	update_scrollbar();
 
-	// The window exists now, so start the blink timer. Interval 0 (system blink off) = always on.
+	// Accept drag-and-drop files so OnDropFiles can type their paths to the child.
+	DragAcceptFiles(TRUE);
+
+	// The window exists now, so start the blink timers. Cursor interval 0 = always on.
 	cursor_on = true;
 	if (cursor_blink_ms > 0)
 		SetTimer(CURSOR_TIMER, cursor_blink_ms, NULL);
+	blink_on = true;
+	SetTimer(BLINK_TIMER, 500, NULL);   // SGR blink: 500ms toggle (always running)
 }
 
 void CConBox::make_font(CFont& font, LOGFONTW& lf_out, int& width_pct, const char* name, float size, const char* opts)
@@ -835,15 +847,34 @@ void CConBox::make_font(CFont& font, LOGFONTW& lf_out, int& width_pct, const cha
 	font.CreateFontIndirectW(&lf_out);
 }
 
+// Create a bold/italic variant of base_lf. If base lfWeight >= 600, bold uses FW_EXTRABOLD (800)
+// to get visually bolder; otherwise FW_BOLD (700). This allows SGR bold on already-bold fonts
+// (e.g. Malgun Gothic B) to become noticeably thicker.
+static void MakeFontVariant(CFont& font, LOGFONTW lf, bool bold, bool italic)
+{
+	if (bold)   lf.lfWeight = (lf.lfWeight >= 600) ? FW_EXTRABOLD : FW_BOLD;
+	if (italic) lf.lfItalic = 1;
+	font.DeleteObject();
+	font.CreateFontIndirectW(&lf);
+}
+
 void CConBox::apply_default_fonts()
 {
 	// Defaults: English Cascadia Mono 12pt normal, Korean Malgun Gothic normal (wt.exe Claude profile).
 	// Korean size 0 = match-English-height mode (kfont_match_efont=true in the ctor), consistent with
 	// the "size<=0 means match" rule.
-	if (efont.GetSafeHandle() == NULL)
+	if (efont.GetSafeHandle() == NULL) {
 		make_font(efont, efont_lf, efont_width_pct, "Cascadia Mono", 12, "");
-	if (kfont.GetSafeHandle() == NULL)
+		MakeFontVariant(efont_bold,        efont_lf, true,  false);
+		MakeFontVariant(efont_italic,      efont_lf, false, true);
+		MakeFontVariant(efont_bold_italic, efont_lf, true,  true);
+	}
+	if (kfont.GetSafeHandle() == NULL) {
 		make_font(kfont, kfont_lf, kfont_width_pct, "Malgun Gothic", 0, "");
+		MakeFontVariant(kfont_bold,        kfont_lf, true,  false);
+		MakeFontVariant(kfont_italic,      kfont_lf, false, true);
+		MakeFontVariant(kfont_bold_italic, kfont_lf, true,  true);
+	}
 }
 
 // (design: [FONT])
@@ -954,6 +985,9 @@ void CConBox::calc_cell_size()
 void CConBox::set_efont(const char* name, float size, const char* opts)
 {
 	make_font(efont, efont_lf, efont_width_pct, name, size, opts);
+	MakeFontVariant(efont_bold,        efont_lf, true,  false);
+	MakeFontVariant(efont_italic,      efont_lf, false, true);
+	MakeFontVariant(efont_bold_italic, efont_lf, true,  true);
 
 	// Cell size changed; recompute the grid if the window is up.
 	if (::IsWindow(m_hWnd)) {
@@ -965,6 +999,9 @@ void CConBox::set_efont(const char* name, float size, const char* opts)
 void CConBox::set_kfont(const char* name, float size, const char* opts)
 {
 	make_font(kfont, kfont_lf, kfont_width_pct, name, size, opts);
+	MakeFontVariant(kfont_bold,        kfont_lf, true,  false);
+	MakeFontVariant(kfont_italic,      kfont_lf, false, true);
+	MakeFontVariant(kfont_bold_italic, kfont_lf, true,  true);
 
 	// size<=0 turns on match mode (size ignored); positive turns it off. Match mode changes line
 	// height (cell_h), so the grid is recomputed below.
@@ -1099,6 +1136,11 @@ void CConBox::OnTimer(UINT_PTR id)
 		CRect rc;
 		if (get_cursor_rect(rc))
 			InvalidateRect(&rc, FALSE);
+		return;
+	}
+	if (id == BLINK_TIMER) {
+		blink_on = !blink_on;
+		Invalidate(FALSE);   // whole view: blink cells may be anywhere
 		return;
 	}
 	if (id == PUMP_TIMER) {
@@ -1257,9 +1299,9 @@ Row CConBox::blank_row() const
 	// Filled with the current SGR background so erase/scroll follow the background color.
 	CharInfo c;
 	c.ch = L' ';
+	c.flags = 0;
 	c.fg = cur_fg;
 	c.bg = cur_bg;
-	c.wide = false;
 	return Row(cols < 1 ? 1 : cols, c);
 }
 
@@ -1269,9 +1311,9 @@ void CConBox::reset_screen()
 	// the row count adjusted to rows (cell-level pad/truncate only; no fine reflow).
 	CharInfo blank;
 	blank.ch = L' ';
+	blank.flags = 0;
 	blank.fg = cur_fg;
 	blank.bg = cur_bg;
-	blank.wide = false;
 
 	for (size_t r = 0; r < screen.size(); ++r) {
 		Row& line = screen[r];
@@ -1323,9 +1365,9 @@ void CConBox::erase_cells(int row, int c0, int c1)
 	if (c1 > (int)line.size()) c1 = (int)line.size();
 	for (int c = c0; c < c1; ++c) {
 		line[c].ch = L' ';
+		line[c].flags = 0;
 		line[c].fg = cur_fg;
 		line[c].bg = cur_bg;
-		line[c].wide = false;
 	}
 }
 
@@ -1392,10 +1434,11 @@ void CConBox::line_feed()
 {
 	// At the region bottom, scroll the region up (cursor stays on that line); otherwise advance one
 	// line without leaving the screen.
-	if (cur_row == scroll_bot)
+	if (cur_row == scroll_bot) {
 		scroll_up_region(1);
-	else if (cur_row < rows - 1)
-		cur_row++;
+	} else {
+		if (cur_row < rows - 1) cur_row++;
+	}
 }
 
 void CConBox::insert_lines(int n)
@@ -1435,7 +1478,7 @@ void CConBox::insert_chars(int n)
 	if (n > (int)line.size() - c) n = (int)line.size() - c;
 
 	CharInfo blank;
-	blank.ch = L' '; blank.fg = cur_fg; blank.bg = cur_bg; blank.wide = false;
+	blank.ch = L' '; blank.flags = 0; blank.fg = cur_fg; blank.bg = cur_bg;
 	line.insert(line.begin() + c, n, blank);
 	line.resize(cols, blank);   // drop overflow to keep line width = cols
 }
@@ -1454,7 +1497,7 @@ void CConBox::delete_chars(int n)
 	if (n > (int)line.size() - c) n = (int)line.size() - c;
 
 	CharInfo blank;
-	blank.ch = L' '; blank.fg = cur_fg; blank.bg = cur_bg; blank.wide = false;
+	blank.ch = L' '; blank.flags = 0; blank.fg = cur_fg; blank.bg = cur_bg;
 	line.erase(line.begin() + c, line.begin() + c + n);
 	line.resize(cols, blank);   // refill the end to keep line width = cols
 }
@@ -1511,18 +1554,23 @@ void CConBox::put_char(wchar_t wc)
 	// reverse swaps fg/bg into the cell.
 	COLORREF fg = cur_reverse ? cur_bg : cur_fg;
 	COLORREF bg = cur_reverse ? cur_fg : cur_bg;
+	uint8_t attr = (cur_bold      ? CELL_BOLD      : 0)
+	             | (cur_italic    ? CELL_ITALIC    : 0)
+	             | (cur_underline ? CELL_UNDERLINE : 0)
+	             | (cur_strike    ? CELL_STRIKE    : 0)
+	             | (cur_blink     ? CELL_BLINK     : 0);
 
 	Row& line = screen[cur_row];
 	if (cur_col >= 0 && cur_col < (int)line.size()) {
 		line[cur_col].ch = wc;
+		line[cur_col].flags = attr | (w == 2 ? CELL_WIDE : 0);
 		line[cur_col].fg = fg;
 		line[cur_col].bg = bg;
-		line[cur_col].wide = (w == 2);
 		if (w == 2 && cur_col + 1 < (int)line.size()) {
 			line[cur_col + 1].ch = 0;   // trail cell (the lead draws both)
+			line[cur_col + 1].flags = attr;   // no CELL_WIDE on trail
 			line[cur_col + 1].fg = fg;
 			line[cur_col + 1].bg = bg;
-			line[cur_col + 1].wide = false;
 		}
 	}
 	cur_col += w;
@@ -1624,6 +1672,32 @@ void CConBox::vt_feed(wchar_t wc)
 			else if (cur_row > 0) cur_row--;
 			vt_state = VT_GROUND; return;
 		}
+		if (wc == L'D') {   // IND: index -- move down (opposite of RI)
+			if (cur_row == scroll_bot) scroll_up_region(1);
+			else if (cur_row < rows - 1) cur_row++;
+			vt_state = VT_GROUND; return;
+		}
+		if (wc == L'E') {   // NEL: next line (CR + LF)
+			cur_col = 0;
+			if (cur_row == scroll_bot)
+				scroll_up_region(1);
+			else if (cur_row < rows - 1)
+				cur_row++;
+			vt_state = VT_GROUND; return;
+		}
+		if (wc == L'c') {   // RIS: reset to initial state
+			cur_row = 0; cur_col = 0;
+			saved_row = 0; saved_col = 0;
+			scroll_top = 0; scroll_bot = rows - 1;
+			app_cursor_keys = false;
+			bracketed_paste = false;
+			cursor_visible = true;
+			cur_fg = default_fg; cur_bg = default_bg;
+			cur_bold = cur_italic = cur_underline = cur_strike = cur_blink = cur_reverse = false;
+			for (int r = 0; r < rows; ++r) erase_cells(r, 0, cols);
+			if (alt_active) leave_alt_screen();
+			vt_state = VT_GROUND; return;
+		}
 		// Other ESC sequences (standalone / 2-byte) ignored.
 		vt_state = VT_GROUND;
 		return;
@@ -1685,6 +1759,8 @@ void CConBox::dispatch_csi(wchar_t fin)
 	case L'B': { int d = n ? n : 1; cur_row += d; clamp_cursor(); break; }   // CUD
 	case L'C': { int d = n ? n : 1; cur_col += d; if (cur_col > cols - 1) cur_col = cols - 1; break; }  // CUF
 	case L'D': { int d = n ? n : 1; cur_col -= d; if (cur_col < 0) cur_col = 0; break; }   // CUB
+	case L'E': { int d = n ? n : 1; cur_row += d; cur_col = 0; clamp_cursor(); break; }   // CNL
+	case L'F': { int d = n ? n : 1; cur_row -= d; cur_col = 0; clamp_cursor(); break; }   // CPL
 
 	case L'H':
 	case L'f': {   // CUP / HVP (1-based -> 0-based)
@@ -1760,17 +1836,26 @@ void CConBox::dispatch_csi(wchar_t fin)
 		if (vt_nparam == 0) {
 			// No params = reset (SGR 0).
 			cur_fg = default_fg; cur_bg = default_bg;
-			cur_bold = false; cur_reverse = false;
+			cur_bold = cur_italic = cur_underline = cur_strike = cur_blink = cur_reverse = false;
 			break;
 		}
 		for (int i = 0; i < vt_nparam; ++i) {
 			int p = vt_params[i];
-			if (p == 0) { cur_fg = default_fg; cur_bg = default_bg; cur_bold = false; cur_reverse = false; }
-			else if (p == 1) cur_bold = true;
+			if (p == 0)  { cur_fg = default_fg; cur_bg = default_bg;
+			               cur_bold = cur_italic = cur_underline = cur_strike = cur_blink = cur_reverse = false; }
+			else if (p == 1)  cur_bold = true;
+			else if (p == 3)  cur_italic = true;
+			else if (p == 4)  cur_underline = true;
+			else if (p == 5 || p == 6) cur_blink = true;
+			else if (p == 7)  cur_reverse = true;
+			else if (p == 9)  cur_strike = true;
 			else if (p == 22) cur_bold = false;
-			else if (p == 7) cur_reverse = true;
+			else if (p == 23) cur_italic = false;
+			else if (p == 24) cur_underline = false;
+			else if (p == 25) cur_blink = false;
 			else if (p == 27) cur_reverse = false;
-			else if (p >= 30 && p <= 37) cur_fg = Xterm256ToRgb((cur_bold ? 8 : 0) + (p - 30), ansi_colors);
+			else if (p == 29) cur_strike = false;
+			else if (p >= 30 && p <= 37) cur_fg = Xterm256ToRgb(p - 30, ansi_colors);
 			else if (p >= 40 && p <= 47) cur_bg = Xterm256ToRgb(p - 40, ansi_colors);
 			else if (p >= 90 && p <= 97) cur_fg = Xterm256ToRgb(8 + (p - 90), ansi_colors);
 			else if (p >= 100 && p <= 107) cur_bg = Xterm256ToRgb(8 + (p - 100), ansi_colors);
@@ -2481,6 +2566,35 @@ void CConBox::OnRButtonDown(UINT flags, CPoint pt)
 	paste_clipboard();
 }
 
+void CConBox::OnDropFiles(HDROP hdrop)
+{
+	// Type dropped file paths to the child stdin (wt.exe behavior).
+	// Paths with spaces are wrapped in double quotes; multiple files are space-separated.
+	if (input_sink == nullptr) {
+		DragFinish(hdrop);
+		return;
+	}
+	finalize_composition();
+	clear_selection();
+	UINT n = DragQueryFileW(hdrop, 0xFFFFFFFF, nullptr, 0);
+	for (UINT i = 0; i < n; ++i) {
+		UINT len = DragQueryFileW(hdrop, i, nullptr, 0);
+		if (len == 0)
+			continue;
+		std::vector<wchar_t> buf(len + 1);
+		DragQueryFileW(hdrop, i, buf.data(), len + 1);
+		bool has_space = (wcschr(buf.data(), L' ') != nullptr);
+		if (i > 0)
+			send_input_bytes(" ", 1);
+		if (has_space)
+			send_input_bytes("\"", 1);
+		send_input_wide(buf.data(), (int)len);
+		if (has_space)
+			send_input_bytes("\"", 1);
+	}
+	DragFinish(hdrop);
+}
+
 LRESULT CConBox::OnImeStart(WPARAM w, LPARAM l)
 {
 	// Move the composition/candidate windows to the cursor and set the composing font to Korean. We
@@ -2957,7 +3071,7 @@ void CConBox::OnPaint()
 		// The cell index (i) is the visual column. A wide glyph fills its trail cell and skips it.
 		for (int i = 0; i < ncell; ++i) {
 			const CharInfo& c = line[i];
-			int w = c.wide ? 2 : 1;
+			int w = (c.flags & CELL_WIDE) ? 2 : 1;
 
 			int px = margin_left + i * cell_w;
 			int py = margin_top + row * cell_h;
@@ -2987,19 +3101,29 @@ void CConBox::OnPaint()
 			dc.FillSolidRect(cell, bg);
 
 			// Blank cells and wide trail cells (ch=0) draw no glyph. Others draw as a shape (block/box)
-			// or via the font (wide uses the Korean font).
-			if (c.ch != 0 && c.ch != L' ') {
+			// or via the font (wide -> Korean font; bold/italic -> variant font).
+			if (c.ch != 0 && c.ch != L' ' && !(c.flags & CELL_BLINK && !blink_on)) {
 				bool drawn = false;
 				if (glyph_level >= 1)
 					drawn = DrawBlockElement(dc, c.ch, px, py, cell_w, cell_h, fg);
 				if (!drawn && glyph_level >= 2)
 					drawn = DrawBoxLine(dc, c.ch, px, py, cell_w, cell_h, fg);
 				if (!drawn) {
-					dc.SelectObject(c.wide ? &kfont : &efont);
+					bool cb = (c.flags & CELL_BOLD)   != 0;
+					bool ci = (c.flags & CELL_ITALIC) != 0;
+					bool cw = (c.flags & CELL_WIDE)   != 0;
+					CFont* f = cw ? (cb && ci ? &kfont_bold_italic : cb ? &kfont_bold : ci ? &kfont_italic : &kfont)
+					              : (cb && ci ? &efont_bold_italic : cb ? &efont_bold : ci ? &efont_italic : &efont);
+					dc.SelectObject(f);
 					dc.SetTextColor(fg);
 					dc.TextOutW(px + adjust_left, py + cell_base, &c.ch, 1);
 				}
 			}
+			// Underline and strikethrough decoration lines (drawn even on space/trail cells).
+			if (c.flags & CELL_UNDERLINE)
+				dc.FillSolidRect(CRect(px, py + cell_h - 1, px + w * cell_w, py + cell_h), fg);
+			if (c.flags & CELL_STRIKE)
+				dc.FillSolidRect(CRect(px, py + cell_h / 2, px + w * cell_w, py + cell_h / 2 + 1), fg);
 
 			if (w == 2) ++i;   // skip the trail cell
 		}
@@ -3120,9 +3244,14 @@ void CConBox::OnPaint()
 				int x = cur.left;
 				for (int i = cur_col; i < (int)line.size() && x < cur.right; ++i) {
 					const CharInfo& cc = line[i];
-					int w = cc.wide ? 2 : 1;
+					int w = (cc.flags & CELL_WIDE) ? 2 : 1;
 					if (cc.ch != 0 && cc.ch != L' ') {
-						dc.SelectObject(cc.wide ? &kfont : &efont);
+						bool cb = (cc.flags & CELL_BOLD)   != 0;
+						bool ci = (cc.flags & CELL_ITALIC) != 0;
+						bool cw = (cc.flags & CELL_WIDE)   != 0;
+						CFont* f = cw ? (cb && ci ? &kfont_bold_italic : cb ? &kfont_bold : ci ? &kfont_italic : &kfont)
+						              : (cb && ci ? &efont_bold_italic : cb ? &efont_bold : ci ? &efont_italic : &efont);
+						dc.SelectObject(f);
 						bool cdrawn = (glyph_level >= 1 && DrawBlockElement(dc, cc.ch, x, cur.top, cell_w, cell_h, cur_fg))
 						           || (glyph_level >= 2 && DrawBoxLine(dc, cc.ch, x, cur.top, cell_w, cell_h, cur_fg));
 						if (!cdrawn)
@@ -3453,6 +3582,7 @@ void CConBox::OnDestroy()
 {
 	// Clean up child/polling timer before the window is destroyed (so polling never touches a dying window).
 	stop();
+	KillTimer(BLINK_TIMER);
 	KillTimer(SBAR_TIMER);
 	CWnd::OnDestroy();
 }
