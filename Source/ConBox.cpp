@@ -125,7 +125,7 @@
 //   A new VT sequence = add a branch in dispatch_csi/vt_feed (cells are COLORREF, so 16/256/truecolor
 //   are expressible). New helpers go in the static block atop this file (keep the portability unit two
 //   files). On font/window/margin/width changes the order is calc_cell_size (font) -> update_metrics
-//   (-> reset_screen). UTF-8 split across an output chunk boundary can corrupt a glyph (rare). Korean
+//   (-> reset_screen). UTF-8 chunk-boundary split handled by utf8_tail carry-over in print(). Korean
 //   IME order / cursor width cannot be auto-captured -> verify by real typing (Learned.md).
 // ===== END DESIGN OVERVIEW =====
 
@@ -490,6 +490,7 @@ CConBox::CConBox()
 	saved_main_row = 0;
 	saved_main_col = 0;
 
+	utf8_tail_len = 0;
 	vt_state = VT_GROUND;
 	vt_nparam = 0;
 	vt_priv = false;
@@ -1644,19 +1645,54 @@ void CConBox::print(const char* text)
 	if (text == nullptr)
 		return;
 
-	int wlen = ::MultiByteToWideChar(CP_UTF8, 0, text, -1, NULL, 0);
-	if (wlen <= 1)
-		return;   // empty or conversion failure
+	// Prepend any incomplete UTF-8 lead bytes carried over from the previous call, then detect and
+	// save any new trailing incomplete sequence before converting.  This prevents MultiByteToWideChar
+	// from substituting U+FFFD when a multi-byte sequence is split across two pump() chunks.
+	int raw_len = (int)strlen(text);
+	if (raw_len == 0 && utf8_tail_len == 0)
+		return;
+
+	// Build working buffer: tail bytes + new bytes.
+	std::string buf;
+	buf.reserve(utf8_tail_len + raw_len);
+	if (utf8_tail_len > 0)
+		buf.append(utf8_tail, utf8_tail_len);
+	buf.append(text, raw_len);
+	utf8_tail_len = 0;
+
+	// Detect trailing incomplete UTF-8 sequence.
+	// Walk backward up to 3 bytes to find a lead byte whose required sequence length exceeds what
+	// remains in the buffer; if found, move those bytes into utf8_tail.
+	int blen = (int)buf.size();
+	for (int back = 1; back <= 3 && back <= blen; ++back) {
+		unsigned char b = (unsigned char)buf[blen - back];
+		if (b < 0x80) break;             // plain ASCII byte; no incomplete sequence possible
+		if (b >= 0xC0) {                 // lead byte found
+			int need = (b >= 0xF0) ? 4 : (b >= 0xE0) ? 3 : 2;
+			if (back < need) {           // fewer bytes present than the sequence requires
+				utf8_tail_len = back;
+				memcpy(utf8_tail, buf.data() + blen - back, back);
+				buf.resize(blen - back);
+			}
+			break;
+		}
+		// continuation byte (0x80-0xBF): keep walking back toward the lead
+	}
+
+	int wlen = ::MultiByteToWideChar(CP_UTF8, 0, buf.data(), (int)buf.size(), NULL, 0);
+	if (wlen <= 0)
+		return;
 
 	std::vector<wchar_t> ws(wlen);
-	::MultiByteToWideChar(CP_UTF8, 0, text, -1, ws.data(), wlen);
+	::MultiByteToWideChar(CP_UTF8, 0, buf.data(), (int)buf.size(), ws.data(), wlen);
 
 	// Create the screen if it does not exist yet (before font/window is fixed).
 	if (screen.empty())
 		reset_screen();
 
-	// Feed each char to the VT parser (skip the trailing null terminator).
-	for (int i = 0; i < wlen - 1; ++i)
+	// Feed each wchar_t to the VT parser.  No null terminator in output (explicit byte length was
+	// passed to MultiByteToWideChar), so iterate over all wlen chars.
+	for (int i = 0; i < wlen; ++i)
 		vt_feed(ws[i]);
 
 	// New output invalidates any selection (cell positions moved); clear it, scroll to bottom, repaint.
@@ -3177,26 +3213,35 @@ void CConBox::OnPaint()
 				if (in_sel) std::swap(fg, bg);
 			}
 
-			// Fill the cell background (2 cells together if wide).
-			CRect cell(px, py, px + w * cell_w, py + cell_h);
+			// Fill the cell background. CELL_DOUBLE bleeds right (2x width) and upward (1 row):
+			// extend the bg rect to cover the full bleed area so the glyph interior shows
+			// the correct bg color. The row above is expected blank per spec; overpainting it
+			// is intentional. GDI clips automatically if py-cell_h < 0 (first row).
+			CRect cell = (c.flags & CELL_DOUBLE)
+				? CRect(px, py - cell_h, px + 2 * w * cell_w, py + cell_h)
+				: CRect(px, py, px + w * cell_w, py + cell_h);
 			dc.FillSolidRect(cell, bg);
 
 			// Blank cells and wide trail cells (ch=0) draw no glyph. Others draw as a shape (block/box)
 			// or via the font (wide -> Korean font; bold/italic -> variant font).
 			// CELL_DOUBLE: drawn inline (right-to-left column order makes the bleed safe; see above).
 			if (c.flags & CELL_DOUBLE) {
+				int dw = 2 * w * cell_w;
+				int dbl_base = cell_base + adjust_top;
+				// Glyph skipped for blank/trail (ch=0/' ') and blink-off; decorations always drawn.
 				if (c.ch != 0 && c.ch != L' ' && !(c.flags & CELL_BLINK && !blink_on)) {
 					bool cw = (c.flags & CELL_WIDE) != 0;
 					dc.SelectObject(cw ? &kfont_double : &efont_double);
 					dc.SetTextColor(fg);
-					dc.TextOutW(px + adjust_left, py + cell_base, &c.ch, 1);
-					int dw = 2 * w * cell_w;
-					if (c.flags & CELL_UNDERLINE)
-						dc.FillSolidRect(CRect(px, py + cell_base + 2, px + dw, py + cell_base + 4), fg);
-					if (c.flags & CELL_STRIKE) {
-						int my = py + cell_base - cell_h / 2;
-						dc.FillSolidRect(CRect(px, my, px + dw, my + 2), fg);
-					}
+					// adjust is scaled 2x for double-size glyphs (left/top position; right/bottom
+					// are already 2x via dw = 2*w*cell_w which uses the adjusted cell_w).
+					dc.TextOutW(px + 2 * adjust_left, py + dbl_base, &c.ch, 1);
+				}
+				if (c.flags & CELL_UNDERLINE)
+					dc.FillSolidRect(CRect(px, py + cell_h - 2, px + dw, py + cell_h), fg);
+				if (c.flags & CELL_STRIKE) {
+					int my = py + dbl_base - cell_h / 2;
+					dc.FillSolidRect(CRect(px, my, px + dw, my + 2), fg);
 				}
 			} else {
 				if (c.ch != 0 && c.ch != L' ' && !(c.flags & CELL_BLINK && !blink_on)) {

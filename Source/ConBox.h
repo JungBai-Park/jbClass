@@ -494,6 +494,8 @@ private:
 	int  saved_main_col;
 
 	// VT parser state (members so a sequence survives across chunked print() calls).
+	char utf8_tail[3];            // trailing incomplete UTF-8 lead bytes carried over from previous print()
+	int  utf8_tail_len;           // 0 = none pending; max 3 (a 4-byte sequence needs at most 3 lead bytes)
 	int  vt_state;                // 0=GROUND 1=ESC 2=CSI 3=OSC
 	int  vt_params[16];           // CSI numeric params
 	int  vt_nparam;

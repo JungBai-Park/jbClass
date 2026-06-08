@@ -141,6 +141,18 @@ To reproduce `calc_cell_size` values (`cell_w`/`natw`/`kwid`):
   acts only when `vt_space`. `Ps` 0..6 maps 1:1 to `set_cursor` (0→1). Test from the child:
   `$e=[char]27; Write-Host "$e[5 q" -NoNewline` then Enter (note the space before `q`).
 
+## UTF-8 chunk-boundary fix in print()
+- `pump()` delivers child output in arbitrary-sized chunks. A 3-byte UTF-8 sequence (e.g. ─ = U+2500 =
+  `E2 94 80`) can be split across two consecutive `print()` calls. Without carry-over, `MultiByteToWideChar`
+  produces U+FFFD for the incomplete fragment — stored in the cell grid → 3 garbled glyphs on screen +
+  `���` in the clipboard when dragging.
+- Fix: `utf8_tail[3]` / `utf8_tail_len` members (initialized to 0 in the ctor). Each `print()` call
+  prepends saved tail bytes, then trims any new trailing incomplete sequence into `utf8_tail` before
+  calling `MultiByteToWideChar`. The VT parser loop now iterates `wlen` (not `wlen-1`) because explicit
+  byte-length conversion omits the null terminator from the output count.
+- U+0000 (NUL byte) **never** appears inside a multi-byte UTF-8 sequence, so `strlen()` is safe for
+  measuring the input in `print()`.
+
 ## Input edge cases
 - **Ctrl+V / Ctrl+C double-send**: both `WM_KEYDOWN` and `WM_CHAR` fire. `terminal_keydown`
   special-cases these (paste / copy-or-interrupt), so `OnChar` must **drop** their WM_CHAR control
