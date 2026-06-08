@@ -28,6 +28,11 @@ Paths are relative to the project root. When a detail is unspecified, follow **W
   (ConPTY API) **only if `start()` is called** — the control functions as a pure view (log/diagnostic
   display) on any Win10 without ConPTY if `start()` is never invoked. Both files are **ASCII**
   (comments ASCII-only, so no BOM needed).
+- **Known limitation**: runtime resize (WM_SIZE changing cols/rows while scrollback+screen content exists)
+  does **not** reflow wrapped lines. Each existing Row is padded/truncated to the new cols width but not
+  merged/split to undo autowrap. Reflow (rewrapping all lines to fit a new width) is not implemented.
+  To avoid confusion, keep the window size fixed during child execution, or restart the child after
+  resizing. This differs from Windows Terminal, which does reflow.
 
 ---
 
@@ -141,7 +146,8 @@ void print(const char* text);   // UTF-8 bytes, interpreted as VT/ANSI escape se
     required, so a bare `CSI q` is not it). `Ps` 0..6 maps 1:1 to `set_cursor` types (0 → 1 = blinking
     block), so a child can switch the cursor shape (§8).
   - **SGR**: 16 base colors + bold/italic/underline/strikethrough/blink (see §8 for rendering) + reverse
-    + **256-color & truecolor**; `0`/`39`/`49` reset to defaults. OSC (title etc.) ignored.
+    + **256-color & truecolor** + **double-size (SGR 8/28, see §8)**; `0`/`39`/`49` reset to defaults.
+    OSC (title etc.) ignored.
   - **Full-screen (best-effort)**: alt screen (`?1049`/`?1047`/`?47`, `?1048`), scroll region
     (DECSTBM `CSI r`), IL/DL (`CSI L`/`M`), ICH/DCH (`CSI @`/`P`), ECH (`CSI X`), SU/SD (`CSI S`/`T`).
   - **Queries → child stdin**: DSR cursor pos (`CSI 6 n` → `ESC[row;colR`), terminal status
@@ -199,11 +205,26 @@ SGR supports text styling attributes applied per cell:
 - **Blink** (SGR 5, 6/25): text toggles visibility at 500ms interval (BLINK_TIMER). Cell glyphs are
   omitted when blink is "off" (500ms toggle rate); decoration lines (underline/strike) are always drawn.
 - **Reverse** (SGR 7/27): swaps foreground ↔ background (no change to bold/italic/underline/strike/blink).
-- **Reset** (SGR 0): clears all attributes and colors.
+- **Double-size** (SGR 8 on / SGR 28 off): renders the glyph at **2x** width and height, **always
+  bold** (bold/italic SGR is ignored on double cells). For titles emitted by a child. The cell grid
+  stays fixed (one logical cell per char); the 2x glyph keeps the same baseline so it **bleeds upward**
+  (2x ascent) and **rightward** (2x width) over neighbor cells. The child must leave a **blank line
+  above** (upward bleed room); no spaces between big chars are needed — `put_char` auto-advances the
+  cursor by `w*2` in double mode (English +2 cells, Korean +4 cells). English = 2x2 cells, Korean =
+  4x2 cells. Underline/strike are supported (drawn spanning the doubled width). Color applies normally.
+  - **Why SGR 8/28 (not a new code)**: a custom/non-standard SGR (133/134) is **stripped by the inbox
+    conhost** on the ConPTY child path (same as IND/NEL, §6 notes / Learned.md), so a child could never
+    trigger it. SGR 8 (conceal) / 28 (reveal) are *standard* codes ConBox does not otherwise implement,
+    and conhost passes them through. Trade-off: a child using SGR 8 for true conceal gets big text
+    instead (conceal is rarely used).
+  - **Rendering**: columns rendered right-to-left in OnPaint so each double glyph's rightward bleed
+    overwrites already-drawn (blank) cells and is not erased by later cells in the same row.
+- **Reset** (SGR 0): clears all attributes and colors (including double-size).
 
 Attributes are stored per cell in the grid (CharInfo::flags) so they persist across scrollback and
 survive viewport changes. Bold/italic use pre-created font variants to avoid GDI font construction
-per character. Underline/strike are rasterized each frame (inexpensive 1px fills).
+per character. Underline/strike are rasterized each frame (inexpensive 1px fills). The 2x font
+variants (efont_double/kfont_double) are built in calc_cell_size once fonts are finalized.
 
 ### Cursor & IME
 
@@ -379,8 +400,8 @@ void set_resize_sink(void (*sink)(int cols, int rows, void* user), void* user);
   (ConBox source stays demo-free).
 - No OK/Cancel; ConBox fills the client area with a **5px** bezel margin. Titlebar has min/max;
   resizing the window resizes ConBox.
-- On startup `con_box.config("../../Documents/Config.ini")` is called before `open()`; all font,
-  color, cursor, margin, grid-size, and cmdline settings come from the INI file. Individual
+- On startup `con_box.setup_from_ini("../../Documents/ConBox.ini")` is called before `open()`; all
+  font, color, cursor, margin, grid-size, and cmdline settings come from the INI file. Individual
   `set_efont`/`set_kfont`/`adjust`/`set_cursor`/`start("powershell.exe")` calls were removed from
   the demo; use the config file instead.
 - Startup sizes the main window so ConBox is **`config_cols()` x `config_rows()` cells** (default
@@ -391,20 +412,23 @@ void set_resize_sink(void (*sink)(int cols, int rows, void* user), void* user);
 
 ---
 
-## 14. Config File (`config()`)
+## 14. Config File (`setup_from_ini()` / `setup()`)
 
 ```cpp
-void config(const char* path = nullptr);  // load INI; nullptr -> "ConBox.ini" next to EXE
-int         config_cols()    const;        // grid_cols from last config() (default 96)
-int         config_rows()    const;        // grid_rows from last config() (default 32)
-const char* config_cmdline() const;        // cmdline from last config() (default "powershell.exe")
+void setup_from_ini(const char* path = nullptr);  // load INI file; nullptr -> "ConBox.ini" next to EXE
+void setup(const char* contents);                 // apply INI-format settings from a string (UTF-8)
+int         config_cols()    const;               // grid_cols from last setup call (default 96)
+int         config_rows()    const;               // grid_rows from last setup call (default 32)
+const char* config_cmdline() const;               // cmdline from last setup call (default "powershell.exe")
 ```
 
 - Sections are cosmetic; keys are matched by **name only** (section-agnostic).
-- Relative path resolved against **EXE directory**, not the working directory.
-- If the file does not exist it is **auto-created** with compiled-in defaults; this call then
-  returns without applying anything (settings stay at constructor defaults).
-- Call **before `open()`** so fonts/margins are set before the first layout.
+- `setup_from_ini`: relative path resolved against **EXE directory**, not the working directory.
+  If the file does not exist it is **auto-created** with compiled-in defaults; returns without
+  applying anything (settings stay at constructor defaults).
+- `setup`: applies INI-format content from a string — useful for embedding config in the host
+  without a separate file. Same key/value rules as `setup_from_ini`.
+- Call either **before `open()`** so fonts/margins are set before the first layout.
 - `config_cols`/`config_rows`/`config_cmdline` return the values read; the host uses them to call
   `resize_to_grid` and `start()` after `open()`.
 

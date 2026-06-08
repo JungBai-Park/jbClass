@@ -12,7 +12,11 @@
       "Bash(C:/Program Files/Microsoft Visual Studio/2022/Community/MSBuild/Current/Bin/MSBuild.exe *)",
       "PowerShell($p = \"D:\\\\ETC\\\\Programs\\\\Node.js\\\\node_modules\\\\@anthropic-ai\\\\claude-code\\\\bin\\\\claude.exe\"; if \\(Test-Path $p\\) { \"EXISTS: \" + \\(Get-Item $p\\).Length + \" bytes\" } else { \"NOT FOUND\" })",
       "Bash(\"C:\\\\Program Files\\\\Microsoft Visual Studio\\\\2022\\\\Community\\\\MSBuild\\\\Current\\\\Bin\\\\MSBuild.exe\" \"Project\\\\ConBox.sln\" /t:Build /p:Configuration=Debug /p:Platform=x64)",
-      "PowerShell(& \"C:\\\\Program Files\\\\Microsoft Visual Studio\\\\2022\\\\Community\\\\MSBuild\\\\Current\\\\Bin\\\\MSBuild.exe\" \"D:\\\\Work\\\\Study\\\\ConBox\\\\Project\\\\ConBox.sln\" /t:Build /p:Configuration=Debug /p:Platform=x64 2>&1 | Select-Object -Last 30)"
+      "PowerShell(& \"C:\\\\Program Files\\\\Microsoft Visual Studio\\\\2022\\\\Community\\\\MSBuild\\\\Current\\\\Bin\\\\MSBuild.exe\" \"D:\\\\Work\\\\Study\\\\ConBox\\\\Project\\\\ConBox.sln\" /t:Build /p:Configuration=Debug /p:Platform=x64 2>&1 | Select-Object -Last 30)",
+      "Bash(cd /d D:\\\\Work\\\\Study\\\\ConBox\\\\Temp)",
+      "Bash(csc.exe write_null.cs)",
+      "Bash(findstr /n \"view_top\" Source/ConBox.cpp)",
+      "Bash(PowerShell *)"
     ]
   }
 }

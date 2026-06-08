@@ -79,6 +79,31 @@ To reproduce `calc_cell_size` values (`cell_w`/`natw`/`kwid`):
 - **Verification**: run `Temp/verify_sgr.ps1` in PowerShell (within ConBox) to see English/Korean
   bold/italic/underline/strike/blink rendered side-by-side.
 
+## SGR double-size (2x glyph, CELL_DOUBLE 0x40)
+- **SGR code choice**: a child triggers double-size via **SGR 8 (on) / SGR 28 (off)**, NOT a custom
+  code. Tried SGR 133/134 first: it works via direct `print()` but is **stripped by the inbox conhost**
+  on the ConPTY child path (same mechanism as IND/NEL -- conhost re-encodes its screen buffer with only
+  standard SGR, dropping unknown params). Proven by the direct-print diagnostic: 133 rendered 2x with no
+  child, but a PowerShell child's 133 arrived as plain text. SGR 8 (conceal)/28 (reveal) are *standard*
+  codes ConBox doesn't otherwise implement, so conhost passes them through. Confirmed by capture.
+- **Always bold**: double cells render with `efont_double`/`kfont_double`, created by `MakeDoubleFont`
+  (lfHeight*2, lfWidth*2, lfWeight forced FW_BOLD/EXTRABOLD). Bold/italic SGR is ignored on double cells.
+- **Font build location = `calc_cell_size` (end), NOT set_efont/set_kfont**. Critical for Korean: in
+  match mode kfont's final height is only settled inside calc_cell_size; building kfont_double in
+  set_kfont captures the pre-match (size 0) LOGFONT -> Korean rendered ~1x. Symptom seen: English 2x OK
+  but Korean stayed 1x until the build was moved to calc_cell_size.
+- **2-pass deferred render in OnPaint**: double glyphs bleed up (2x ascent) + right (2x width) past
+  their cell. Drawing inline lets a later neighbor's `FillSolidRect(bg)` erase the bleed (looks 1x /
+  clipped). Fix: collect double cells (DeferredDouble: px,py,w,ch,fg,cw,flags) during the main loop
+  (background still fills inline, 1-cell), then draw them in a second pass after the whole grid. Their
+  underline/strike are deferred too, spanning the doubled width (`2*w*cell_w`): underline at
+  `cell_base+2`, strike at `cell_base-cell_h/2`.
+- **Child must leave blank line above** (bleed goes upward, NOT downward). No manual spaces needed
+  between big chars — `put_char` auto-advances `cur_col` by `w*2` in double mode (English: +2,
+  Korean: +4), so the child writes `"가나다"` directly and ConBox leaves the correct gap.
+- **Verification**: `Temp/verify_double.py` (run as the child) + `Temp/capture.ps1` (CopyFromScreen PNG;
+  the python child must `time.sleep` so the window stays open for capture, else child-exit closes it).
+
 ## Cursor rendering
 - **`cursor_type`** (1..6) picks the shape; `set_cursor(type)` maps `0`→the default (3=blinking
   underline, like classic conhost.exe). **Odd=blink, even=fixed** — `set_cursor`/`bump_cursor`/
@@ -144,9 +169,13 @@ To reproduce `calc_cell_size` values (`cell_w`/`natw`/`kwid`):
   Verify: each syllable forms in the cursor cell with prior text in place, following text not hidden,
   restored on commit.
 
-## config() and ANSI palette
-- `config()` is implemented in `ConBox.cpp` ("config" section). Section headers in the INI are
-  cosmetic; all keys matched by name only. Relative path resolved against EXE dir (not CWD).
+## config / ANSI palette
+- `config()` was renamed to `setup_from_ini()`; a new `setup(const char* contents)` was added that
+  accepts INI-format text from a string (useful for embedding config in the host). `ParseIni` was
+  refactored to accept a `const char*` string instead of a file path (file reading moved to
+  `setup_from_ini`). `ConBoxDlg.cpp` updated accordingly. All three methods have the same key rules.
+- `setup_from_ini()` is implemented in `ConBox.cpp` ("config" section). Section headers in the INI
+  are cosmetic; all keys matched by name only. Relative path resolved against EXE dir (not CWD).
 - `Xterm256ToRgb` signature changed to `static COLORREF Xterm256ToRgb(int n, const COLORREF* pal)`.
   The old `static const COLORREF base16[16]` local was removed; callers pass `ansi_colors` (member).
   All 5 call sites in `dispatch_csi` pass `ansi_colors`.
@@ -201,3 +230,17 @@ To reproduce `calc_cell_size` values (`cell_w`/`natw`/`kwid`):
   (`dbg_log` -> `Temp/debug.log`) tracing each char into vt_feed / put_char / line_feed plus the
   raw bytes into `print()`, driven by direct `print()` test strings (no child) for determinism.
   Removed after use; re-add the same pattern if a future VT issue needs tracing.
+
+## Runtime resize (WM_SIZE cols/rows change) — does NOT reflow wrapped lines — INTENTIONAL LIMITATION
+- **Current behavior**: When cols/rows change (e.g. user resizes the window), `reset_screen()` pads or
+  truncates each existing Row to the new cols width. Autowrapped lines are NOT merged/split; they stay
+  as separate Rows.
+- **Example**: cols=20, "1234567890123456789ABC" is stored as [Row0(20 chars), Row1("ABC")].
+  Resize to cols=40 → [Row0(20 chars + 20 blanks), Row1("ABC" + 37 blanks)]. Not merged into one Row.
+- **Why**: Full reflow (unwrapping all lines, rewrapping to new width, then re-splitting scrollback+screen)
+  is complex and expensive. ConBox prioritizes simplicity.
+- **Workaround**: Keep window size fixed during child execution, or `stop()` and `start()` the child
+  after resizing (child will see the new PTY size and re-render accordingly).
+- **Difference from wt.exe**: Windows Terminal does reflow on resize; ConBox does not. This is a
+  documented limitation, not a bug to fix.
+- **Do NOT revisit**: This decision was made consciously; don't reopen the "add reflow" discussion.

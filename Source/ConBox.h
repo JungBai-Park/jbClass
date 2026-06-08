@@ -19,7 +19,8 @@
 //   - Save .h/.cpp as ASCII (comments are ASCII-only) so encoding is unambiguous.
 //   - SGR text attributes: bold/italic use font variants (efont/kfont _bold/_italic/_bold_italic),
 //     underline/strike are drawn as 1px decoration lines, blink toggled by BLINK_TIMER (500ms).
-//     Stored per cell in CharInfo::flags (CELL_BOLD/ITALIC/UNDERLINE/STRIKE/BLINK).
+//     SGR 8/28 = double-size (CELL_DOUBLE): 2x glyph, always bold, bleeds up+right; cursor auto-
+//     advances 2x so no manual spaces needed between big chars. Stored in CharInfo::flags.
 //
 // --- Usage (inside the host parent window) ---
 //     CConBox box;                            // usually held as a member
@@ -58,7 +59,7 @@
 // Layout: ch(2)+flags(1)+pad(1)+fg(4)+bg(4) = 12 bytes (was 16 with bool wide at the end).
 struct CharInfo {
 	wchar_t  ch;     // UTF-16 char; 0 = trail cell of a wide glyph (render skips it)
-	uint8_t  flags;  // bit field: CELL_WIDE | CELL_BOLD | CELL_ITALIC | CELL_UNDERLINE | CELL_STRIKE | CELL_BLINK
+	uint8_t  flags;  // bit field: CELL_WIDE | CELL_BOLD | CELL_ITALIC | CELL_UNDERLINE | CELL_STRIKE | CELL_BLINK | CELL_DOUBLE
 	// 1 byte compiler padding here (aligns fg to offset 4)
 	COLORREF fg;
 	COLORREF bg;
@@ -72,6 +73,7 @@ enum {
 	CELL_UNDERLINE = 0x08,   // SGR 4; drawn as a 1px line at cell bottom
 	CELL_STRIKE    = 0x10,   // SGR 9; drawn as a 1px line at cell middle
 	CELL_BLINK     = 0x20,   // SGR 5/6; glyph toggled by BLINK_TIMER
+	CELL_DOUBLE    = 0x40,   // SGR 8/28; 2x-size glyph, always bold (bleeds right/upward)
 };
 
 typedef std::vector<CharInfo> Row;
@@ -161,9 +163,13 @@ public:
 	// path is resolved against the EXE directory (not the working directory). nullptr defaults to
 	// "ConBox.ini". If the file does not exist, it is created with compiled-in defaults and this
 	// call returns without changing any settings (they stay at their defaults).
-	void config(const char* path = nullptr);
+	void setup_from_ini(const char* path = nullptr);
 
-	// Grid size and child cmdline read from the last config() call. The host uses these to size
+	// Apply INI-format settings from a string. contents is UTF-8 with \n line endings (no BOM).
+	// Useful for programmatic injection of settings without a file.
+	void setup(const char* contents);
+
+	// Grid size and child cmdline read from the last setup_from_ini() or setup() call. The host uses these to size
 	// the window (resize_to_grid) and launch the child (start()), so it does not need to hard-code
 	// those values anymore.
 	int         config_cols()    const { return cfg_cols; }
@@ -419,10 +425,12 @@ private:
 	CFont efont_bold;         // SGR bold variant
 	CFont efont_italic;       // SGR italic variant
 	CFont efont_bold_italic;  // SGR bold+italic variant
+	CFont efont_double;       // 2x-size variant, always bold (SGR 8/28); built in calc_cell_size
 	CFont kfont;
 	CFont kfont_bold;
 	CFont kfont_italic;
 	CFont kfont_bold_italic;
+	CFont kfont_double;       // 2x-size variant, always bold (SGR 8/28); built in calc_cell_size
 	LOGFONTW efont_lf;
 	LOGFONTW kfont_lf; // keeps the user's original size/style
 
@@ -500,6 +508,7 @@ private:
 	bool cur_strike;
 	bool cur_blink;
 	bool cur_reverse;             // swap fg/bg
+	bool cur_double;              // SGR 8/28; 2x-size glyph (always bold)
 
 	bool blink_on;                // blink visibility state, toggled by BLINK_TIMER
 

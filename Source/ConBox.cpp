@@ -11,7 +11,7 @@
 //                     set_efont, set_kfont, set_builtin_glyphs
 //   color/cursor    : set_color, set_bg_color, set_cursor_blend, set_cursor_blink, set_cursor, bump_cursor, OnTimer
 //   margin          : set_margin, client_size_for_grid
-//   config          : config, CreateDefaultIni(static), ResolveIniPath(static), ParseIni(static), ParseColor(static)
+//   config          : setup_from_ini, setup, CreateDefaultIni(static), ResolveIniPath(static), ParseIni(static), ParseColor(static)
 //   cursor geometry : blend_cursor_color, cursor_screen_pos, get_cursor_rect, is_hangul_mode
 //   grid/output     : update_metrics, blank_row, reset_screen, line_at, clamp_cursor, erase_cells,
 //                     scroll_lines_up/down, scroll_up_region, scroll_down_region, line_feed,
@@ -37,8 +37,12 @@
 //
 // [DM] Data model (cell grid)
 //   screen: vector<Row>      current screen, always rows lines x cols cells. Row = vector<CharInfo>.
-//   CharInfo{ wchar_t ch; uint8_t flags; COLORREF fg,bg; }  flags: CELL_WIDE|BOLD|ITALIC|UNDERLINE|STRIKE|BLINK
+//   CharInfo{ wchar_t ch; uint8_t flags; COLORREF fg,bg; }  flags: CELL_WIDE|BOLD|ITALIC|UNDERLINE|STRIKE|BLINK|DOUBLE
 //     CELL_WIDE = lead cell of double-width glyph (trail has ch=0).
+//     CELL_DOUBLE (SGR 8/28) = glyph rendered at 2x size (always bold). English=2x2 cells, Korean=4x2 cells.
+//       Cursor auto-advances 2x (put_char advance=w*2) so no manual spacing needed between big chars.
+//       Bleed: upward (2x ascent) and rightward (2x width); OnPaint renders columns right-to-left so
+//       a double glyph's rightward bleed overwrites already-drawn cells (not later ones). No 2nd pass.
 //   scrollback: deque<Row>   lines pushed off the top (capped at max_scrollback, oldest dropped; deque for O(1) pop_front).
 //   main_saved: vector<Row>  main screen backed up on alt-screen entry (swapped back on leave).
 //   Key state: cur_row/cur_col (0-based screen cell cursor), view_top (top of view, unified index),
@@ -65,7 +69,9 @@
 //     Otherwise cursor moves (CUU/CUD/CUF/CUB/CUP/HVP/CHA/VPA/CNL/CPL), erase ED/EL/ECH, SGR (m), modes h/l
 //     (?25, ?1049/47, ?1048, ?1, ?2004), save/restore (s/u), full-screen (DECSTBM r, IL/DL, ICH/DCH,
 //     SU/SD), queries (DSR n -> CPR/status to input sink, DA c -> VT102).
-//   put_char: autowrap past width, swap colors when reverse, wide glyph sets the next cell to trail.
+//   put_char: autowrap past width (advance=w*2 if cur_double), swap colors when reverse, wide glyph
+//     sets the next cell to trail. double mode (CELL_DOUBLE) stores the glyph in 1 cell but advances
+//     cur_col by w*2 so subsequent chars land past the 2x visual span without manual spacing.
 //     line_feed: scroll_up_region at the region bottom (scroll_bot), else advance one line.
 //   Scroll workers: scroll_lines_up/down (pure rotation within a range), scroll_up_region (preserves
 //     displaced lines into scrollback only on the main screen with top==0), enter/leave_alt_screen
@@ -79,9 +85,13 @@
 //   (cell_w+=l+r, cell_h+=t+b; left/top also shift the glyph; built-in block/box glyphs stay full-cell).
 //
 // [PAINT] Drawing (OnPaint, double buffered)
-//   Draw a whole frame into a memory DC then BitBlt (no flicker). Walk rows lines from view_top via
-//   line_at, cell by cell (wide = 2 cells in kfont; trail/blank cells skip the glyph), TA_BASELINE
-//   aligned. Block/box chars are painted directly by DrawBlockElement/DrawBoxLine per glyph_level.
+//   Draw a whole frame into a memory DC then BitBlt (no flicker). Walk rows top-to-bottom, columns
+//   RIGHT-TO-LEFT within each row. right-to-left order: CELL_DOUBLE glyphs bleed rightward; by the
+//   time a double cell is drawn its right neighbors are already laid down, so the bleed overwrites
+//   them (not erased by later renders). Wide=2 cells in kfont; trail/blank cells skip glyph. TA_BASELINE.
+//   Block/box chars painted directly by DrawBlockElement/DrawBoxLine per glyph_level.
+//   CELL_DOUBLE: drawn inline (not a second pass) using efont_double/kfont_double (2x, always bold);
+//   underline/strike span the doubled width.
 //   Cursor: when cursor_on && cursor_visible, fill get_cursor_rect with blend_cursor_color (2 cells in
 //   Korean mode, 1 in English) and redraw the covered glyph(s) on top. child_caret (the child paints
 //   the cursor cell as reverse = its bg differs from neighbors) suppresses the ConBox block (avoids a
@@ -121,6 +131,7 @@
 
 #include "ConBox.h"
 #include <string>
+#include <sstream>
 #include <map>
 #include <imm.h>            // Korean IME (Input Method Manager)
 #pragma comment(lib, "imm32.lib")
@@ -491,6 +502,7 @@ CConBox::CConBox()
 	cur_strike = false;
 	cur_blink = false;
 	cur_reverse = false;
+	cur_double = false;
 	blink_on = true;
 
 	// Input modes default off; the child turns them on.
@@ -605,41 +617,45 @@ static std::wstring ResolveIniPath(const char* utf8)
 
 // Parse an INI file into a key->value map. Section headers are silently ignored so the caller
 // can match keys regardless of which section they appear in.  key names are lower-cased.
-static std::map<std::string, std::string> ParseIni(const wchar_t* path)
+// Parse INI-format contents (key=value, one per line) into a key->value map.
+// contents: UTF-8 string with \n line endings. If nullptr, returns empty map.
+// Section headers and comments are silently ignored; key names are lowercased.
+static std::map<std::string, std::string> ParseIni(const char* contents)
 {
 	std::map<std::string, std::string> m;
-	FILE* f = nullptr;
-	_wfopen_s(&f, path, L"r");
-	if (!f) return m;
+	if (!contents) return m;
 
-	char line[512];
-	while (fgets(line, (int)sizeof(line), f)) {
+	std::istringstream ss(contents);
+	std::string line;
+	while (std::getline(ss, line)) {
 		// Trim leading whitespace.
-		char* p = line;
-		while (*p == ' ' || *p == '\t') ++p;
+		size_t start = 0;
+		while (start < line.size() && (line[start] == ' ' || line[start] == '\t')) ++start;
 		// Skip empty lines, comments, and section headers.
-		if (*p == '\0' || *p == '\r' || *p == '\n' || *p == ';' || *p == '#' || *p == '[') continue;
+		if (start >= line.size() || line[start] == ';' || line[start] == '#' || line[start] == '[') continue;
 
-		char* eq = strchr(p, '=');
-		if (!eq) continue;
+		line = line.substr(start);
+		size_t eq_pos = line.find('=');
+		if (eq_pos == std::string::npos) continue;
 
 		// Key: everything before '=', trailing-trimmed.
-		std::string key(p, eq);
+		std::string key = line.substr(0, eq_pos);
 		while (!key.empty() && (key.back() == ' ' || key.back() == '\t')) key.pop_back();
 		for (char& c : key) c = (char)tolower((unsigned char)c);
 
 		// Value: everything after '=', leading-trimmed, inline comment and trailing whitespace stripped.
-		char* v = eq + 1;
-		while (*v == ' ' || *v == '\t') ++v;
+		std::string val = line.substr(eq_pos + 1);
+		size_t val_start = 0;
+		while (val_start < val.size() && (val[val_start] == ' ' || val[val_start] == '\t')) ++val_start;
+		val = val.substr(val_start);
 		// Strip inline comment (ConBox INI values never contain ';').
-		char* semi = strchr(v, ';');
-		if (semi) *semi = '\0';
-		std::string val(v);
+		size_t semi_pos = val.find(';');
+		if (semi_pos != std::string::npos) val = val.substr(0, semi_pos);
+		// Trim trailing whitespace.
 		while (!val.empty() && (val.back() == '\r' || val.back() == '\n' || val.back() == ' ')) val.pop_back();
 
 		if (!key.empty()) m[key] = val;
 	}
-	fclose(f);
 	return m;
 }
 
@@ -727,20 +743,12 @@ static void CreateDefaultIni(const wchar_t* path)
 	fclose(f);
 }
 
-// Load settings from an INI file.  Sections are ignored; keys are matched by name only.
-// Relative paths are resolved against the EXE directory.  If the file does not exist it is
-// created with compiled-in defaults and this call returns (settings stay at their defaults).
-void CConBox::config(const char* path)
+// Apply INI-format settings from a string. contents: UTF-8 with \n line endings.
+void CConBox::setup(const char* contents)
 {
-	const char* src = (path && *path) ? path : "ConBox.ini";
-	std::wstring wide_path = ResolveIniPath(src);
+	if (!contents) return;
 
-	if (::GetFileAttributesW(wide_path.c_str()) == INVALID_FILE_ATTRIBUTES) {
-		CreateDefaultIni(wide_path.c_str());
-		return;   // defaults already set in the constructor
-	}
-
-	std::map<std::string, std::string> m = ParseIni(wide_path.c_str());
+	std::map<std::string, std::string> m = ParseIni(contents);
 	auto get = [&](const char* k) -> const std::string* {
 		auto it = m.find(k);
 		return (it != m.end()) ? &it->second : nullptr;
@@ -801,6 +809,35 @@ void CConBox::config(const char* path)
 	if (const std::string* s = get("cmdline")) { if (!s->empty()) cfg_cmdline = *s; }
 }
 
+// Load settings from an INI file.  Sections are ignored; keys are matched by name only.
+// Relative paths are resolved against the EXE directory.  If the file does not exist it is
+// created with compiled-in defaults and this call returns (settings stay at their defaults).
+void CConBox::setup_from_ini(const char* path)
+{
+	const char* src = (path && *path) ? path : "ConBox.ini";
+	std::wstring wide_path = ResolveIniPath(src);
+
+	if (::GetFileAttributesW(wide_path.c_str()) == INVALID_FILE_ATTRIBUTES) {
+		CreateDefaultIni(wide_path.c_str());
+		return;   // defaults already set in the constructor
+	}
+
+	// Read entire file into a string and pass to setup().
+	FILE* f = nullptr;
+	_wfopen_s(&f, wide_path.c_str(), L"r");
+	if (!f) return;
+
+	std::string content;
+	char buf[4096];
+	size_t n;
+	while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+		content.append(buf, n);
+	}
+	fclose(f);
+
+	setup(content.c_str());
+}
+
 void CConBox::open(CWnd* parent, int x0, int y0, int x1, int y1)
 {
 	// Register a dedicated window class. No background brush (we paint it). Arrow cursor (like wt.exe).
@@ -858,6 +895,20 @@ static void MakeFontVariant(CFont& font, LOGFONTW lf, bool bold, bool italic)
 	font.CreateFontIndirectW(&lf);
 }
 
+// Build the double-size (2x) variant of src into dst. Used for SGR 8 (double-size) cells. The glyph
+// is always rendered bold (titles), so bold/italic SGR is ignored on double cells -- no italic
+// variant is created. Height and width are doubled from src's current LOGFONT.
+static void MakeDoubleFont(CFont& dst, CFont& src)
+{
+	LOGFONTW lf;
+	src.GetLogFont(&lf);
+	lf.lfHeight = lf.lfHeight < 0 ? lf.lfHeight * 2 : -((-lf.lfHeight) * 2);
+	if (lf.lfWidth != 0) lf.lfWidth *= 2;
+	lf.lfWeight = (lf.lfWeight >= 600) ? FW_EXTRABOLD : FW_BOLD;   // always bold
+	dst.DeleteObject();
+	dst.CreateFontIndirectW(&lf);
+}
+
 void CConBox::apply_default_fonts()
 {
 	// Defaults: English Cascadia Mono 12pt normal, Korean Malgun Gothic normal (wt.exe Claude profile).
@@ -875,6 +926,7 @@ void CConBox::apply_default_fonts()
 		MakeFontVariant(kfont_italic,      kfont_lf, false, true);
 		MakeFontVariant(kfont_bold_italic, kfont_lf, true,  true);
 	}
+	// efont_double / kfont_double are built in calc_cell_size (after fonts are finalized).
 }
 
 // (design: [FONT])
@@ -980,6 +1032,13 @@ void CConBox::calc_cell_size()
 
 	::SelectObject(hdc, old);
 	::ReleaseDC(meas_wnd, hdc);
+
+	// Build the double-size (2x, always-bold) variants from the now-finalized fonts. This must run
+	// here (not in set_efont/set_kfont) because in Korean match mode kfont's final height is only
+	// settled above; making kfont_double earlier would capture the pre-match (size 0) LOGFONT and
+	// render Korean double-size glyphs at the wrong (1x-looking) size.
+	MakeDoubleFont(efont_double, efont);
+	MakeDoubleFont(kfont_double, kfont);
 }
 
 void CConBox::set_efont(const char* name, float size, const char* opts)
@@ -988,6 +1047,7 @@ void CConBox::set_efont(const char* name, float size, const char* opts)
 	MakeFontVariant(efont_bold,        efont_lf, true,  false);
 	MakeFontVariant(efont_italic,      efont_lf, false, true);
 	MakeFontVariant(efont_bold_italic, efont_lf, true,  true);
+	// efont_double is (re)built in calc_cell_size below.
 
 	// Cell size changed; recompute the grid if the window is up.
 	if (::IsWindow(m_hWnd)) {
@@ -1002,6 +1062,7 @@ void CConBox::set_kfont(const char* name, float size, const char* opts)
 	MakeFontVariant(kfont_bold,        kfont_lf, true,  false);
 	MakeFontVariant(kfont_italic,      kfont_lf, false, true);
 	MakeFontVariant(kfont_bold_italic, kfont_lf, true,  true);
+	// kfont_double is (re)built in calc_cell_size below.
 
 	// size<=0 turns on match mode (size ignored); positive turns it off. Match mode changes line
 	// height (cell_h), so the grid is recomputed below.
@@ -1546,7 +1607,8 @@ void CConBox::put_char(wchar_t wc)
 		return;
 
 	int w = IsWideChar(wc) ? 2 : 1;
-	if (cur_col + w > cols) {
+	int advance = cur_double ? w * 2 : w;   // double mode: cursor skips 2x to leave room for bleed
+	if (cur_col + advance > cols) {
 		cur_col = 0;
 		line_feed();
 	}
@@ -1558,7 +1620,8 @@ void CConBox::put_char(wchar_t wc)
 	             | (cur_italic    ? CELL_ITALIC    : 0)
 	             | (cur_underline ? CELL_UNDERLINE : 0)
 	             | (cur_strike    ? CELL_STRIKE    : 0)
-	             | (cur_blink     ? CELL_BLINK     : 0);
+	             | (cur_blink     ? CELL_BLINK     : 0)
+	             | (cur_double    ? CELL_DOUBLE    : 0);
 
 	Row& line = screen[cur_row];
 	if (cur_col >= 0 && cur_col < (int)line.size()) {
@@ -1573,7 +1636,7 @@ void CConBox::put_char(wchar_t wc)
 			line[cur_col + 1].bg = bg;
 		}
 	}
-	cur_col += w;
+	cur_col += advance;
 }
 
 void CConBox::print(const char* text)
@@ -1836,13 +1899,13 @@ void CConBox::dispatch_csi(wchar_t fin)
 		if (vt_nparam == 0) {
 			// No params = reset (SGR 0).
 			cur_fg = default_fg; cur_bg = default_bg;
-			cur_bold = cur_italic = cur_underline = cur_strike = cur_blink = cur_reverse = false;
+			cur_bold = cur_italic = cur_underline = cur_strike = cur_blink = cur_reverse = cur_double = false;
 			break;
 		}
 		for (int i = 0; i < vt_nparam; ++i) {
 			int p = vt_params[i];
 			if (p == 0)  { cur_fg = default_fg; cur_bg = default_bg;
-			               cur_bold = cur_italic = cur_underline = cur_strike = cur_blink = cur_reverse = false; }
+			               cur_bold = cur_italic = cur_underline = cur_strike = cur_blink = cur_reverse = cur_double = false; }
 			else if (p == 1)  cur_bold = true;
 			else if (p == 3)  cur_italic = true;
 			else if (p == 4)  cur_underline = true;
@@ -1855,6 +1918,8 @@ void CConBox::dispatch_csi(wchar_t fin)
 			else if (p == 25) cur_blink = false;
 			else if (p == 27) cur_reverse = false;
 			else if (p == 29) cur_strike = false;
+			else if (p == 8)  cur_double = true;    // SGR 8 (conceal) repurposed: double-size ON
+			else if (p == 28) cur_double = false;   // SGR 28 (reveal) repurposed: double-size OFF
 			else if (p >= 30 && p <= 37) cur_fg = Xterm256ToRgb(p - 30, ansi_colors);
 			else if (p >= 40 && p <= 47) cur_bg = Xterm256ToRgb(p - 40, ansi_colors);
 			else if (p >= 90 && p <= 97) cur_fg = Xterm256ToRgb(8 + (p - 90), ansi_colors);
@@ -3051,6 +3116,11 @@ void CConBox::OnPaint()
 	// Draw visible lines top to bottom (unified index view_top+row).
 	int total = (int)scrollback.size() + rows;
 
+	// CELL_DOUBLE glyphs (2x size) bleed upward (into the row above) and rightward (into cells to the
+	// right). Rendering columns right-to-left means cells to the right are already laid down before a
+	// double glyph draws over them, so the bleed is never erased. Upward bleed is safe because rows
+	// are rendered top-to-bottom (the row above is already complete). No second pass needed.
+
 	// Pre-sort the selection range if active. Block mode sorts rows and cols independently;
 	// linear mode sorts so (sr0,sc0) precedes (sr1,sc1) in reading order.
 	int sr0 = 0, sc0 = 0, sr1 = -1, sc1 = -1;   // sr1 < sr0 means no selection
@@ -3077,8 +3147,10 @@ void CConBox::OnPaint()
 		int ncell = (int)line.size();
 		if (ncell > cols) ncell = cols;
 
-		// The cell index (i) is the visual column. A wide glyph fills its trail cell and skips it.
-		for (int i = 0; i < ncell; ++i) {
+		// Render columns right-to-left so CELL_DOUBLE right-bleed overwrites already-drawn cells
+		// (not cells drawn later). Wide trail cells (ch=0) are naturally encountered before their
+		// lead cell; no explicit skip needed.
+		for (int i = ncell - 1; i >= 0; --i) {
 			const CharInfo& c = line[i];
 			int w = (c.flags & CELL_WIDE) ? 2 : 1;
 
@@ -3111,30 +3183,46 @@ void CConBox::OnPaint()
 
 			// Blank cells and wide trail cells (ch=0) draw no glyph. Others draw as a shape (block/box)
 			// or via the font (wide -> Korean font; bold/italic -> variant font).
-			if (c.ch != 0 && c.ch != L' ' && !(c.flags & CELL_BLINK && !blink_on)) {
-				bool drawn = false;
-				if (glyph_level >= 1)
-					drawn = DrawBlockElement(dc, c.ch, px, py, cell_w, cell_h, fg);
-				if (!drawn && glyph_level >= 2)
-					drawn = DrawBoxLine(dc, c.ch, px, py, cell_w, cell_h, fg);
-				if (!drawn) {
-					bool cb = (c.flags & CELL_BOLD)   != 0;
-					bool ci = (c.flags & CELL_ITALIC) != 0;
-					bool cw = (c.flags & CELL_WIDE)   != 0;
-					CFont* f = cw ? (cb && ci ? &kfont_bold_italic : cb ? &kfont_bold : ci ? &kfont_italic : &kfont)
-					              : (cb && ci ? &efont_bold_italic : cb ? &efont_bold : ci ? &efont_italic : &efont);
-					dc.SelectObject(f);
+			// CELL_DOUBLE: drawn inline (right-to-left column order makes the bleed safe; see above).
+			if (c.flags & CELL_DOUBLE) {
+				if (c.ch != 0 && c.ch != L' ' && !(c.flags & CELL_BLINK && !blink_on)) {
+					bool cw = (c.flags & CELL_WIDE) != 0;
+					dc.SelectObject(cw ? &kfont_double : &efont_double);
 					dc.SetTextColor(fg);
 					dc.TextOutW(px + adjust_left, py + cell_base, &c.ch, 1);
+					int dw = 2 * w * cell_w;
+					if (c.flags & CELL_UNDERLINE)
+						dc.FillSolidRect(CRect(px, py + cell_base + 2, px + dw, py + cell_base + 4), fg);
+					if (c.flags & CELL_STRIKE) {
+						int my = py + cell_base - cell_h / 2;
+						dc.FillSolidRect(CRect(px, my, px + dw, my + 2), fg);
+					}
 				}
+			} else {
+				if (c.ch != 0 && c.ch != L' ' && !(c.flags & CELL_BLINK && !blink_on)) {
+					bool drawn = false;
+					if (glyph_level >= 1)
+						drawn = DrawBlockElement(dc, c.ch, px, py, cell_w, cell_h, fg);
+					if (!drawn && glyph_level >= 2)
+						drawn = DrawBoxLine(dc, c.ch, px, py, cell_w, cell_h, fg);
+					if (!drawn) {
+						bool cb = (c.flags & CELL_BOLD)   != 0;
+						bool ci = (c.flags & CELL_ITALIC) != 0;
+						bool cw = (c.flags & CELL_WIDE)   != 0;
+						CFont* f = cw ? (cb && ci ? &kfont_bold_italic : cb ? &kfont_bold : ci ? &kfont_italic : &kfont)
+						              : (cb && ci ? &efont_bold_italic : cb ? &efont_bold : ci ? &efont_italic : &efont);
+						dc.SelectObject(f);
+						dc.SetTextColor(fg);
+						dc.TextOutW(px + adjust_left, py + cell_base, &c.ch, 1);
+					}
+				}
+				// Underline and strikethrough decoration lines (drawn even on space/trail cells).
+				if (c.flags & CELL_UNDERLINE)
+					dc.FillSolidRect(CRect(px, py + cell_h - 1, px + w * cell_w, py + cell_h), fg);
+				if (c.flags & CELL_STRIKE)
+					dc.FillSolidRect(CRect(px, py + cell_h / 2, px + w * cell_w, py + cell_h / 2 + 1), fg);
 			}
-			// Underline and strikethrough decoration lines (drawn even on space/trail cells).
-			if (c.flags & CELL_UNDERLINE)
-				dc.FillSolidRect(CRect(px, py + cell_h - 1, px + w * cell_w, py + cell_h), fg);
-			if (c.flags & CELL_STRIKE)
-				dc.FillSolidRect(CRect(px, py + cell_h / 2, px + w * cell_w, py + cell_h / 2 + 1), fg);
 
-			if (w == 2) ++i;   // skip the trail cell
 		}
 	}
 

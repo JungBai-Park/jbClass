@@ -1,4 +1,4 @@
-
+﻿
 // ConBoxDlg.cpp: 구현 파일
 //
 
@@ -59,9 +59,9 @@ BOOL CConBoxDlg::OnInitDialog()
     if (CWnd* cancel = GetDlgItem(IDCANCEL))
         cancel->DestroyWindow();
 
-    // config() 로 폰트, 색상, 커서, 마진, 그리드 크기, 자식 명령줄을 한 번에 불러온다.
+    // setup_from_ini() 로 폰트, 색상, 커서, 마진, 그리드 크기, 자식 명령줄을 한 번에 불러온다.
     // 파일이 없으면 기본값으로 자동 생성된다.
-    con_box.config("..\\..\\Documents\\ConBox.ini");
+    con_box.setup_from_ini("..\\..\\Documents\\ConBox.ini");
 
     // ConBox 를 자식 창으로 만든다. (위치/크기는 아래 resize_to_grid 가 정한다.)
     con_box.open(this, 0, 0, 10, 10);
