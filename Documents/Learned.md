@@ -201,6 +201,25 @@ To reproduce `calc_cell_size` values (`cell_w`/`natw`/`kwid`):
 - `CreateDefaultIni()` writes Korean UTF-8 comments as `\xNN` hex escapes to keep `.cpp` pure ASCII.
   Default INI filename is `ConBox.ini` (formerly `Config.ini`).
 
+## EMF export (save_emf / export_text)
+- **BeginPath/FillPath does NOT work on EMF DCs**: `TextOutW` on an EMF DC renders immediately
+  regardless of the path bracket; `FillPath` fills an empty path. Correct approach: `SetTextColor(fg)` +
+  `TextOutW`. Using path for vector text on EMF DCs silently produces wrong output (black text, no fill).
+- **EMF canvas whitespace**: passing a manually computed HIMETRIC `bounds` rect to `CreateEnhMetaFile`
+  can produce extra whitespace on right/bottom (reference device mismatch). Fix: pass `NULL` for `lpRect`
+  so GDI auto-computes the tight frame from actual drawing operations.
+- **Trail cell flag**: `put_char` writes trail with `ch=0` but sets `flags = attr` (no `CELL_WIDE` on
+  trail; only the lead has `CELL_WIDE`). Detecting trail by `ch==0 && CELL_WIDE` always fails → trail
+  output as extra space. Correct detection: when the lead has `CELL_WIDE`, unconditionally skip lead+1
+  (the trail), regardless of the trail's flags. This also affects `export_text` for single-size Korean.
+- **`export_text` cell consumption per char**:
+  - Normal English: 1 cell.
+  - Normal Korean (`CELL_WIDE`): 2 cells (lead + skip trail at lead+1).
+  - Double English (`CELL_DOUBLE`): 2 cells (lead + skip 1 blank from 2x advance).
+  - Double Korean (`CELL_WIDE|CELL_DOUBLE`): 4 cells (lead + skip trail + skip 2 blanks from 4x advance).
+- **CDC::Detach() before CloseEnhMetaFile**: if CDC owns the HDC, its destructor calls `DeleteDC` after
+  `CloseEnhMetaFile`, which is invalid. Always `cdc.Detach()` before calling `CloseEnhMetaFile`.
+
 ## scrollback container
 - `scrollback` is `std::deque<Row>` (not `std::vector`) so front removal when the cap is exceeded
   is O(1) (`pop_front()`) rather than O(n) (`erase(begin, begin+over)`). Cap default = 5000 lines,

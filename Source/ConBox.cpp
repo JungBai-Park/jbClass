@@ -26,6 +26,7 @@
 //   mouse selection : hit_test, copy_selection, clear_selection, OnLButtonDown, OnLButtonDblClk,
 //                     OnLButtonUp, OnMouseMove, OnRButtonDown, OnDropFiles
 //   painting        : ensure_back_buffer, OnPaint
+//   export          : save_emf, export_text
 //   child (ConPTY)  : Utf8ToWide/CreatePtyPipes(static), start, write, resize, stop, is_running,
 //                     set_exit_callback, pump, handle_child_exit, child_input_thunk/child_resize_thunk, OnDestroy
 //
@@ -560,6 +561,7 @@ CConBox::CConBox()
 	cfg_cols = 96;
 	cfg_rows = 32;
 	cfg_cmdline = "powershell.exe";
+	cfg_lines_per_page = 50;
 
 	// Default 16-color ANSI palette (matches the hardcoded base16[] in Xterm256ToRgb).
 	static const COLORREF def16[16] = {
@@ -739,7 +741,10 @@ static void CreateDefaultIni(const wchar_t* path)
 		"scrollback_cap = 5000           ; \xEC\x8A\xA4\xED\x81\xAC\xEB\xA1\xA4\xEB\xB0\xB1 \xEC\xB5\x9C\xEB\x8C\x80 \xEC\xA4\x84 \xEC\x88\x98\n"
 		"\n"
 		"[child]\n"
-		"cmdline = powershell.exe        ; \xEC\x8B\xA4\xED\x96\x89\xED\x95\xA0 \xEC\x9E\x90\xEC\x8B\x9D \xED\x94\x84\xEB\xA1\x9C\xEC\x84\xB8\xEC\x8A\xA4 \xEB\xAA\x85\xEB\xA0\xB9\xEC\xA4\x84\n",
+		"cmdline = powershell.exe        ; \xEC\x8B\xA4\xED\x96\x89\xED\x95\xA0 \xEC\x9E\x90\xEC\x8B\x9D \xED\x94\x84\xEB\xA1\x9C\xEC\x84\xB8\xEC\x8A\xA4 \xEB\xAA\x85\xEB\xA0\xB9\xEC\xA4\x84\n"
+		"\n"
+		"[export]\n"
+		"lines_per_page = 50             ; EMF export: rows per page (save_emf)\n",
 		f);
 	fclose(f);
 }
@@ -808,6 +813,8 @@ void CConBox::setup(const char* contents)
 	cfg_cols = geti("grid_cols", 96);
 	cfg_rows = geti("grid_rows", 32);
 	if (const std::string* s = get("cmdline")) { if (!s->empty()) cfg_cmdline = *s; }
+	cfg_lines_per_page = geti("lines_per_page", 50);
+	if (cfg_lines_per_page < 1) cfg_lines_per_page = 1;
 }
 
 // Load settings from an INI file.  Sections are ignored; keys are matched by name only.
@@ -3430,6 +3437,227 @@ void CConBox::OnPaint()
 	// Blit the finished frame to the screen at once (no flicker). The bitmap stays a live member (freed
 	// in the dtor), so it is not detached here.
 	paintDC.BitBlt(0, 0, rc.Width(), rc.Height(), &back_dc, 0, 0, SRCCOPY);
+}
+
+
+// ===== EMF export =====
+// save_emf: renders the full scrollback+screen buffer to a series of EMF vector files.
+// Each page is a chunk of cfg_lines_per_page rows. If the first row of a page has CELL_DOUBLE
+// glyphs (which bleed upward by cell_h), an extra blank row is prepended (y_offset=cell_h) so the
+// bleed is not clipped. Rendering order per row: right-to-left, matching OnPaint (so CELL_DOUBLE
+// rightward bleed overwrites already-drawn cells, not later ones). Glyphs are drawn via
+// SetTextColor + TextOutW (EMF text records -- vector, not bitmap). Block/box chars go through
+// DrawBlockElement/DrawBoxLine (shape-based). Note: BeginPath/FillPath does NOT work on EMF DCs
+// as on screen DCs; TextOutW on an EMF DC renders immediately regardless of the path bracket.
+
+// (design: [PAINT]) -- same coordinate/cell logic as OnPaint but targets an EMF DC.
+void CConBox::save_emf(const char* dir)
+{
+	if (!dir || !*dir) return;
+
+	int total = (int)scrollback.size() + rows;
+	if (total <= 0) return;
+
+	// Convert dir (UTF-8) to wide string for Win32 path APIs.
+	int wlen = ::MultiByteToWideChar(CP_UTF8, 0, dir, -1, NULL, 0);
+	if (wlen <= 0) return;
+	std::vector<wchar_t> wdir(wlen);
+	::MultiByteToWideChar(CP_UTF8, 0, dir, -1, wdir.data(), wlen);
+
+	// Page width is fixed (same for all pages); height varies only when extra_top is added.
+	int page_w = margin_left + cols * cell_w + margin_right;
+
+	int page_idx = 0;
+	for (int row_start = 0; row_start < total; row_start += cfg_lines_per_page, ++page_idx) {
+		int row_end = min(row_start + cfg_lines_per_page, total);
+		int n_lines = row_end - row_start;
+
+		// If the first row of this page has any CELL_DOUBLE glyph, prepend a blank row so the
+		// 2x upward bleed (which extends into the row above) is not clipped at the page top.
+		bool extra_top = false;
+		{
+			const Row& first = line_at(row_start);
+			for (const CharInfo& c : first) {
+				if (c.flags & CELL_DOUBLE) { extra_top = true; break; }
+			}
+		}
+		int y_offset = extra_top ? cell_h : 0;
+		int page_h   = margin_top + y_offset + n_lines * cell_h + margin_bottom;
+
+		// Build output filename: <dir>\ConBox000.emf
+		wchar_t filename[MAX_PATH];
+		swprintf_s(filename, MAX_PATH, L"%s\\ConBox%03d.emf", wdir.data(), page_idx);
+
+		// Pass NULL for lpRect so GDI auto-computes the frame from actual drawing operations,
+		// giving a tight canvas that matches exactly the drawn content (no extra whitespace).
+		HDC hMeta = ::CreateEnhMetaFile(NULL, filename, NULL, NULL);
+		if (!hMeta) continue;
+
+		// Wrap in CDC for DrawBlockElement/DrawBoxLine compatibility. Must Detach() before
+		// CloseEnhMetaFile (CDC destructor would DeleteDC if we let it go out of scope owned).
+		CDC cdc;
+		cdc.Attach(hMeta);
+		cdc.SetBkMode(TRANSPARENT);
+		cdc.SetTextAlign(TA_LEFT | TA_BASELINE);
+		CFont* old_font = cdc.SelectObject(&efont);
+
+		// Fill the page background with the default bg color.
+		cdc.FillSolidRect(CRect(0, 0, page_w, page_h), default_bg);
+
+		// Render rows. Right-to-left column order (same as OnPaint): CELL_DOUBLE glyphs bleed
+		// rightward; rendering right-to-left means the bleed overwrites already-drawn cells
+		// (not cells rendered after the glyph). Upward bleed is safe because rows go top-to-bottom.
+		for (int ri = 0; ri < n_lines; ++ri) {
+			const Row& line = line_at(row_start + ri);
+			int ncell = min((int)line.size(), cols);
+			int py = margin_top + y_offset + ri * cell_h;
+
+			for (int i = ncell - 1; i >= 0; --i) {
+				const CharInfo& c = line[i];
+				int w  = (c.flags & CELL_WIDE) ? 2 : 1;
+				int px = margin_left + i * cell_w;
+				COLORREF fg = c.fg;
+				COLORREF bg = c.bg;
+
+				// --- Background ---
+				// CELL_DOUBLE: background covers the full 2x bleed area (upward by cell_h,
+				// rightward to 2*w*cell_w); same formula as OnPaint.
+				if (c.flags & CELL_DOUBLE) {
+					cdc.FillSolidRect(
+						CRect(px, py - cell_h, px + 2 * w * cell_w, py + cell_h), bg);
+				} else {
+					cdc.FillSolidRect(
+						CRect(px, py, px + w * cell_w, py + cell_h), bg);
+				}
+
+				// --- Glyph ---
+				// Trail cells (ch=0) and spaces draw no glyph (but may still have decorations).
+				// Blink cells: always rendered visible (static EMF, no blink state).
+				if (c.ch != 0 && c.ch != L' ') {
+					if (c.flags & CELL_DOUBLE) {
+						// 2x-size glyph: uses efont_double/kfont_double (built in calc_cell_size).
+						// Always bold, ignores bold/italic SGR flags on double cells.
+						int dw       = 2 * w * cell_w;
+						int dbl_base = cell_base + adjust_top;
+						bool cw = (c.flags & CELL_WIDE) != 0;
+						cdc.SelectObject(cw ? &kfont_double : &efont_double);
+						cdc.SetTextColor(fg);
+						cdc.TextOutW(px + 2 * adjust_left, py + dbl_base, &c.ch, 1);
+						// Decorations for double: underline 2px at bottom, strike at midline.
+						if (c.flags & CELL_UNDERLINE)
+							cdc.FillSolidRect(
+								CRect(px, py + cell_h - 2, px + dw, py + cell_h), fg);
+						if (c.flags & CELL_STRIKE) {
+							int my = py + dbl_base - cell_h / 2;
+							cdc.FillSolidRect(CRect(px, my, px + dw, my + 2), fg);
+						}
+					} else {
+						// Normal glyph: block/box chars via DrawBlockElement/DrawBoxLine (already
+						// shape-based); other chars via SetTextColor + TextOutW (vector text record
+						// in the EMF -- on EMF DCs BeginPath/FillPath does not gate rendering).
+						bool drawn = false;
+						if (glyph_level >= 1)
+							drawn = DrawBlockElement(cdc, c.ch, px, py, cell_w, cell_h, fg);
+						if (!drawn && glyph_level >= 2)
+							drawn = DrawBoxLine(cdc, c.ch, px, py, cell_w, cell_h, fg);
+						if (!drawn) {
+							bool cb = (c.flags & CELL_BOLD)   != 0;
+							bool ci = (c.flags & CELL_ITALIC) != 0;
+							bool cw = (c.flags & CELL_WIDE)   != 0;
+							CFont* f = cw
+								? (cb&&ci ? &kfont_bold_italic : cb ? &kfont_bold : ci ? &kfont_italic : &kfont)
+								: (cb&&ci ? &efont_bold_italic : cb ? &efont_bold : ci ? &efont_italic : &efont);
+							cdc.SelectObject(f);
+							cdc.SetTextColor(fg);
+							cdc.TextOutW(px + adjust_left, py + cell_base, &c.ch, 1);
+						}
+					}
+				}
+
+				// --- Decorations for non-double cells (drawn even on space / trail ch=0 cells) ---
+				if (!(c.flags & CELL_DOUBLE)) {
+					if (c.flags & CELL_UNDERLINE)
+						cdc.FillSolidRect(
+							CRect(px, py + cell_h - 1, px + w * cell_w, py + cell_h), fg);
+					if (c.flags & CELL_STRIKE)
+						cdc.FillSolidRect(
+							CRect(px, py + cell_h / 2, px + w * cell_w, py + cell_h / 2 + 1), fg);
+				}
+			}
+		}
+
+		cdc.SelectObject(old_font);
+		cdc.Detach();   // CDC must not own hMeta when CloseEnhMetaFile is called
+
+		HENHMETAFILE hmf = ::CloseEnhMetaFile(hMeta);   // writes the .emf file to disk
+		if (hmf) ::DeleteEnhMetaFile(hmf);               // release the in-memory handle
+	}
+}
+
+
+// ===== Text extract =====
+// export_text: returns the full scrollback+screen buffer as UTF-8 text lines.
+// Each element is a null-terminated std::string with no trailing newline. Trailing spaces trimmed.
+// Trail cell detection: put_char sets ch=0 on the trail but does NOT set CELL_WIDE there (only
+// the lead has CELL_WIDE). Trails are skipped by position (lead+1), not by flag check.
+// CELL_DOUBLE extras: Korean (CELL_WIDE+CELL_DOUBLE) = 4-cell advance -> skip trail + 2 blanks.
+//                     English/etc (CELL_DOUBLE only)  = 2-cell advance -> skip 1 blank.
+
+std::vector<std::string> CConBox::export_text() const
+{
+	int total = (int)scrollback.size() + rows;
+	std::vector<std::string> result;
+	result.reserve(total);
+
+	std::vector<wchar_t> wline;
+
+	for (int r = 0; r < total; ++r) {
+		const Row& row = line_at(r);
+		int ncell = min((int)row.size(), cols);
+		wline.clear();
+
+		int i = 0;
+		while (i < ncell) {
+			const CharInfo& c = row[i];
+			bool is_wide   = (c.flags & CELL_WIDE)   != 0;
+			bool is_double = (c.flags & CELL_DOUBLE) != 0;
+
+			wline.push_back(c.ch ? c.ch : L' ');
+			++i;
+
+			if (is_wide) {
+				// Skip trail cell. Trail has ch=0 but no CELL_WIDE (put_char sets flags=attr on trail).
+				// Detect by lead position: trail is always at lead+1.
+				if (i < ncell) ++i;
+				if (is_double) {
+					// Korean double (4-cell advance): skip 2 extra blank cells.
+					if (i < ncell && (row[i].ch == 0 || row[i].ch == L' ')) ++i;
+					if (i < ncell && (row[i].ch == 0 || row[i].ch == L' ')) ++i;
+				}
+			} else if (is_double) {
+				// English/special/blank double (2-cell advance): skip 1 extra blank cell.
+				if (i < ncell && (row[i].ch == 0 || row[i].ch == L' ')) ++i;
+			}
+		}
+
+		// Trim trailing spaces.
+		while (!wline.empty() && (wline.back() == L' ' || wline.back() == 0))
+			wline.pop_back();
+
+		// Convert to UTF-8; no newline appended (caller decides line ending).
+		if (wline.empty()) {
+			result.emplace_back();
+		} else {
+			int u8len = ::WideCharToMultiByte(CP_UTF8, 0, wline.data(), (int)wline.size(),
+			                                  NULL, 0, NULL, NULL);
+			std::string s(u8len, '\0');
+			::WideCharToMultiByte(CP_UTF8, 0, wline.data(), (int)wline.size(),
+			                      &s[0], u8len, NULL, NULL);
+			result.push_back(std::move(s));
+		}
+	}
+
+	return result;
 }
 
 

@@ -7,6 +7,7 @@
 #include "ConBoxApp.h"
 #include "ConBoxDlg.h"
 #include "afxdialogex.h"
+#include <shlobj.h>    // SHBrowseForFolder, SHGetPathFromIDList
 
 #ifdef _DEBUG
 #define new DEBUG_NEW
@@ -28,11 +29,17 @@ void CConBoxDlg::DoDataExchange(CDataExchange* pDX)
     CDialog::DoDataExchange(pDX);
 }
 
+// System menu item IDs. Must be multiples of 0x10 (low 4 bits reserved by Windows)
+// and below 0xF000 (above that are system-defined SC_ values handled by DefWindowProc).
+static const UINT ID_EXPORT_EMF = 0xE010;
+static const UINT ID_SAVE_TEXT  = 0xE020;
+
 BEGIN_MESSAGE_MAP(CConBoxDlg, CDialog)
     ON_WM_PAINT()
     ON_WM_QUERYDRAGICON()
     ON_WM_SIZE()
     ON_WM_DESTROY()
+    ON_WM_SYSCOMMAND()
 END_MESSAGE_MAP()
 
 
@@ -52,6 +59,14 @@ BOOL CConBoxDlg::OnInitDialog()
     // 최소화 버튼으로 창을 작업표시줄 아이콘으로 보낼 수 있다. (EXSTYLE 에 WS_EX_APPWINDOW 가 있어 항상 표시됨)
     ModifyStyle(0, WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX);
     SetWindowPos(NULL, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+
+    // 시스템 메뉴(타이틀바 왼쪽 아이콘 클릭 메뉴)에 EMF 내보내기 항목을 추가한다.
+    CMenu* sys_menu = GetSystemMenu(FALSE);
+    if (sys_menu) {
+        sys_menu->AppendMenu(MF_SEPARATOR);
+        sys_menu->AppendMenu(MF_STRING, ID_EXPORT_EMF, _T("Export EMF..."));
+        sys_menu->AppendMenu(MF_STRING, ID_SAVE_TEXT,  _T("Save Text..."));
+    }
 
     // 데모에서는 확인/취소 버튼을 쓰지 않으므로 제거한다.
     if (CWnd* ok = GetDlgItem(IDOK))
@@ -191,5 +206,49 @@ void CConBoxDlg::OnPaint()
 HCURSOR CConBoxDlg::OnQueryDragIcon()
 {
     return static_cast<HCURSOR>(m_hIcon);
+}
+
+void CConBoxDlg::OnSysCommand(UINT id, LPARAM lparam)
+{
+    // WM_SYSCOMMAND: low 4 bits of id carry system-internal flags; mask them before comparing.
+    if ((id & 0xFFF0) == ID_EXPORT_EMF) {
+        // Show the classic folder-browse dialog (no COM/OLE init required).
+        BROWSEINFO bi = {};
+        bi.hwndOwner = GetSafeHwnd();
+        bi.lpszTitle = _T("Select folder to save EMF files");
+        bi.ulFlags   = BIF_RETURNONLYFSDIRS;
+        LPITEMIDLIST pidl = ::SHBrowseForFolder(&bi);
+        if (pidl) {
+            TCHAR path[MAX_PATH] = {};
+            if (::SHGetPathFromIDList(pidl, path)) {
+                char utf8[MAX_PATH * 3] = {};
+                ::WideCharToMultiByte(CP_UTF8, 0, path, -1, utf8, sizeof(utf8), NULL, NULL);
+                con_box.save_emf(utf8);
+                AfxMessageBox(_T("EMF export complete."), MB_OK | MB_ICONINFORMATION);
+            }
+            ::CoTaskMemFree(pidl);
+        }
+    } else if ((id & 0xFFF0) == ID_SAVE_TEXT) {
+        CFileDialog dlg(FALSE, _T("txt"), _T("ConBox"),
+                        OFN_OVERWRITEPROMPT | OFN_HIDEREADONLY,
+                        _T("Text Files (*.txt)|*.txt|All Files (*.*)|*.*||"));
+        if (dlg.DoModal() == IDOK) {
+            CString wpath = dlg.GetPathName();
+            HANDLE hf = ::CreateFile(wpath, GENERIC_WRITE, 0, NULL,
+                                     CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+            if (hf != INVALID_HANDLE_VALUE) {
+                std::vector<std::string> lines = con_box.export_text();
+                for (const std::string& line : lines) {
+                    DWORD written;
+                    ::WriteFile(hf, line.c_str(), (DWORD)line.size(), &written, NULL);
+                    ::WriteFile(hf, "\r\n", 2, &written, NULL);
+                }
+                ::CloseHandle(hf);
+                AfxMessageBox(_T("Text saved."), MB_OK | MB_ICONINFORMATION);
+            }
+        }
+    } else {
+        CDialog::OnSysCommand(id, lparam);
+    }
 }
 

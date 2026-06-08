@@ -409,6 +409,9 @@ void set_resize_sink(void (*sink)(int cols, int rows, void* user), void* user);
 - `set_exit_callback` closes the window when the child exits.
 - The app is **System DPI Aware** (crisp at non-100% scaling) — set by the host
   (`SetProcessDPIAware()`), not the control, since DPI awareness is process-wide.
+- System menu (title-bar icon click) has two export items:
+  - **Export EMF…** — folder picker → `save_emf(dir)` → saves ConBox000.emf, ConBox001.emf, …
+  - **Save Text…** — file-save dialog → `export_text()` → writes UTF-8 lines with `\r\n` to `.txt`
 
 ---
 
@@ -449,6 +452,7 @@ const char* config_cmdline() const;               // cmdline from last setup cal
 | `scrollback_cap` | `max_scrollback` | 5000 |
 | `grid_cols`, `grid_rows` | stored in `cfg_cols`/`cfg_rows` | 96, 32 |
 | `cmdline` | stored in `cfg_cmdline` | powershell.exe |
+| `lines_per_page` | stored in `cfg_lines_per_page` | 50 |
 
 - **`color0..color15`**: xterm 256-color index 0-15 (the ANSI 16-color base palette). Format `#RRGGBB`.
   Defaults match the classic xterm colors (black/red/green/yellow/blue/magenta/cyan/white ×2 bright).
@@ -456,6 +460,33 @@ const char* config_cmdline() const;               // cmdline from last setup cal
 
 ---
 
-## 15. Reference
+## 15. Export API
+
+```cpp
+void                     save_emf(const char* dir);    // save scrollback+screen to EMF files in dir
+std::vector<std::string> export_text() const;          // return scrollback+screen as UTF-8 lines
+```
+
+### `save_emf(const char* dir)`
+- Writes `ConBox000.emf`, `ConBox001.emf`, … to `dir` (UTF-8 path).
+- Rows per page: `cfg_lines_per_page` (INI key `lines_per_page`, default 50).
+- All attributes preserved: fg/bg, bold, italic, underline, strikethrough, double-size. Blink fixed visible.
+- If the first row of a page has CELL_DOUBLE, a blank row is prepended (so 2x upward bleed is not clipped).
+- Rendering order: right-to-left per row (same as OnPaint) so CELL_DOUBLE rightward bleed overwrites already-drawn cells.
+- Glyphs stored as EMF text records (vector, not bitmap); fonts must be installed on the viewer machine.
+- `CreateEnhMetaFile` called with `lpRect=NULL` so GDI auto-computes the tight canvas from drawing ops (no extra whitespace on right/bottom).
+
+### `export_text() const`
+- Returns one `std::string` per row (scrollback first, then screen). No trailing newline; null-terminated.
+- All colors and attributes stripped; only characters remain. Trailing spaces trimmed per line.
+- Trail cell handling: `put_char` sets trail `ch=0` but **no CELL_WIDE flag** on the trail (only the lead has CELL_WIDE). Trail is skipped by position (lead+1), not by flag.
+- CELL_DOUBLE extras (2x cursor advance leaves blank cells):
+  - Korean (`CELL_WIDE|CELL_DOUBLE`, 4-cell advance): skip trail + 2 blank cells.
+  - English/etc (`CELL_DOUBLE` only, 2-cell advance): skip 1 blank cell.
+- Caller adds line endings and writes to file (see demo `OnSysCommand` for `\r\n` example).
+
+---
+
+## 16. Reference
 
 - For any behavior not specified here, follow **Windows Terminal (wt.exe)**.

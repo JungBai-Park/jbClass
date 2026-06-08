@@ -35,6 +35,7 @@ protected:
 	afx_msg HCURSOR OnQueryDragIcon();
 	afx_msg void OnSize(UINT type, int cx, int cy);
 	afx_msg void OnDestroy();
+	afx_msg void OnSysCommand(UINT id, LPARAM lparam);
 	DECLARE_MESSAGE_MAP()
 
 	// ConBox 와 확인/취소 버튼을 현재 창 크기에 맞춰 다시 배치한다.

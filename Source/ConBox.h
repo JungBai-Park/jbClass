@@ -176,6 +176,26 @@ public:
 	int         config_rows()    const { return cfg_rows; }
 	const char* config_cmdline() const { return cfg_cmdline.c_str(); }
 
+	// Export all content (scrollback + screen) to a series of EMF vector files in dir (UTF-8 path).
+	// Files are named ConBox000.emf, ConBox001.emf, ...
+	// Lines per page is read from the INI key lines_per_page (default 50).
+	// All cell attributes are preserved: fg/bg colors, bold, italic, underline, strikethrough,
+	// double-size. Blink cells are exported in the visible (on) state (static capture).
+	// If the first row of a page has CELL_DOUBLE glyphs, an extra blank row is prepended so the
+	// 2x upward bleed is not clipped. Glyphs are stored as text records in the EMF (vector, not
+	// bitmap); the original fonts must be installed on the machine where the EMF is opened.
+	void save_emf(const char* dir);
+
+	// Extract all content (scrollback + screen) as plain UTF-8 text lines.
+	// Returns one std::string per row (scrollback first); null-terminated, no trailing newline.
+	// All colors and attributes stripped; trailing spaces trimmed per line.
+	// Trail cells (put_char writes ch=0, flags=attr -- no CELL_WIDE on trail, only on lead) are
+	// skipped by position (lead+1), not by flag. Cell consumption per char:
+	//   Normal Korean (CELL_WIDE):              2 cells (lead + trail).
+	//   Double English (CELL_DOUBLE):           2 cells (lead + 1 blank from 2x advance).
+	//   Double Korean  (CELL_WIDE|CELL_DOUBLE): 4 cells (lead + trail + 2 blanks from 4x advance).
+	std::vector<std::string> export_text() const;
+
 	// Set the input sink (raw/terminal mode). Once set, ConBox does not locally edit/echo; it encodes
 	// keys/chars to VT sequences and UTF-8 bytes and pushes them to sink (for the child's stdin). user
 	// is an opaque context returned on each call. nullptr reverts to read-only viewer mode.
@@ -540,10 +560,11 @@ private:
 	bool sbar_dragging;      // dragging the thumb (held visible; SetCapture active)
 	int sbar_drag_off;       // px from thumb top to the grab point (so the thumb does not jump)
 
-	// config() result cache: grid size and cmdline stored for the host to query after config().
+	// config() result cache: grid size, cmdline, and export settings stored for the host to query.
 	int         cfg_cols;
 	int         cfg_rows;
 	std::string cfg_cmdline;
+	int         cfg_lines_per_page;  // EMF export: rows per page (lines_per_page INI key; default 50)
 
 	// Double-buffer cache reused by OnPaint (not recreated each frame).
 	CDC back_dc;            // persistent memory DC
