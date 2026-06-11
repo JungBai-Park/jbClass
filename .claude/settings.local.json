@@ -16,7 +16,9 @@
       "Bash(cd /d D:\\\\Work\\\\Study\\\\ConBox\\\\Temp)",
       "Bash(csc.exe write_null.cs)",
       "Bash(findstr /n \"view_top\" Source/ConBox.cpp)",
-      "Bash(PowerShell *)"
+      "Bash(PowerShell *)",
+      "Bash(Test-Path D:\\\\Work\\\\Study\\\\ConBox\\\\Temp *)",
+      "PowerShell(python \"D:\\\\Work\\\\Study\\\\ConBox\\\\Temp\\\\md_to_txt.py\")"
     ]
   }
 }

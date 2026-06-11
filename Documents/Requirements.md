@@ -28,6 +28,9 @@ Paths are relative to the project root. When a detail is unspecified, follow **W
   (ConPTY API) **only if `start()` is called** — the control functions as a pure view (log/diagnostic
   display) on any Win10 without ConPTY if `start()` is never invoked. Both files are **ASCII**
   (comments ASCII-only, so no BOM needed).
+- **MBCS build compatible**: all MFC/Win32 calls in ConBox.h/ConBox.cpp use explicit W-suffix variants
+  (`::CreateFontIndirectW`, `::TextOutW`, `::GetObjectW`, `::CreateEnhMetaFileW`) so the portability
+  unit compiles under both Unicode and Multi-Byte Character Set project settings.
 - **Known limitation**: runtime resize (WM_SIZE changing cols/rows while scrollback+screen content exists)
   does **not** reflow wrapped lines. Each existing Row is padded/truncated to the new cols width but not
   merged/split to undo autowrap. Reflow (rewrapping all lines to fit a new width) is not implemented.
@@ -45,6 +48,9 @@ int  grid_cols() const;   // current screen grid columns (English cells)
 int  grid_rows() const;   // current screen grid rows
 ```
 
+- `open()` registers the window class `"ConBox"` (fixed name via `RegisterClassExW`). Multiple
+  instances in one process are safe. Host/test code can locate any instance with
+  `FindWindowEx(parent, NULL, L"ConBox", NULL)`.
 - `client_size_for_grid` returns the client pixel size to hold `cols` x `rows` cells including
   `set_margin` padding; cell px depends on font/DPI so call after `open()`.
 - `grid_cols`/`grid_rows` give the current grid; `start()` internally reads them to size the child
@@ -181,7 +187,7 @@ void print(const char* text);   // UTF-8 bytes, interpreted as VT/ANSI escape se
 ## 7. Color API
 
 ```cpp
-void set_color(COLORREF fg);      // foreground
+void set_fg_color(COLORREF fg);   // foreground
 void set_bg_color(COLORREF bg);   // background
 ```
 
@@ -229,23 +235,24 @@ variants (efont_double/kfont_double) are built in calc_cell_size once fonts are 
 ### Cursor & IME
 
 ```cpp
-void set_cursor(int type);                            // shape; 0 = default (see below)
+void set_cursor(int type);                            // shape; 0 = default. Pass CursorType enum or raw int.
 void set_cursor_blend(int bg_weight, int fg_weight);  // block/underline color mix, default 4:6 (bg:fg)
-void set_cursor_blink(int interval_ms);               // toggle ms; 0 = always on
+void set_cursor_blink(int interval_ms);               // toggle ms; 0 = follow system caret rate (GetCaretBlinkTime); if system blink disabled -> always on
 ```
 
-- **`set_cursor(type)`** — cursor shape. `0` = default = **blinking underline (3)**, matching the
-  classic conhost.exe cursor. Explicit types:
-  `1`=blinking block, `2`=fixed block, `3`=blinking underline, `4`=fixed underline,
-  `5`=blinking I-beam, `6`=fixed I-beam. **Odd = blinking, even = fixed.** Fixed types kill the blink
-  timer and stay solid; odd types blink per `set_cursor_blink`.
+- **`set_cursor(type)`** — cursor shape. Use `CursorType` enum constants (defined in `ConBox.h`):
+  `CURSOR_DEFAULT(0)`→blinking underline (classic conhost.exe default),
+  `CURSOR_BLINKING_BLOCK(1)`, `CURSOR_FIXED_BLOCK(2)`,
+  `CURSOR_BLINKING_UNDER(3)`, `CURSOR_FIXED_UNDER(4)`,
+  `CURSOR_BLINKING_IBEAM(5)`, `CURSOR_FIXED_IBEAM(6)`.
+  **Odd = blinking, even = fixed.** Fixed types kill the blink timer and stay solid; odd types blink per `set_cursor_blink`.
 - **Block** (1/2): fills the cell with the blend color; any glyph under it is redrawn in default fg on
   top so it shows (a 2-cell Korean block redraws both covered glyphs).
 - **Underline** (3/4): a **3px-high bar at the cell bottom** in the blend color; the glyph stays
   visible above it (no redraw).
 - **I-beam** (5/6): a vertical bar at the cell's **left edge** (the insertion point). Drawn in **pure
   default fg** (not the blend). English = **1px** wide; Korean (2-cell) = **3px** wide.
-- Cursor color **blend** = mix of default bg and fg (set via `set_bg_color`/`set_color`, defaulting to
+- Cursor color **blend** = mix of default bg and fg (set via `set_bg_color`/`set_fg_color`, defaulting to
   RGB(32,32,32)/RGB(200,200,200)) at `bg_weight:fg_weight`, default **4:6 (leans fg)**. Independent of
   the SGR colors of the last printed text. Used by block/underline and the IME composing box outline;
   the I-beam ignores it (pure fg).
@@ -409,9 +416,10 @@ void set_resize_sink(void (*sink)(int cols, int rows, void* user), void* user);
 - `set_exit_callback` closes the window when the child exits.
 - The app is **System DPI Aware** (crisp at non-100% scaling) — set by the host
   (`SetProcessDPIAware()`), not the control, since DPI awareness is process-wide.
-- System menu (title-bar icon click) has two export items:
+- System menu (title-bar icon click) has three export items:
   - **Export EMF…** — folder picker → `save_emf(dir)` → saves ConBox000.emf, ConBox001.emf, …
-  - **Save Text…** — file-save dialog → `export_text()` → writes UTF-8 lines with `\r\n` to `.txt`
+  - **Save Text…** — file-save dialog → `get_text_lines()` → writes UTF-8 lines with `\r\n` to `.txt`
+  - **Save PDF…** — file-save dialog → `save_pdf(path)` → writes a PDF via the system PDF printer
 
 ---
 
@@ -442,41 +450,55 @@ const char* config_cmdline() const;               // cmdline from last setup cal
 | `efont_name`, `efont_size`, `efont_opts` | `set_efont` | Cascadia Mono, 12, "" |
 | `kfont_name`, `kfont_size`, `kfont_opts` | `set_kfont` | Malgun Gothic, 0 (match), "B" |
 | `margin_top/left/bottom/right` | `set_margin` | 10 each |
-| `adjust_left/top/right/bottom` | `adjust` | 0 each |
-| `fg`, `bg` | `set_color`, `set_bg_color` | #C8C8C8, #202020 |
-| `color0`..`color15` | `ansi_colors[i]` | xterm default base16 (see below) |
+| `adjust_left/top/right/bottom` | `adjust` | left/right/bottom=0, top=-2 |
+| `screen_text`, `screen_back` | `set_fg_color`, `set_bg_color` | #C8C8C8, #202020 |
+| `screen_palette00`..`screen_palette15` | `ansi_colors[i]` (0-indexed) | xterm default base16 (see below) |
+| `paper_text`, `paper_back` | `paper_default_fg`, `paper_default_bg` | #000000, #FFFFFF |
+| `paper_palette00`..`paper_palette15` | `paper_ansi_colors[i]` (0-indexed) | semantic inversion (see below) |
 | `cursor_type` | `set_cursor` | 0 (→ 3 blinking underline) |
 | `cursor_blend_bg`, `cursor_blend_fg` | `set_cursor_blend` | 4, 6 |
 | `cursor_blink_ms` | `set_cursor_blink` | 0 (system rate) |
-| `builtin_glyphs` | `set_builtin_glyphs` | 1 |
+| `builtin_glyphs` | `set_builtin_glyphs` | 2 |
 | `scrollback_cap` | `max_scrollback` | 5000 |
 | `grid_cols`, `grid_rows` | stored in `cfg_cols`/`cfg_rows` | 96, 32 |
-| `cmdline` | stored in `cfg_cmdline` | powershell.exe |
-| `lines_per_page` | stored in `cfg_lines_per_page` | 50 |
+| `cmdline` | stored in `cfg_cmdline` | cmd.exe |
+| `lines_per_paper` | stored in `cfg_lines_per_paper` | 50 |
 
-- **`color0..color15`**: xterm 256-color index 0-15 (the ANSI 16-color base palette). Format `#RRGGBB`.
-  Defaults match the classic xterm colors (black/red/green/yellow/blue/magenta/cyan/white ×2 bright).
-  Changing these recolors all SGR 30-37/40-47/90-97/100-107 output.
+- **`screen_palette00..15`**: ANSI 16-color base palette (0-indexed, matching ANSI indices directly). Format `#RRGGBB`. Defaults match classic xterm colors (black/red/green/yellow/blue/magenta/cyan/white ×2 bright). Changing these recolors all SGR 30-37/40-47/90-97/100-107 screen output.
+- **`paper_palette00..15`**: export palette applied by `remap_paper_color()` in `save_emf`/`save_pdf`. Screen and paper palettes are fully independent. Default is a **semantic inversion** for white-background export: index 0 (screen bg = black) → #FFFFFF (paper bg = white); index 7 (screen fg = white) → #000000 (paper fg = black); index 8 (bright bg) → #EEEEEE (near-white); index 15 (bright fg = most emphasized) → #000000 (black). Chromatic pairs 1-6 / 9-14 are collapsed to the same dark Tango color so bright variants (yellow, cyan, green) don't become invisible on white paper.
 
 ---
 
 ## 15. Export API
 
 ```cpp
-void                     save_emf(const char* dir);    // save scrollback+screen to EMF files in dir
-std::vector<std::string> export_text() const;          // return scrollback+screen as UTF-8 lines
+bool                     save_emf(const char* dir);    // save scrollback+screen to EMF files; true if wrote any
+bool                     save_pdf(const char* path);   // save scrollback+screen to PDF via system printer
+std::vector<std::string> get_text_lines() const;       // return scrollback+screen as UTF-8 lines
 ```
+
+### Paper color remapping (`remap_paper_color`)
+Both `save_emf` and `save_pdf` apply paper colors instead of screen colors: each cell's `fg`/`bg`
+COLORREF is passed through `remap_paper_color()`, which substitutes `default_fg`→`paper_default_fg`,
+`default_bg`→`paper_default_bg`, and `ansi_colors[i]`→`paper_ansi_colors[i]`. Truecolor/256-color
+values not in the 18-entry table pass through unchanged.
 
 ### `save_emf(const char* dir)`
 - Writes `ConBox000.emf`, `ConBox001.emf`, … to `dir` (UTF-8 path).
-- Rows per page: `cfg_lines_per_page` (INI key `lines_per_page`, default 50).
-- All attributes preserved: fg/bg, bold, italic, underline, strikethrough, double-size. Blink fixed visible.
+- Rows per page: `cfg_lines_per_paper` (INI key `lines_per_paper`, default 50).
+- All attributes preserved: fg/bg (paper-remapped), bold, italic, underline, strikethrough, double-size. Blink fixed visible.
 - If the first row of a page has CELL_DOUBLE, a blank row is prepended (so 2x upward bleed is not clipped).
 - Rendering order: right-to-left per row (same as OnPaint) so CELL_DOUBLE rightward bleed overwrites already-drawn cells.
 - Glyphs stored as EMF text records (vector, not bitmap); fonts must be installed on the viewer machine.
 - `CreateEnhMetaFile` called with `lpRect=NULL` so GDI auto-computes the tight canvas from drawing ops (no extra whitespace on right/bottom).
 
-### `export_text() const`
+### `save_pdf(const char* path)`
+- Saves scrollback+screen to a PDF file at `path` (UTF-8) via the system "Microsoft Print to PDF" printer.
+- Returns `false` if no PDF printer is found (printer name must contain "PDF") or if the print job fails.
+- Rendering identical to `save_emf` (same cell loop; MM_ANISOTROPIC viewport scaling so cell/font sizes match the screen appearance at the correct DPI). Paper colors applied via `remap_paper_color`.
+- Demo: "Save PDF…" in the system menu.
+
+### `get_text_lines() const`
 - Returns one `std::string` per row (scrollback first, then screen). No trailing newline; null-terminated.
 - All colors and attributes stripped; only characters remain. Trailing spaces trimmed per line.
 - Trail cell handling: `put_char` sets trail `ch=0` but **no CELL_WIDE flag** on the trail (only the lead has CELL_WIDE). Trail is skipped by position (lead+1), not by flag.
@@ -484,6 +506,22 @@ std::vector<std::string> export_text() const;          // return scrollback+scre
   - Korean (`CELL_WIDE|CELL_DOUBLE`, 4-cell advance): skip trail + 2 blank cells.
   - English/etc (`CELL_DOUBLE` only, 2-cell advance): skip 1 blank cell.
 - Caller adds line endings and writes to file (see demo `OnSysCommand` for `\r\n` example).
+
+### `save_log(const char* file_name = 0)`
+```cpp
+int save_log(const char* file_name = 0);
+```
+- **file_name non-null/non-empty**: open/create the file and begin logging. Each raw byte received
+  from the child via `pump()` is written before VT parsing — VT codes intact, no CR/LF conversion,
+  no encoding conversion. Returns 0 on success, `GetLastError()` on failure.
+- **file_name null or empty** (default): close the log file. Returns 0.
+- **Append mode**: uses `OPEN_ALWAYS` + seek-to-end; existing content is preserved. At the start of
+  each session a separator is prepended: 4 blank lines then a 100-column line
+  `--- YYYY-MM-DD HH:MM:SS ---...` with the local start time.
+- **No window needed**: may be called before `open()`. Actual bytes flow once the child is running
+  (after `start()`). Window close (`OnDestroy`) auto-closes any open log.
+- Demo: `con_box.save_log("Temp\\ConBox.log")` called after `SetCurrentDirectory` (so the relative
+  path resolves to the project root) and before `start()`.
 
 ---
 

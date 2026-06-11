@@ -9,7 +9,8 @@
 // contents lets you find one function without reading the whole file).
 //
 // --- Requirements / dependencies ---
-//   - MFC (Unicode), Windows only. Depends on afxwin.h.
+//   - MFC (Unicode or MBCS), Windows only. Depends on afxwin.h. All Win32/MFC calls in the
+//     portability unit use explicit W-suffix functions so both character-set settings compile.
 //   - start() (ConPTY child) needs Windows 10 1809 (build 17763)+. Pure-view use does not.
 //   - imm32.lib (Korean IME) is auto-linked by ConBox.cpp via #pragma comment (no host setup).
 //   - For crisp glyphs the HOST app calls SetProcessDPIAware() at startup. DPI awareness is a
@@ -125,7 +126,7 @@ public:
 
 	// Default foreground / background color for subsequent output (child SGR may override; SGR
 	// 0/39/49 reset to these). Also the basis for the cursor block blend.
-	void set_color(COLORREF fg);
+	void set_fg_color(COLORREF fg);
 	void set_bg_color(COLORREF bg);
 
 	// Cursor color = blend of default bg:fg at this weight ratio. Default bg 4 : fg 6 (leans fg).
@@ -133,17 +134,24 @@ public:
 	// this blend; this blend is the block/underline color and the IME composing box outline.)
 	void set_cursor_blend(int bg_weight, int fg_weight);
 
-	// Cursor blink interval (ms); 0 = never blink (always on). Default follows the system caret rate
-	// (GetCaretBlinkTime).
+	// Cursor blink interval (ms); 0 (or negative) = follow the system caret rate (GetCaretBlinkTime);
+	// if the system has blink disabled (INFINITE) the cursor stays always on. Positive = fixed rate.
 	void set_cursor_blink(int interval_ms);
 
-	// Set the cursor shape. 0 = default (= blinking underline, type 3, matching classic conhost.exe).
-	// Explicit shapes:
-	//   1=blinking block, 2=fixed block, 3=blinking underline, 4=fixed underline,
-	//   5=blinking I-beam, 6=fixed I-beam.
-	// Odd types blink (subject to set_cursor_blink / system rate); even types stay solid. Block and
-	// underline hide while a Korean IME composition is active (only the composing glyph shows); the
-	// I-beam stays visible during composition. Korean (2-cell) cursors render 2 cells wide.
+	// Cursor shape constants for set_cursor(). Odd = blinks, even = fixed.
+	enum CursorType {
+		CURSOR_DEFAULT        = 0,   // -> CURSOR_BLINKING_UNDER (classic conhost.exe default)
+		CURSOR_BLINKING_BLOCK = 1,
+		CURSOR_FIXED_BLOCK    = 2,
+		CURSOR_BLINKING_UNDER = 3,
+		CURSOR_FIXED_UNDER    = 4,
+		CURSOR_BLINKING_IBEAM = 5,
+		CURSOR_FIXED_IBEAM    = 6,
+	};
+
+	// Set the cursor shape. Pass a CursorType constant or its raw int (0-6). Block and underline hide
+	// while a Korean IME composition is active; the I-beam stays visible. Korean (2-cell) cursors
+	// render 2 cells wide.
 	void set_cursor(int type);
 
 	// Inner padding (px); glyphs draw only inside it. CSS-shorthand omission of negative sides:
@@ -178,13 +186,21 @@ public:
 
 	// Export all content (scrollback + screen) to a series of EMF vector files in dir (UTF-8 path).
 	// Files are named ConBox000.emf, ConBox001.emf, ...
-	// Lines per page is read from the INI key lines_per_page (default 50).
+	// Lines per page is read from the INI key lines_per_paper (default 50).
 	// All cell attributes are preserved: fg/bg colors, bold, italic, underline, strikethrough,
 	// double-size. Blink cells are exported in the visible (on) state (static capture).
 	// If the first row of a page has CELL_DOUBLE glyphs, an extra blank row is prepended so the
 	// 2x upward bleed is not clipped. Glyphs are stored as text records in the EMF (vector, not
 	// bitmap); the original fonts must be installed on the machine where the EMF is opened.
-	void save_emf(const char* dir);
+	bool save_emf(const char* dir);   // returns true if at least one EMF file was written
+
+	// Save all content (scrollback+screen) to a PDF file via the system PDF printer.
+	// path: UTF-8 output file path (e.g. "C:\\out.pdf"). The output PDF is written directly
+	// without showing a Save dialog (DOCINFO.lpszOutput). Returns false if no PDF printer is
+	// found (a printer whose name contains "PDF", e.g. "Microsoft Print to PDF") or if the
+	// print job fails. Rendering is identical to save_emf (same cell loop, MM_ANISOTROPIC
+	// viewport scaling so cell/font sizes match the screen appearance at the correct DPI).
+	bool save_pdf(const char* path);
 
 	// Extract all content (scrollback + screen) as plain UTF-8 text lines.
 	// Returns one std::string per row (scrollback first); null-terminated, no trailing newline.
@@ -194,7 +210,15 @@ public:
 	//   Normal Korean (CELL_WIDE):              2 cells (lead + trail).
 	//   Double English (CELL_DOUBLE):           2 cells (lead + 1 blank from 2x advance).
 	//   Double Korean  (CELL_WIDE|CELL_DOUBLE): 4 cells (lead + trail + 2 blanks from 4x advance).
-	std::vector<std::string> export_text() const;
+	std::vector<std::string> get_text_lines() const;
+
+	// Start or stop raw child-output logging. file_name (UTF-8 path): open/create the file and begin
+	// logging; each raw byte from the child (VT codes intact, no CR/LF conversion, no encoding
+	// conversion) is written as received by pump(). nullptr or empty string: close the log file.
+	// Returns 0 on success, GetLastError() code on failure. May be called before open() (no window
+	// needed); actual bytes start flowing once the child is running (after start()).
+	int save_log(const char* file_name = 0);
+	bool is_logging() const { return log_file != INVALID_HANDLE_VALUE; }
 
 	// Set the input sink (raw/terminal mode). Once set, ConBox does not locally edit/echo; it encodes
 	// keys/chars to VT sequences and UTF-8 bytes and pushes them to sink (for the child's stdin). user
@@ -365,6 +389,10 @@ private:
 	// last printed SGR colors).
 	COLORREF blend_cursor_color() const;
 
+	// Map a screen COLORREF to its paper (export) equivalent. Used by save_emf / save_pdf.
+	// Matches default_fg/bg and ansi_colors[0..15]; truecolor / 256-color values pass through.
+	COLORREF remap_paper_color(COLORREF c) const;
+
 	// Make the cursor visible now and restart the blink timer (so it is solid for a beat after
 	// input/move/output).
 	void bump_cursor();
@@ -417,6 +445,7 @@ private:
 	bool child_running;
 	void (*exit_cb)(void* user);     // child natural-exit callback (nullptr if none)
 	void* exit_cb_user;
+	HANDLE log_file;                 // raw child-output log; INVALID_HANDLE_VALUE = not logging
 
 	// On detecting child exit, clean up then fire the exit callback. stop() runs first so the callback
 	// may safely restart (start()) immediately.
@@ -428,7 +457,14 @@ private:
 	COLORREF default_fg; // default RGB(200,200,200)
 	COLORREF default_bg; // default RGB(32,32,32)
 
-	COLORREF ansi_colors[16]; // xterm 256-color index 0-15 (base ANSI palette); configurable via color0..color15
+	COLORREF ansi_colors[16];     // xterm 256-color index 0-15 (base ANSI palette); configurable via screen_palette01..16
+
+	// Paper (export) colors used by save_emf / save_pdf. Defaults are Tango Light theme.
+	// Configurable via paper_text / paper_back / paper_palette01..16 in the [paper] INI section.
+	// remap_paper_color() maps any cell COLORREF from the screen palette to its paper equivalent.
+	COLORREF paper_default_fg;      // paper fg; default: #000000
+	COLORREF paper_default_bg;      // paper bg; default: #FFFFFF
+	COLORREF paper_ansi_colors[16]; // paper ANSI palette; Tango Light defaults
 
 	COLORREF cur_fg;     // current SGR foreground
 	COLORREF cur_bg;     // current SGR background
@@ -489,7 +525,8 @@ private:
 	int cur_col;                  // 0..cols
 
 	bool cursor_visible;          // DECTCEM (?25): cursor shown (default true)
-	int  saved_row, saved_col;    // saved by DECSC/DECRC
+	struct SavedCursor { int row, col; };
+	SavedCursor saved_cur;        // saved by DECSC/DECRC (ESC 7/8, CSI s/u)
 
 	// In-progress (uncommitted) IME string. Empty = no composition. When non-empty OnPaint draws it in
 	// the cursor cell itself (instead of system inline) to pin it to the cursor.
@@ -510,8 +547,7 @@ private:
 	// Alt screen. Full-screen TUIs switch in via ?1049 (/?1047/?47).
 	std::vector<Row> main_saved;  // main screen backed up on entry (restored on leave)
 	bool alt_active;              // alt screen active (scrollback frozen/hidden while so)
-	int  saved_main_row;          // main-screen cursor saved on entry
-	int  saved_main_col;
+	SavedCursor saved_main_cur;   // main-screen cursor saved on alt entry
 
 	// VT parser state (members so a sequence survives across chunked print() calls).
 	char utf8_tail[3];            // trailing incomplete UTF-8 lead bytes carried over from previous print()
@@ -564,12 +600,16 @@ private:
 	int         cfg_cols;
 	int         cfg_rows;
 	std::string cfg_cmdline;
-	int         cfg_lines_per_page;  // EMF export: rows per page (lines_per_page INI key; default 50)
+	int         cfg_lines_per_paper; // EMF export: rows per page (lines_per_paper INI key; default 50)
 
 	// Double-buffer cache reused by OnPaint (not recreated each frame).
-	CDC back_dc;            // persistent memory DC
-	CBitmap back_bmp;       // back buffer bitmap (matches client size)
-	CBitmap* back_old_bmp;  // bitmap originally in back_dc (restored on teardown)
-	int back_w;             // current back_bmp size (change detection)
+	CDC back_dc;              // persistent memory DC
+	CBitmap back_bmp;         // back buffer bitmap (matches client size)
+	CBitmap* back_bmp_saved;  // bitmap originally selected into back_dc (restored on teardown)
+	int back_w;               // current back_bmp size (change detection)
 	int back_h;
+
+	// Reusable buffers for print(): avoids per-call heap allocation on the pump() hot path.
+	std::string         print_buf;  // UTF-8 working buffer (tail + new bytes)
+	std::vector<wchar_t> print_ws;  // UTF-16 conversion output
 };

@@ -24,15 +24,32 @@ Concise notes Claude should recall each session. Implementation truth = `Source/
 - vcxproj **filters** use one `소스 파일` filter (IDE-only; unrelated to disk/build).
 - String-input APIs (`set_efont`/`set_kfont`/`print`) take `const char*` UTF-8 (C++ literals pass directly).
 
+## MBCS build compatibility
+- ConBox.h/ConBox.cpp compile under both Unicode and MBCS project settings. All MFC/Win32 calls
+  use explicit W-suffix variants to avoid TCHAR-mapped ambiguity. Key rules:
+  - **Font creation**: `CFont::CreateFontIndirectW` does NOT exist in MBCS builds. Use
+    `CFont::Attach(::CreateFontIndirectW(&lf))` instead (always calls the W Win32 function).
+  - **Font retrieval**: `CFont::GetLogFont(LOGFONTW*)` in MBCS calls `GetObjectA` → struct layout
+    mismatch (LOGFONTA 60 bytes vs LOGFONTW 92 bytes). Use `::GetObjectW(hFont, sizeof(LOGFONTW), &lf)`.
+  - **Text output**: `CDC::TextOutW` does NOT exist in MBCS builds. Use `::TextOutW(dc.GetSafeHdc(), ...)`.
+  - **EMF creation**: `::CreateEnhMetaFile` in MBCS = `CreateEnhMetaFileA`. Use `::CreateEnhMetaFileW` explicitly.
+  - **Demo paths**: `TCHAR path[]` + `SHGetPathFromIDList` → use `wchar_t[]` + `SHGetPathFromIDListW`.
+    `CString` with `WideCharToMultiByte` → use `CStringW wpath(str.GetString())` (direct-init; explicit ctor).
+- **`replace_all` ordering pitfall**: when doing bulk replacements, a shorter pattern can be a
+  substring of a longer one (e.g. `dc.TextOutW(` inside `cdc.TextOutW(`). Replace the longer pattern
+  FIRST, or fix up the garbled results afterward.
+
 ## Demo & automated verification (GUI)
 - GUI app: run via PowerShell, then **capture screen** to verify.
 - Keys: `SendInput` (KEYEVENTF_UNICODE; INPUT is 40 bytes on x64) or WScript.Shell `SendKeys`.
   **`PostMessage(WM_CHAR)` is eaten** by the dialog pump — use the input-queue path.
 - SendKeys gotcha: `+ ^ % ~ ( ) { } [ ]` are special; send literal `+`/`(` as `{+}`/`{(}`
-  (`7*7` is fine, but `1+2` → `1@`). The ConBox child window class starts with "Afx...".
-- Demo child = **`powershell.exe`** (interactive stdio shell; representative target). Verify:
-  `7*7`+Enter → `49`; colored prompt (PSReadLine = limited VT100); `exit`+Enter → child exits →
-  `set_exit_callback` closes the window, no crash.
+  (`7*7` is fine, but `1+2` → `1@`). The ConBox window class is `"ConBox"` (fixed name);
+  use `FindWindowEx(parent, NULL, L"ConBox", NULL)` to locate it from host/test scripts.
+  Multiple instances in one process are safe — `GetClassInfoExW` guards duplicate registration.
+- Demo child = **`cmd.exe`** (default cmdline in INI; was powershell.exe). To test PSReadLine
+  colors, change `cmdline=powershell.exe` in ConBox.ini. Verify: `7*7`+Enter → `49`; `exit`+Enter →
+  child exits → `set_exit_callback` closes the window, no crash.
 - Self-dump beats external screenshot: `PrintWindow`/`GetWindowDC` come out **black** (double-buffer
   + DWM). Use the harness PNG dump; for a real WT window, `AttachThreadInput`+`CopyFromScreen`.
 
@@ -66,8 +83,11 @@ To reproduce `calc_cell_size` values (`cell_w`/`natw`/`kwid`):
   (already semi-bold/bold), use FW_EXTRABOLD(800) for visual enhancement; else FW_BOLD(700). Allows
   already-bold fonts (e.g. Malgun Gothic B) to become thicker on SGR bold.
 - **BLINK_TIMER** (ID=2, 500ms): separate from CURSOR_TIMER(1), PUMP_TIMER(3), SBAR_TIMER(4). Toggles
-  `blink_on`, invalidates whole screen (blink cells may be anywhere). SGR blink cells render glyph
-  only when `blink_on=true`; decoration lines (underline/strike) always drawn.
+  `blink_on`; calls `Invalidate(FALSE)` only when CELL_BLINK cells are visible. SGR blink cells render
+  glyph only when `blink_on=true`; decoration lines (underline/strike) always drawn.
+  **Must scan visible viewport** via `line_at(view_top + row)` (0..rows-1), NOT `screen[]` alone —
+  when the user has scrolled back, visible rows come from scrollback; scanning only `screen[]` misses
+  them and the blink state change never reaches the screen (blink appears frozen).
 - **OnPaint rendering**: for each cell, select font based on (CELL_WIDE, CELL_BOLD, CELL_ITALIC) → 4-way
   branch to one of {efont, efont_bold, efont_italic, efont_bold_italic, kfont, ...}. After glyph,
   draw underline (1px at cell bottom) / strike (1px at middle) if flags set, in cell's fg color.
@@ -92,12 +112,11 @@ To reproduce `calc_cell_size` values (`cell_w`/`natw`/`kwid`):
   match mode kfont's final height is only settled inside calc_cell_size; building kfont_double in
   set_kfont captures the pre-match (size 0) LOGFONT -> Korean rendered ~1x. Symptom seen: English 2x OK
   but Korean stayed 1x until the build was moved to calc_cell_size.
-- **2-pass deferred render in OnPaint**: double glyphs bleed up (2x ascent) + right (2x width) past
-  their cell. Drawing inline lets a later neighbor's `FillSolidRect(bg)` erase the bleed (looks 1x /
-  clipped). Fix: collect double cells (DeferredDouble: px,py,w,ch,fg,cw,flags) during the main loop
-  (background still fills inline, 1-cell), then draw them in a second pass after the whole grid. Their
-  underline/strike are deferred too, spanning the doubled width (`2*w*cell_w`): underline at
-  `cell_base+2`, strike at `cell_base-cell_h/2`.
+- **Right-to-left column rendering solves CELL_DOUBLE bleed** (no 2nd pass): double glyphs bleed
+  right (2x width) over neighboring cells. By rendering columns right-to-left within each row, the
+  right neighbors are already painted before the double glyph draws over them — so the bleed is never
+  erased by a later cell's background fill. Upward bleed (2x ascent) is safe because rows are rendered
+  top-to-bottom (the row above is already complete). Underline/strike span the doubled width inline.
 - **Child must leave blank line above** (bleed goes upward, NOT downward). No manual spaces needed
   between big chars — `put_char` auto-advances `cur_col` by `w*2` in double mode (English: +2,
   Korean: +4), so the child writes `"가나다"` directly and ConBox leaves the correct gap.
@@ -109,7 +128,12 @@ To reproduce `calc_cell_size` values (`cell_w`/`natw`/`kwid`):
   underline, like classic conhost.exe). **Odd=blink, even=fixed** — `set_cursor`/`bump_cursor`/
   `OnTimer` all gate the blink timer on `(cursor_type & 1)`. The shape itself is chosen in `OnPaint`'s
   cursor branch: `<=2` block, `<=4` underline, else I-beam.
-- color = `blend_cursor_color()` mixing `default_bg`:`default_fg` at `cursor_bg_weight:cursor_fg_weight` (default **4:6**, leans fg; `set_cursor_blend`). The default colors are stored in `default_fg` and `default_bg` (updated via `set_color`/`set_bg_color`), keeping the cursor blend independent of the SGR colors of the last printed text. Block/underline use the blend; **I-beam uses pure `default_fg`**. Width 2 cells if `is_hangul_mode()` else 1.
+- color = `blend_cursor_color()` mixing `default_bg`:`default_fg` at `cursor_bg_weight:cursor_fg_weight` (default **4:6**, leans fg; `set_cursor_blend`). The default colors are stored in `default_fg` and `default_bg` (updated via `set_fg_color`/`set_bg_color`), keeping the cursor blend independent of the SGR colors of the last printed text. Block/underline use the blend; **I-beam uses pure `default_fg`**. Width 2 cells if `is_hangul_mode()` else 1.
+- **`set_cursor_blink(0)` = system rate** (NOT "always on"). When 0 is passed, `GetCaretBlinkTime()`
+  is called and the result is stored as `cursor_blink_ms`. If the system has blink disabled (INFINITE),
+  then cursor_blink_ms stays 0 → always on. Root cause of the original bug: the INI default is
+  `cursor_blink_ms = 0` (comment: "시스템 설정 따름"), but old implementation set cursor_blink_ms=0
+  and never started CURSOR_TIMER, so cursor_type=0 (→3 blinking underline) never blinked.
 - **I-beam** sits at the cell's **left edge** (insertion point): English 1px, Korean 3px, all `default_fg`.
   During IME composition the I-beam is the one shape that stays visible — drawn (3px) to the **right** of
   the hollow box (after the composing glyph, so it is on top). Block/underline are hidden while composing.
@@ -181,6 +205,14 @@ To reproduce `calc_cell_size` values (`cell_w`/`natw`/`kwid`):
   Verify: each syllable forms in the cursor cell with prior text in place, following text not hidden,
   restored on commit.
 
+## save_log (raw child output logging)
+- `save_log(file_name)` opens/creates in append mode (`OPEN_ALWAYS` + `SetFilePointerEx(FILE_END)`).
+  Each session prepends a separator: 4 blank lines + `--- YYYY-MM-DD HH:MM:SS ---...` (100 cols).
+- **CWD matters**: `save_log("Temp\\ConBox.log")` uses a relative path. Call it AFTER `SetCurrentDirectory`
+  in the demo, or the path resolves to the wrong directory. Order in `OnInitDialog`:
+  `SetCurrentDirectory(...)` → `save_log(...)` → `start(...)`.
+- `log_file` member is `HANDLE` (INVALID_HANDLE_VALUE = not logging); auto-closed in `OnDestroy`.
+
 ## config / ANSI palette
 - `config()` was renamed to `setup_from_ini()`; a new `setup(const char* contents)` was added that
   accepts INI-format text from a string (useful for embedding config in the host). `ParseIni` was
@@ -191,8 +223,11 @@ To reproduce `calc_cell_size` values (`cell_w`/`natw`/`kwid`):
 - `Xterm256ToRgb` signature changed to `static COLORREF Xterm256ToRgb(int n, const COLORREF* pal)`.
   The old `static const COLORREF base16[16]` local was removed; callers pass `ansi_colors` (member).
   All 5 call sites in `dispatch_csi` pass `ansi_colors`.
-- `ansi_colors[16]` is a private member initialized in the constructor to the same values as the
-  former hardcoded `base16[]`. Configurable via `color0..color15` in the INI file.
+- `ansi_colors[16]` is a private member initialized in the constructor to xterm base16 defaults.
+  Configurable via `screen_palette00..15` in the INI file (**0-indexed**, matching ANSI indices directly).
+  **Key names**: `screen_text`/`screen_back`/`screen_palette00..15` (screen), `paper_text`/`paper_back`/
+  `paper_palette00..15` (paper). Old names `fg`/`bg`/`color0..15` and the 1-indexed `..01..16` variants
+  are gone.
 - `ParseColor` parses `#RRGGBB` strings; on failure returns the `def` argument unchanged.
 - **`ParseIni` must strip inline comments**: `key = value ; comment` — the `;` and everything after
   it must be truncated before storing the value (`strchr(v, ';')` + null-terminate). Without this,
@@ -200,8 +235,17 @@ To reproduce `calc_cell_size` values (`cell_w`/`natw`/`kwid`):
   on the second run, causing GDI to fall back to a substitute font with different metrics.
 - `CreateDefaultIni()` writes Korean UTF-8 comments as `\xNN` hex escapes to keep `.cpp` pure ASCII.
   Default INI filename is `ConBox.ini` (formerly `Config.ini`).
+- **Current INI defaults** (changed this session): `cmdline=cmd.exe` (was powershell.exe);
+  `adjust_top=-2` (was 0); `builtin_glyphs=2` (was 1); `lines_per_page` renamed to `lines_per_paper`.
+- **Paper palette** (`paper_default_fg/bg`, `paper_ansi_colors[16]`): independent second color set for
+  export (save_emf/save_pdf). Defaults use semantic inversion for white-bg export (see below).
+  Configurable via `paper_text`/`paper_back`/`paper_palette00..15` (0-indexed). `remap_paper_color()`
+  maps screen COLORREFs at render time (matches default_fg/bg and ansi_colors[0..15]; truecolor passes
+  through unchanged).
+- **Palette key naming**: `screen_palette00..15` / `paper_palette00..15` are 0-indexed (matching ANSI
+  color indices 0-15 directly). Older sessions used 1-indexed keys (01..16); those are now gone.
 
-## EMF export (save_emf / export_text)
+## EMF export (save_emf / get_text_lines)
 - **BeginPath/FillPath does NOT work on EMF DCs**: `TextOutW` on an EMF DC renders immediately
   regardless of the path bracket; `FillPath` fills an empty path. Correct approach: `SetTextColor(fg)` +
   `TextOutW`. Using path for vector text on EMF DCs silently produces wrong output (black text, no fill).
@@ -212,13 +256,25 @@ To reproduce `calc_cell_size` values (`cell_w`/`natw`/`kwid`):
   trail; only the lead has `CELL_WIDE`). Detecting trail by `ch==0 && CELL_WIDE` always fails → trail
   output as extra space. Correct detection: when the lead has `CELL_WIDE`, unconditionally skip lead+1
   (the trail), regardless of the trail's flags. This also affects `export_text` for single-size Korean.
-- **`export_text` cell consumption per char**:
+- **`get_text_lines` cell consumption per char**:
   - Normal English: 1 cell.
   - Normal Korean (`CELL_WIDE`): 2 cells (lead + skip trail at lead+1).
   - Double English (`CELL_DOUBLE`): 2 cells (lead + skip 1 blank from 2x advance).
   - Double Korean (`CELL_WIDE|CELL_DOUBLE`): 4 cells (lead + skip trail + skip 2 blanks from 4x advance).
 - **CDC::Detach() before CloseEnhMetaFile**: if CDC owns the HDC, its destructor calls `DeleteDC` after
   `CloseEnhMetaFile`, which is invalid. Always `cdc.Detach()` before calling `CloseEnhMetaFile`.
+- **Paper color remapping**: `remap_paper_color()` does an 18-entry table lookup (default_fg, default_bg,
+  ansi_colors[0..15]). Both save_emf and save_pdf pass every cell's c.fg/c.bg through this at render time.
+  Screen and paper palettes are independent; screen colors never contaminate paper output.
+- **Paper palette semantic inversion**: on a dark terminal, index 0 = bg (black), index 7 = fg (white),
+  index 8 = bright-bg, index 15 = bright-fg (most emphasized). For white-paper export the roles invert:
+  paper[0]=#FFFFFF (bg), paper[7]=#000000 (fg), paper[8]=#EEEEEE (near-white), paper[15]=#000000 (black).
+  Chromatic pairs (1-6 / 9-14) collapsed to the same dark Tango color so bright yellow/cyan/green don't
+  become invisible on white. Do NOT revert to Tango Light defaults (those had near-white at index 7/15).
+- **Korean UTF-8 hex encoding in CreateDefaultIni**: double-check hex escapes against a UTF-8 table.
+  Example mistake: U+C7A5 (장) encodes as `\xEC\x9E\xA5` (correct), NOT `\xEC\xA5\xBF` (wrong).
+  Wrong bytes produce a different character in the rendered INI comment. Use a UTF-8 table or encode with
+  Python: `'장'.encode('utf-8')` → `b'\xec\x9e\xa5`.
 
 ## scrollback container
 - `scrollback` is `std::deque<Row>` (not `std::vector`) so front removal when the cap is exceeded

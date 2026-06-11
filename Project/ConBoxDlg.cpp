@@ -31,8 +31,10 @@ void CConBoxDlg::DoDataExchange(CDataExchange* pDX)
 
 // System menu item IDs. Must be multiples of 0x10 (low 4 bits reserved by Windows)
 // and below 0xF000 (above that are system-defined SC_ values handled by DefWindowProc).
-static const UINT ID_EXPORT_EMF = 0xE010;
-static const UINT ID_SAVE_TEXT  = 0xE020;
+static const UINT ID_SAVE_EMF  = 0xE010;
+static const UINT ID_SAVE_TEXT = 0xE020;
+static const UINT ID_SAVE_PDF  = 0xE030;
+static const UINT ID_LOG       = 0xE040;
 
 BEGIN_MESSAGE_MAP(CConBoxDlg, CDialog)
     ON_WM_PAINT()
@@ -60,12 +62,15 @@ BOOL CConBoxDlg::OnInitDialog()
     ModifyStyle(0, WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX);
     SetWindowPos(NULL, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
 
-    // 시스템 메뉴(타이틀바 왼쪽 아이콘 클릭 메뉴)에 EMF 내보내기 항목을 추가한다.
+    // 시스템 메뉴(타이틀바 왼쪽 아이콘 클릭 메뉴)에 저장/로깅 항목을 추가한다.
     CMenu* sys_menu = GetSystemMenu(FALSE);
     if (sys_menu) {
         sys_menu->AppendMenu(MF_SEPARATOR);
-        sys_menu->AppendMenu(MF_STRING, ID_EXPORT_EMF, _T("Export EMF..."));
-        sys_menu->AppendMenu(MF_STRING, ID_SAVE_TEXT,  _T("Save Text..."));
+        sys_menu->AppendMenu(MF_STRING, ID_SAVE_EMF,  _T("Save EMF..."));
+        sys_menu->AppendMenu(MF_STRING, ID_SAVE_TEXT, _T("Save Text..."));
+        sys_menu->AppendMenu(MF_STRING, ID_SAVE_PDF,  _T("Save PDF..."));
+        sys_menu->AppendMenu(MF_SEPARATOR);
+        sys_menu->AppendMenu(MF_STRING, ID_LOG,       _T("Start Logging..."));
     }
 
     // 데모에서는 확인/취소 버튼을 쓰지 않으므로 제거한다.
@@ -211,7 +216,7 @@ HCURSOR CConBoxDlg::OnQueryDragIcon()
 void CConBoxDlg::OnSysCommand(UINT id, LPARAM lparam)
 {
     // WM_SYSCOMMAND: low 4 bits of id carry system-internal flags; mask them before comparing.
-    if ((id & 0xFFF0) == ID_EXPORT_EMF) {
+    if ((id & 0xFFF0) == ID_SAVE_EMF) {
         // Show the classic folder-browse dialog (no COM/OLE init required).
         BROWSEINFO bi = {};
         bi.hwndOwner = GetSafeHwnd();
@@ -219,12 +224,14 @@ void CConBoxDlg::OnSysCommand(UINT id, LPARAM lparam)
         bi.ulFlags   = BIF_RETURNONLYFSDIRS;
         LPITEMIDLIST pidl = ::SHBrowseForFolder(&bi);
         if (pidl) {
-            TCHAR path[MAX_PATH] = {};
-            if (::SHGetPathFromIDList(pidl, path)) {
+            wchar_t path[MAX_PATH] = {};
+            if (::SHGetPathFromIDListW(pidl, path)) {
                 char utf8[MAX_PATH * 3] = {};
                 ::WideCharToMultiByte(CP_UTF8, 0, path, -1, utf8, sizeof(utf8), NULL, NULL);
-                con_box.save_emf(utf8);
-                AfxMessageBox(_T("EMF export complete."), MB_OK | MB_ICONINFORMATION);
+                if (con_box.save_emf(utf8))
+                    AfxMessageBox(_T("EMF saved."), MB_OK | MB_ICONINFORMATION);
+                else
+                    AfxMessageBox(_T("EMF save failed."), MB_OK | MB_ICONERROR);
             }
             ::CoTaskMemFree(pidl);
         }
@@ -237,7 +244,7 @@ void CConBoxDlg::OnSysCommand(UINT id, LPARAM lparam)
             HANDLE hf = ::CreateFile(wpath, GENERIC_WRITE, 0, NULL,
                                      CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
             if (hf != INVALID_HANDLE_VALUE) {
-                std::vector<std::string> lines = con_box.export_text();
+                std::vector<std::string> lines = con_box.get_text_lines();
                 for (const std::string& line : lines) {
                     DWORD written;
                     ::WriteFile(hf, line.c_str(), (DWORD)line.size(), &written, NULL);
@@ -245,6 +252,45 @@ void CConBoxDlg::OnSysCommand(UINT id, LPARAM lparam)
                 }
                 ::CloseHandle(hf);
                 AfxMessageBox(_T("Text saved."), MB_OK | MB_ICONINFORMATION);
+            }
+        }
+    } else if ((id & 0xFFF0) == ID_SAVE_PDF) {
+        CFileDialog dlg(FALSE, _T("pdf"), _T("ConBox"),
+                        OFN_OVERWRITEPROMPT | OFN_HIDEREADONLY,
+                        _T("PDF Files (*.pdf)|*.pdf||"), this);
+        if (dlg.DoModal() == IDOK) {
+            CStringW wpath(dlg.GetPathName().GetString());
+            char utf8[MAX_PATH * 3] = {};
+            ::WideCharToMultiByte(CP_UTF8, 0, (LPCWSTR)wpath, -1, utf8, sizeof(utf8), NULL, NULL);
+            if (con_box.save_pdf(utf8))
+                AfxMessageBox(_T("PDF saved."), MB_OK | MB_ICONINFORMATION);
+            else
+                AfxMessageBox(_T("PDF save failed.\nNo PDF printer found or print job failed."),
+                              MB_OK | MB_ICONERROR);
+        }
+    } else if ((id & 0xFFF0) == ID_LOG) {
+        if (con_box.is_logging()) {
+            // Stop logging.
+            con_box.save_log(nullptr);
+            CMenu* sys_menu = GetSystemMenu(FALSE);
+            if (sys_menu)
+                sys_menu->ModifyMenu(ID_LOG, MF_BYCOMMAND | MF_STRING, ID_LOG, _T("Start Logging..."));
+        } else {
+            // Ask for a log file path and start logging.
+            CFileDialog dlg(FALSE, _T("log"), _T("ConBox"),
+                            OFN_OVERWRITEPROMPT | OFN_HIDEREADONLY,
+                            _T("Log Files (*.log)|*.log|All Files (*.*)|*.*||"), this);
+            if (dlg.DoModal() == IDOK) {
+                CStringW wpath(dlg.GetPathName().GetString());
+                char utf8[MAX_PATH * 3] = {};
+                ::WideCharToMultiByte(CP_UTF8, 0, (LPCWSTR)wpath, -1, utf8, sizeof(utf8), NULL, NULL);
+                if (con_box.save_log(utf8) == 0) {
+                    CMenu* sys_menu = GetSystemMenu(FALSE);
+                    if (sys_menu)
+                        sys_menu->ModifyMenu(ID_LOG, MF_BYCOMMAND | MF_STRING, ID_LOG, _T("Stop Logging"));
+                } else {
+                    AfxMessageBox(_T("Failed to open log file."), MB_OK | MB_ICONERROR);
+                }
             }
         }
     } else {

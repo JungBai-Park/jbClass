@@ -9,14 +9,14 @@
 //   message map     : BEGIN_MESSAGE_MAP ... END_MESSAGE_MAP
 //   window/font     : open, make_font, apply_default_fonts, calc_cell_size,
 //                     set_efont, set_kfont, set_builtin_glyphs
-//   color/cursor    : set_color, set_bg_color, set_cursor_blend, set_cursor_blink, set_cursor, bump_cursor, OnTimer
+//   color/cursor    : set_fg_color, set_bg_color, set_cursor_blend, set_cursor_blink, set_cursor, bump_cursor, remap_paper_color, OnTimer
 //   margin          : set_margin, client_size_for_grid
 //   config          : setup_from_ini, setup, CreateDefaultIni(static), ResolveIniPath(static), ParseIni(static), ParseColor(static)
 //   cursor geometry : blend_cursor_color, cursor_screen_pos, get_cursor_rect, is_hangul_mode
 //   grid/output     : update_metrics, blank_row, reset_screen, line_at, clamp_cursor, erase_cells,
 //                     scroll_lines_up/down, scroll_up_region, scroll_down_region, line_feed,
 //                     insert_lines, delete_lines, insert_chars, delete_chars,
-//                     enter_alt_screen, leave_alt_screen, put_char, print, scroll_to_bottom, update_scrollbar
+//                     enter_alt_screen, leave_alt_screen, put_char, print, update_scrollbar
 //   VT parser       : Xterm256ToRgb(static), vt_feed, dispatch_csi
 //   window messages : OnEraseBkgnd, OnSize, OnGetDlgCode, OnMouseWheel
 //   overlay scrollbar: sbar_geometry, sbar_show, draw_overlay_scrollbar, OnMouseLeave
@@ -26,7 +26,7 @@
 //   mouse selection : hit_test, copy_selection, clear_selection, OnLButtonDown, OnLButtonDblClk,
 //                     OnLButtonUp, OnMouseMove, OnRButtonDown, OnDropFiles
 //   painting        : ensure_back_buffer, OnPaint
-//   export          : save_emf, export_text
+//   export          : save_emf, save_pdf, get_text_lines, save_log
 //   child (ConPTY)  : Utf8ToWide/CreatePtyPipes(static), start, write, resize, stop, is_running,
 //                     set_exit_callback, pump, handle_child_exit, child_input_thunk/child_resize_thunk, OnDestroy
 //
@@ -47,8 +47,8 @@
 //   scrollback: deque<Row>   lines pushed off the top (capped at max_scrollback, oldest dropped; deque for O(1) pop_front).
 //   main_saved: vector<Row>  main screen backed up on alt-screen entry (swapped back on leave).
 //   Key state: cur_row/cur_col (0-based screen cell cursor), view_top (top of view, unified index),
-//     cursor_visible (?25), saved_row/col (DECSC/RC), scroll_top/bot (DECSTBM region),
-//     alt_active/saved_main_* (alt screen), cols/rows, cell_w/h/base, margin_*, glyph_level,
+//     cursor_visible (?25), saved_cur (DECSC/RC), scroll_top/bot (DECSTBM region),
+//     alt_active/saved_main_cur (alt screen), cols/rows, cell_w/h/base, margin_*, glyph_level,
 //     vt_state/params/priv/gtlt/space (parser; persists across chunked print()), cur_fg/bg/bold/italic/underline/strike/blink/reverse (SGR),
 //     app_cursor_keys/bracketed_paste (input encoding the child turned on via DEC modes),
 //     back_dc/bmp (double buffer). ConPTY: h_pc/in_write/out_read/child_proc/child_running/exit_cb
@@ -136,6 +136,8 @@
 #include <map>
 #include <imm.h>            // Korean IME (Input Method Manager)
 #pragma comment(lib, "imm32.lib")
+#include <winspool.h>       // EnumPrintersW, OpenPrinterW, GetPrinterW, CreateDCW (save_pdf)
+#pragma comment(lib, "winspool.lib")
 #pragma comment(lib, "msimg32.lib")   // AlphaBlend (overlay scrollbar fade)
 
 // Some SDK configurations expose CreatePseudoConsole/HPCON but not this attribute macro, so define it
@@ -480,16 +482,14 @@ CConBox::CConBox()
 	cur_row = 0;
 	cur_col = 0;
 	cursor_visible = true;
-	saved_row = 0;
-	saved_col = 0;
+	saved_cur = { 0, 0 };
 
 	// Scroll region starts as the whole screen; scroll_bot is set to rows-1 in reset_screen/update_metrics.
 	scroll_top = 0;
 	scroll_bot = 0;
 
 	alt_active = false;
-	saved_main_row = 0;
-	saved_main_col = 0;
+	saved_main_cur = { 0, 0 };
 
 	utf8_tail_len = 0;
 	vt_state = VT_GROUND;
@@ -525,6 +525,7 @@ CConBox::CConBox()
 	child_running = false;
 	exit_cb = nullptr;
 	exit_cb_user = nullptr;
+	log_file = INVALID_HANDLE_VALUE;
 
 	cursor_bg_weight = 4;
 	cursor_fg_weight = 6;
@@ -537,7 +538,7 @@ CConBox::CConBox()
 	adjust_right = 0;
 	adjust_bottom = 0;
 
-	glyph_level = 1;
+	glyph_level = 2;
 
 	// Cursor blink: start visible; interval follows the system caret rate. If GetCaretBlinkTime returns
 	// INFINITE (blink disabled system-wide), use 0 = no blink, always on.
@@ -560,8 +561,8 @@ CConBox::CConBox()
 	max_scrollback = 5000;
 	cfg_cols = 96;
 	cfg_rows = 32;
-	cfg_cmdline = "powershell.exe";
-	cfg_lines_per_page = 50;
+	cfg_cmdline = "cmd.exe";
+	cfg_lines_per_paper = 50;
 
 	// Default 16-color ANSI palette (matches the hardcoded base16[] in Xterm256ToRgb).
 	static const COLORREF def16[16] = {
@@ -572,6 +573,22 @@ CConBox::CConBox()
 	};
 	memcpy(ansi_colors, def16, sizeof(def16));
 
+	// Paper (export) colors: black text on white background by default.
+	paper_default_fg = RGB(0x00, 0x00, 0x00);
+	paper_default_bg = RGB(0xFF, 0xFF, 0xFF);
+	// Semantic inversion of screen palette for white-bg export:
+	//   index 0 (screen bg black) -> white (#FFFFFF); index 7 (screen fg white) -> black (#000000).
+	//   index 8 (bright bg) -> near-white (#EEEEEE); index 15 (bright fg) -> black (#000000).
+	//   chromatic pairs (1-6 / 9-14) collapsed to the same dark Tango color so bright
+	//   variants (yellow, cyan, green) don't become invisible on white paper.
+	static const COLORREF paper16[16] = {
+		RGB(0xFF,0xFF,0xFF), RGB(0xCC,0x00,0x00), RGB(0x4E,0x9A,0x06), RGB(0xC4,0xA0,0x00),
+		RGB(0x34,0x65,0xA4), RGB(0x75,0x50,0x7B), RGB(0x06,0x98,0x9A), RGB(0x00,0x00,0x00),
+		RGB(0xEE,0xEE,0xEE), RGB(0xCC,0x00,0x00), RGB(0x4E,0x9A,0x06), RGB(0xC4,0xA0,0x00),
+		RGB(0x34,0x65,0xA4), RGB(0x75,0x50,0x7B), RGB(0x06,0x98,0x9A), RGB(0x00,0x00,0x00)
+	};
+	memcpy(paper_ansi_colors, paper16, sizeof(paper16));
+
 	// Overlay scrollbar starts hidden (alpha 0); shown on user scroll / hover.
 	sbar_alpha = 0;
 	sbar_hold_until = 0;
@@ -580,9 +597,13 @@ CConBox::CConBox()
 	sbar_drag_off = 0;
 
 	// Double-buffer cache is created on the first OnPaint.
-	back_old_bmp = nullptr;
+	back_bmp_saved = nullptr;
 	back_w = 0;
 	back_h = 0;
+
+	// Pre-allocate reusable print() buffers to avoid per-call heap allocation on the pump() hot path.
+	print_buf.reserve(8192);
+	print_ws.reserve(8192);
 }
 
 CConBox::~CConBox()
@@ -591,8 +612,8 @@ CConBox::~CConBox()
 	stop();
 
 	// Restore the original bitmap so back_bmp is not destroyed while still selected into back_dc.
-	if (back_old_bmp)
-		back_dc.SelectObject(back_old_bmp);
+	if (back_bmp_saved)
+		back_dc.SelectObject(back_bmp_saved);
 }
 
 // ===== Config file loader =====
@@ -701,33 +722,55 @@ static void CreateDefaultIni(const wchar_t* path)
 		"margin_bottom = 10              ; \xEC\x95\x84\xEB\x9E\x98\xEC\xAA\xBD \xEC\x97\xAC\xEB\xB0\xB1\n"
 		"margin_right  = 10              ; \xEC\x98\xA4\xEB\xA5\xB8\xEC\xAA\xBD \xEC\x97\xAC\xEB\xB0\xB1\n"
 		"adjust_left   = 0               ; \xEC\x85\x80 \xEC\x99\xBC\xEC\xAA\xBD \xED\x8C\xA8\xEB\x94\xA9\n"
-		"adjust_top    = 0               ; \xEC\x85\x80 \xEC\x9C\x84\xEC\xAA\xBD \xED\x8C\xA8\xEB\x94\xA9\n"
+		"adjust_top    = -2              ; \xEC\x85\x80 \xEC\x9C\x84\xEC\xAA\xBD \xED\x8C\xA8\xEB\x94\xA9\n"
 		"adjust_right  = 0               ; \xEC\x85\x80 \xEC\x98\xA4\xEB\xA5\xB8\xEC\xAA\xBD \xED\x8C\xA8\xEB\x94\xA9\n"
 		"adjust_bottom = 0               ; \xEC\x85\x80 \xEC\x95\x84\xEB\x9E\x98\xEC\xAA\xBD \xED\x8C\xA8\xEB\x94\xA9\n"
 		"grid_cols     = 96              ; \xEA\xB0\x80\xEB\xA1\x9C \xEC\xB9\xB8 \xEC\x88\x98\n"
 		"grid_rows     = 32              ; \xEC\x84\xB8\xEB\xA1\x9C \xEC\xA4\x84 \xEC\x88\x98\n"
 		"\n"
-		"[colors]\n"
+		"[screen]\n"
 		"; \xEC\x83\x89\xEC\x83\x81 \xED\x98\x95\xEC\x8B\x9D: #RRGGBB\n"
-		"fg            = #C8C8C8         ; \xEA\xB8\xB0\xEB\xB3\xB8 \xEA\xB8\x80\xEC\x9E\x90\xEC\x83\x89\n"
-		"bg            = #202020         ; \xEA\xB8\xB0\xEB\xB3\xB8 \xEB\xB0\xB0\xEA\xB2\xBD\xEC\x83\x89\n"
-		"; ANSI 16\xEC\x83\x89 \xED\x8C\x94\xEB\xA0\x88\xED\x8A\xB8 (SGR 30~37/90~97 \xEC\x83\x89\xEC\x83\x81)\n"
-		"color0        = #000000         ; \xEA\xB2\x80\xEC\xA0\x95\n"
-		"color1        = #CD0000         ; \xEB\xB9\xA8\xEA\xB0\x95\n"
-		"color2        = #00CD00         ; \xEC\xB4\x88\xEB\xA1\x9D\n"
-		"color3        = #CDCD00         ; \xEB\x85\xB8\xEB\x9E\x91\n"
-		"color4        = #0000EE         ; \xED\x8C\x8C\xEB\x9E\x91\n"
-		"color5        = #CD00CD         ; \xEC\x9E\x90\xED\x99\x8D\n"
-		"color6        = #00CDCD         ; \xEC\xB2\xAD\xEB\xA1\x9D\n"
-		"color7        = #E5E5E5         ; \xED\x9D\xB0\xEC\x83\x89(\xEB\xB0\x9D\xEC\x9D\x80)\n"
-		"color8        = #7F7F7F         ; \xED\x9A\x8C\xEC\x83\x89(\xEB\xB0\x9D\xEC\x9D\x80 \xEA\xB2\x80\xEC\xA0\x95)\n"
-		"color9        = #FF0000         ; \xEB\xB0\x9D\xEC\x9D\x80 \xEB\xB9\xA8\xEA\xB0\x95\n"
-		"color10       = #00FF00         ; \xEB\xB0\x9D\xEC\x9D\x80 \xEC\xB4\x88\xEB\xA1\x9D\n"
-		"color11       = #FFFF00         ; \xEB\xB0\x9D\xEC\x9D\x80 \xEB\x85\xB8\xEB\x9E\x91\n"
-		"color12       = #5C5CFF         ; \xEB\xB0\x9D\xEC\x9D\x80 \xED\x8C\x8C\xEB\x9E\x91\n"
-		"color13       = #FF00FF         ; \xEB\xB0\x9D\xEC\x9D\x80 \xEC\x9E\x90\xED\x99\x8D\n"
-		"color14       = #00FFFF         ; \xEB\xB0\x9D\xEC\x9D\x80 \xEC\xB2\xAD\xEB\xA1\x9D\n"
-		"color15       = #FFFFFF         ; \xED\x9D\xB0\xEC\x83\x89\n"
+		"screen_text       = #C8C8C8     ; \xEA\xB8\xB0\xEB\xB3\xB8 \xEA\xB8\x80\xEC\x9E\x90\xEC\x83\x89\n"
+		"screen_back       = #202020     ; \xEA\xB8\xB0\xEB\xB3\xB8 \xEB\xB0\xB0\xEA\xB2\xBD\xEC\x83\x89\n"
+		"; ANSI 16\xEC\x83\x89 \xED\x8C\x94\xEB\xA0\x88\xED\x8A\xB8 (SGR 30~37/90~97 \xEC\x83\x89\xEC\x83\x81, 0-indexed)\n"
+		"screen_palette00  = #000000     ; \xEA\xB2\x80\xEC\xA0\x95\n"
+		"screen_palette01  = #CD0000     ; \xEB\xB9\xA8\xEA\xB0\x95\n"
+		"screen_palette02  = #00CD00     ; \xEC\xB4\x88\xEB\xA1\x9D\n"
+		"screen_palette03  = #CDCD00     ; \xEB\x85\xB8\xEB\x9E\x91\n"
+		"screen_palette04  = #0000EE     ; \xED\x8C\x8C\xEB\x9E\x91\n"
+		"screen_palette05  = #CD00CD     ; \xEC\x9E\x90\xED\x99\x8D\n"
+		"screen_palette06  = #00CDCD     ; \xEC\xB2\xAD\xEB\xA1\x9D\n"
+		"screen_palette07  = #E5E5E5     ; \xED\x9D\xB0\xEC\x83\x89(\xEB\xB0\x9D\xEC\x9D\x80)\n"
+		"screen_palette08  = #7F7F7F     ; \xED\x9A\x8C\xEC\x83\x89(\xEB\xB0\x9D\xEC\x9D\x80 \xEA\xB2\x80\xEC\xA0\x95)\n"
+		"screen_palette09  = #FF0000     ; \xEB\xB0\x9D\xEC\x9D\x80 \xEB\xB9\xA8\xEA\xB0\x95\n"
+		"screen_palette10  = #00FF00     ; \xEB\xB0\x9D\xEC\x9D\x80 \xEC\xB4\x88\xEB\xA1\x9D\n"
+		"screen_palette11  = #FFFF00     ; \xEB\xB0\x9D\xEC\x9D\x80 \xEB\x85\xB8\xEB\x9E\x91\n"
+		"screen_palette12  = #5C5CFF     ; \xEB\xB0\x9D\xEC\x9D\x80 \xED\x8C\x8C\xEB\x9E\x91\n"
+		"screen_palette13  = #FF00FF     ; \xEB\xB0\x9D\xEC\x9D\x80 \xEC\x9E\x90\xED\x99\x8D\n"
+		"screen_palette14  = #00FFFF     ; \xEB\xB0\x9D\xEC\x9D\x80 \xEC\xB2\xAD\xEB\xA1\x9D\n"
+		"screen_palette15  = #FFFFFF     ; \xED\x9D\xB0\xEC\x83\x89\n"
+		"\n"
+		"[paper]\n"
+		"; EMF/PDF \xEC\xB6\x9C\xEB\xA0\xA5\xEC\x9A\xA9 \xEC\x83\x89\xEC\x83\x81\n"
+		"paper_text        = #000000\n"
+		"paper_back        = #FFFFFF\n"
+		"paper_palette00   = #FFFFFF\n"
+		"paper_palette01   = #CC0000\n"
+		"paper_palette02   = #4E9A06\n"
+		"paper_palette03   = #C4A000\n"
+		"paper_palette04   = #3465A4\n"
+		"paper_palette05   = #75507B\n"
+		"paper_palette06   = #06989A\n"
+		"paper_palette07   = #000000\n"
+		"paper_palette08   = #EEEEEE\n"
+		"paper_palette09   = #CC0000\n"
+		"paper_palette10   = #4E9A06\n"
+		"paper_palette11   = #C4A000\n"
+		"paper_palette12   = #3465A4\n"
+		"paper_palette13   = #75507B\n"
+		"paper_palette14   = #06989A\n"
+		"paper_palette15   = #000000\n"
+		"lines_per_paper   = 50         ; EMF \xEA\xB7\xB8\xEB\xA6\xBC \xED\x95\x9C\xEC\x9E\xA5\xEC\x97\x90 \xED\x91\x9C\xEC\x8B\x9C\xEB\x90\x98\xEB\x8A\x94 \xEC\xA4\x84 \xEC\x88\x98\n"
 		"\n"
 		"[cursor]\n"
 		"; \xEC\xBB\xA4\xEC\x84\x9C \xEB\xAA\xA8\xEC\x96\x91: \xED\x99\x80\xEC\x88\x98=\xEA\xB9\x9C\xEB\xB9\xA1\xEC\x9E\x84, \xEC\xA7\x9D\xEC\x88\x98=\xEA\xB3\xA0\xEC\xA0\x95\n"
@@ -737,14 +780,11 @@ static void CreateDefaultIni(const wchar_t* path)
 		"cursor_blink_ms = 0             ; \xEA\xB9\x9C\xEB\xB9\xA1\xEC\x9E\x84 \xEA\xB0\x84\xEA\xB2\xA9(ms). 0 = \xEC\x8B\x9C\xEC\x8A\xA4\xED\x85\x9C \xEC\x84\xA4\xEC\xA0\x95 \xEB\x94\xB0\xEB\xA6\x84\n"
 		"\n"
 		"[rendering]\n"
-		"builtin_glyphs = 1              ; 0=\xED\x8F\xB0\xED\x8A\xB8, 1=\xEB\xB8\x94\xEB\xA1\x9D\xEB\xAC\xB8\xEC\x9E\x90 \xEC\xA7\x81\xEC\xA0\x91\xEA\xB7\xB8\xEB\xA6\xBC(\xEA\xB8\xB0\xEB\xB3\xB8), 2=\xEB\xB0\x95\xEC\x8A\xA4\xEC\x84\xA0\xEA\xB9\x8C\xEC\xA7\x80 \xEC\xA7\x81\xEC\xA0\x91\xEA\xB7\xB8\xEB\xA6\xBC\n"
+		"builtin_glyphs = 2              ; 0=\xED\x8F\xB0\xED\x8A\xB8, 1=\xEB\xB8\x94\xEB\xA1\x9D\xEB\xAC\xB8\xEC\x9E\x90 \xEC\xA7\x81\xEC\xA0\x91\xEA\xB7\xB8\xEB\xA6\xBC, 2=\xEB\xB0\x95\xEC\x8A\xA4\xEC\x84\xA0\xEA\xB9\x8C\xEC\xA7\x80 \xEC\xA7\x81\xEC\xA0\x91\xEA\xB7\xB8\xEB\xA6\xBC(\xEA\xB8\xB0\xEB\xB3\xB8)\n"
 		"scrollback_cap = 5000           ; \xEC\x8A\xA4\xED\x81\xAC\xEB\xA1\xA4\xEB\xB0\xB1 \xEC\xB5\x9C\xEB\x8C\x80 \xEC\xA4\x84 \xEC\x88\x98\n"
 		"\n"
 		"[child]\n"
-		"cmdline = powershell.exe        ; \xEC\x8B\xA4\xED\x96\x89\xED\x95\xA0 \xEC\x9E\x90\xEC\x8B\x9D \xED\x94\x84\xEB\xA1\x9C\xEC\x84\xB8\xEC\x8A\xA4 \xEB\xAA\x85\xEB\xA0\xB9\xEC\xA4\x84\n"
-		"\n"
-		"[export]\n"
-		"lines_per_page = 50             ; EMF export: rows per page (save_emf)\n",
+		"cmdline = cmd.exe               ; \xEC\x8B\xA4\xED\x96\x89\xED\x95\xA0 \xEC\x9E\x90\xEC\x8B\x9D \xED\x94\x84\xEB\xA1\x9C\xEC\x84\xB8\xEC\x8A\xA4 \xEB\xAA\x85\xEB\xA0\xB9\xEC\xA4\x84\n",
 		f);
 	fclose(f);
 }
@@ -783,20 +823,29 @@ void CConBox::setup(const char* contents)
 	int mt = geti("margin_top", 10), ml = geti("margin_left", 10);
 	int mb = geti("margin_bottom", 10), mr = geti("margin_right", 10);
 	set_margin(mt, ml, mb, mr);
-	int al = geti("adjust_left", 0), at = geti("adjust_top", 0);
+	int al = geti("adjust_left", 0), at = geti("adjust_top", -2);
 	int ar = geti("adjust_right", 0), ab = geti("adjust_bottom", 0);
 	adjust(al, at, ar, ab);
 
-	// Colors
-	if (const std::string* s = get("fg")) set_color(ParseColor(*s, default_fg));
-	if (const std::string* s = get("bg")) set_bg_color(ParseColor(*s, default_bg));
+	// Screen colors: screen_text / screen_back / screen_palette00..15 (0-indexed, matching ANSI indices 0..15).
+	if (const std::string* s = get("screen_text")) set_fg_color(ParseColor(*s, default_fg));
+	if (const std::string* s = get("screen_back")) set_bg_color(ParseColor(*s, default_bg));
 
-	// ANSI palette color0..color15 (xterm 256-color index 0-15)
-	char pal_key[10];
+	char pal_key[24];
 	for (int i = 0; i < 16; i++) {
-		sprintf_s(pal_key, sizeof(pal_key), "color%d", i);
+		sprintf_s(pal_key, sizeof(pal_key), "screen_palette%02d", i);
 		if (const std::string* s = get(pal_key))
 			ansi_colors[i] = ParseColor(*s, ansi_colors[i]);
+	}
+
+	// Paper colors for EMF/PDF export. Defaults are Tango Light (set in ctor).
+	// Only entries present in the INI override the defaults.
+	if (const std::string* s = get("paper_text")) paper_default_fg = ParseColor(*s, paper_default_fg);
+	if (const std::string* s = get("paper_back")) paper_default_bg = ParseColor(*s, paper_default_bg);
+	for (int i = 0; i < 16; i++) {
+		sprintf_s(pal_key, sizeof(pal_key), "paper_palette%02d", i);
+		if (const std::string* s = get(pal_key))
+			paper_ansi_colors[i] = ParseColor(*s, paper_ansi_colors[i]);
 	}
 
 	// Cursor
@@ -805,7 +854,7 @@ void CConBox::setup(const char* contents)
 	set_cursor_blink(geti("cursor_blink_ms", 0));
 
 	// Rendering
-	set_builtin_glyphs(geti("builtin_glyphs", 1));
+	set_builtin_glyphs(geti("builtin_glyphs", 2));
 	int cap = geti("scrollback_cap", 5000);
 	if (cap > 0) max_scrollback = cap;
 
@@ -813,8 +862,8 @@ void CConBox::setup(const char* contents)
 	cfg_cols = geti("grid_cols", 96);
 	cfg_rows = geti("grid_rows", 32);
 	if (const std::string* s = get("cmdline")) { if (!s->empty()) cfg_cmdline = *s; }
-	cfg_lines_per_page = geti("lines_per_page", 50);
-	if (cfg_lines_per_page < 1) cfg_lines_per_page = 1;
+	cfg_lines_per_paper = geti("lines_per_paper", 50);
+	if (cfg_lines_per_paper < 1) cfg_lines_per_paper = 1;
 }
 
 // Load settings from an INI file.  Sections are ignored; keys are matched by name only.
@@ -848,19 +897,27 @@ void CConBox::setup_from_ini(const char* path)
 
 void CConBox::open(CWnd* parent, int x0, int y0, int x1, int y1)
 {
-	// Register a dedicated window class. No background brush (we paint it). Arrow cursor (like wt.exe).
+	// Register the "ConBox" window class on first call; subsequent calls (multiple instances) skip.
+	// Fixed name allows FindWindowEx(parent, NULL, L"ConBox", NULL) from host/test scripts.
+	// No background brush (we paint it). Arrow cursor (like wt.exe).
 	// CS_HREDRAW|CS_VREDRAW so a resize repaints the whole control.
-	LPCTSTR cls = AfxRegisterWndClass(
-		CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS,
-		::LoadCursor(nullptr, IDC_ARROW),
-		nullptr,
-		nullptr);
+	WNDCLASSEXW wc = {};
+	if (!::GetClassInfoExW(AfxGetInstanceHandle(), L"ConBox", &wc))
+	{
+		wc.cbSize        = sizeof(wc);
+		wc.style         = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
+		wc.lpfnWndProc   = ::DefWindowProcW;
+		wc.hInstance     = AfxGetInstanceHandle();
+		wc.hCursor       = ::LoadCursor(nullptr, IDC_ARROW);
+		wc.lpszClassName = L"ConBox";
+		::RegisterClassExW(&wc);
+	}
 
 	CRect rc(x0, y0, x1, y1);
 	// No WS_VSCROLL: a native vertical scrollbar would shrink the client area the first time scrollback
 	// appears, reflowing the grid and resizing the child PTY (a visible flash). Instead the overlay
 	// scrollbar (draw_overlay_scrollbar) is painted over the right edge and never reserves client space.
-	CreateEx(0, cls, _T(""),
+	CreateEx(0, _T("ConBox"), _T(""),
 		WS_CHILD | WS_VISIBLE,
 		rc, parent, 0);
 
@@ -873,7 +930,8 @@ void CConBox::open(CWnd* parent, int x0, int y0, int x1, int y1)
 	// Accept drag-and-drop files so OnDropFiles can type their paths to the child.
 	DragAcceptFiles(TRUE);
 
-	// The window exists now, so start the blink timers. Cursor interval 0 = always on.
+	// The window exists now, so start the blink timers.
+	// cursor_blink_ms: set by set_cursor_blink (0 = system blink disabled -> always on).
 	cursor_on = true;
 	if (cursor_blink_ms > 0)
 		SetTimer(CURSOR_TIMER, cursor_blink_ms, NULL);
@@ -889,7 +947,7 @@ void CConBox::make_font(CFont& font, LOGFONTW& lf_out, int& width_pct, const cha
 
 	lf_out = ParseFontOpts(name, size, opts, dpi, width_pct);
 	font.DeleteObject();
-	font.CreateFontIndirectW(&lf_out);
+	font.Attach(::CreateFontIndirectW(&lf_out));
 }
 
 // Create a bold/italic variant of base_lf. If base lfWeight >= 600, bold uses FW_EXTRABOLD (800)
@@ -900,7 +958,7 @@ static void MakeFontVariant(CFont& font, LOGFONTW lf, bool bold, bool italic)
 	if (bold)   lf.lfWeight = (lf.lfWeight >= 600) ? FW_EXTRABOLD : FW_BOLD;
 	if (italic) lf.lfItalic = 1;
 	font.DeleteObject();
-	font.CreateFontIndirectW(&lf);
+	font.Attach(::CreateFontIndirectW(&lf));
 }
 
 // Build the double-size (2x) variant of src into dst. Used for SGR 8 (double-size) cells. The glyph
@@ -909,12 +967,12 @@ static void MakeFontVariant(CFont& font, LOGFONTW lf, bool bold, bool italic)
 static void MakeDoubleFont(CFont& dst, CFont& src)
 {
 	LOGFONTW lf;
-	src.GetLogFont(&lf);
+	::GetObjectW(src.m_hObject, sizeof(LOGFONTW), &lf);
 	lf.lfHeight = lf.lfHeight < 0 ? lf.lfHeight * 2 : -((-lf.lfHeight) * 2);
 	if (lf.lfWidth != 0) lf.lfWidth *= 2;
 	lf.lfWeight = (lf.lfWeight >= 600) ? FW_EXTRABOLD : FW_BOLD;   // always bold
 	dst.DeleteObject();
-	dst.CreateFontIndirectW(&lf);
+	dst.Attach(::CreateFontIndirectW(&lf));
 }
 
 void CConBox::apply_default_fonts()
@@ -948,7 +1006,7 @@ void CConBox::calc_cell_size()
 	LOGFONTW elf = efont_lf;
 	elf.lfWidth = 0;
 	efont.DeleteObject();
-	efont.CreateFontIndirectW(&elf);
+	efont.Attach(::CreateFontIndirectW(&elf));
 
 	HGDIOBJ old = ::SelectObject(hdc, efont.GetSafeHandle());
 	TEXTMETRICW tm;
@@ -969,7 +1027,7 @@ void CConBox::calc_cell_size()
 		// its height equals English (eh). Width stays natural (lfWidth=0).
 		klf.lfHeight = efont_lf.lfHeight;
 		kfont.DeleteObject();
-		kfont.CreateFontIndirectW(&klf);
+		kfont.Attach(::CreateFontIndirectW(&klf));
 		::SelectObject(hdc, kfont.GetSafeHandle());
 		::GetTextMetricsW(hdc, &tm);
 		int kh0 = tm.tmHeight + tm.tmExternalLeading;
@@ -979,7 +1037,7 @@ void CConBox::calc_cell_size()
 			klf.lfHeight = newh;
 			::SelectObject(hdc, old);
 			kfont.DeleteObject();
-			kfont.CreateFontIndirectW(&klf);
+			kfont.Attach(::CreateFontIndirectW(&klf));
 			::SelectObject(hdc, kfont.GetSafeHandle());
 			::GetTextMetricsW(hdc, &tm);
 		}
@@ -991,7 +1049,7 @@ void CConBox::calc_cell_size()
 	}
 	else {
 		kfont.DeleteObject();
-		kfont.CreateFontIndirectW(&klf);
+		kfont.Attach(::CreateFontIndirectW(&klf));
 		::SelectObject(hdc, kfont.GetSafeHandle());
 		::GetTextMetricsW(hdc, &tm);
 		SIZE ksz;
@@ -1015,13 +1073,13 @@ void CConBox::calc_cell_size()
 	if (efont_width_pct != 100) {
 		elf.lfWidth = w_e;
 		efont.DeleteObject();
-		efont.CreateFontIndirectW(&elf);
+		efont.Attach(::CreateFontIndirectW(&elf));
 	}
 
 	if (kfont_width_pct != 100) {
 		klf.lfWidth = (int)(w_k / 2.0f + 0.5f);
 		kfont.DeleteObject();
-		kfont.CreateFontIndirectW(&klf);
+		kfont.Attach(::CreateFontIndirectW(&klf));
 	}
 
 	// Line height/baseline take the larger of the two fonts to avoid clipping.
@@ -1121,7 +1179,7 @@ void CConBox::set_builtin_glyphs(int level)
 		Invalidate();
 }
 
-void CConBox::set_color(COLORREF fg)
+void CConBox::set_fg_color(COLORREF fg)
 {
 	default_fg = fg;
 	cur_fg = fg;
@@ -1153,11 +1211,16 @@ void CConBox::set_cursor_blend(int bg_weight, int fg_weight)
 
 void CConBox::set_cursor_blink(int interval_ms)
 {
-	if (interval_ms < 0)
-		interval_ms = 0;
-	cursor_blink_ms = interval_ms;
+	// interval_ms <= 0: follow the system caret rate (GetCaretBlinkTime). If the system has blink
+	// disabled (INFINITE), cursor_blink_ms stays 0 = always on (no timer). This matches the INI
+	// default comment "0 = system rate" and the constructor's own initialization logic.
+	if (interval_ms <= 0) {
+		UINT caret = ::GetCaretBlinkTime();
+		cursor_blink_ms = (caret == INFINITE) ? 0 : (int)caret;
+	} else {
+		cursor_blink_ms = interval_ms;
+	}
 
-	// Restart the timer. Interval 0 = no blink, always on.
 	if (::IsWindow(m_hWnd)) {
 		KillTimer(CURSOR_TIMER);
 		cursor_on = true;
@@ -1209,7 +1272,18 @@ void CConBox::OnTimer(UINT_PTR id)
 	}
 	if (id == BLINK_TIMER) {
 		blink_on = !blink_on;
-		Invalidate(FALSE);   // whole view: blink cells may be anywhere
+		// Skip Invalidate when no CELL_BLINK cells are visible -- avoids a full repaint every 500ms
+		// on typical screens. Scan the visible viewport via line_at(view_top+row) so scrollback rows
+		// that are currently scrolled into view are also checked (screen[] alone misses them).
+		bool has_blink = false;
+		int total = (int)scrollback.size() + rows;
+		for (int row = 0; row < rows && !has_blink; ++row) {
+			int idx = view_top + row;
+			if (idx >= total) break;
+			for (const CharInfo& c : line_at(idx))
+				if (c.flags & CELL_BLINK) { has_blink = true; break; }
+		}
+		if (has_blink) Invalidate(FALSE);
 		return;
 	}
 	if (id == PUMP_TIMER) {
@@ -1292,6 +1366,17 @@ COLORREF CConBox::blend_cursor_color() const
 	int g = (GetGValue(default_bg) * bw + GetGValue(default_fg) * fw) / sum;
 	int b = (GetBValue(default_bg) * bw + GetBValue(default_fg) * fw) / sum;
 	return RGB(r, g, b);
+}
+
+// Map a screen COLORREF to its paper (export) equivalent.
+// Matches default_fg/bg and ansi_colors[0..15]; truecolor / 256-color values pass through.
+COLORREF CConBox::remap_paper_color(COLORREF c) const
+{
+	if (c == default_fg) return paper_default_fg;
+	if (c == default_bg) return paper_default_bg;
+	for (int i = 0; i < 16; i++)
+		if (c == ansi_colors[i]) return paper_ansi_colors[i];
+	return c;
 }
 
 bool CConBox::cursor_screen_pos(int& row_out, int& vx_out) const
@@ -1578,8 +1663,7 @@ void CConBox::enter_alt_screen()
 	if (alt_active)
 		return;
 	main_saved.swap(screen);          // back up main (screen left empty)
-	saved_main_row = cur_row;
-	saved_main_col = cur_col;
+	saved_main_cur = { cur_row, cur_col };
 
 	screen.assign(rows, blank_row());
 	cur_row = 0;
@@ -1599,8 +1683,8 @@ void CConBox::leave_alt_screen()
 	alt_active = false;
 
 	// Fit the restored main screen to the current cols/rows (a resize may have happened); restore cursor/region.
-	cur_row = saved_main_row;
-	cur_col = saved_main_col;
+	cur_row = saved_main_cur.row;
+	cur_col = saved_main_cur.col;
 	scroll_top = 0;
 	scroll_bot = rows - 1;
 	reset_screen();
@@ -1659,39 +1743,39 @@ void CConBox::print(const char* text)
 	if (raw_len == 0 && utf8_tail_len == 0)
 		return;
 
-	// Build working buffer: tail bytes + new bytes.
-	std::string buf;
-	buf.reserve(utf8_tail_len + raw_len);
+	// Build working buffer (member reuse): tail bytes + new bytes. No per-call allocation.
+	print_buf.clear();
 	if (utf8_tail_len > 0)
-		buf.append(utf8_tail, utf8_tail_len);
-	buf.append(text, raw_len);
+		print_buf.append(utf8_tail, utf8_tail_len);
+	print_buf.append(text, raw_len);
 	utf8_tail_len = 0;
 
 	// Detect trailing incomplete UTF-8 sequence.
 	// Walk backward up to 3 bytes to find a lead byte whose required sequence length exceeds what
 	// remains in the buffer; if found, move those bytes into utf8_tail.
-	int blen = (int)buf.size();
+	int blen = (int)print_buf.size();
 	for (int back = 1; back <= 3 && back <= blen; ++back) {
-		unsigned char b = (unsigned char)buf[blen - back];
+		unsigned char b = (unsigned char)print_buf[blen - back];
 		if (b < 0x80) break;             // plain ASCII byte; no incomplete sequence possible
 		if (b >= 0xC0) {                 // lead byte found
 			int need = (b >= 0xF0) ? 4 : (b >= 0xE0) ? 3 : 2;
 			if (back < need) {           // fewer bytes present than the sequence requires
 				utf8_tail_len = back;
-				memcpy(utf8_tail, buf.data() + blen - back, back);
-				buf.resize(blen - back);
+				memcpy(utf8_tail, print_buf.data() + blen - back, back);
+				print_buf.resize(blen - back);
 			}
 			break;
 		}
 		// continuation byte (0x80-0xBF): keep walking back toward the lead
 	}
 
-	int wlen = ::MultiByteToWideChar(CP_UTF8, 0, buf.data(), (int)buf.size(), NULL, 0);
+	// Pre-allocate worst-case (blen wchar_t: UTF-8 byte count >= wchar_t count for BMP) then
+	// convert in one call, avoiding a separate size-query call.
+	int bufsz = (int)print_buf.size();
+	print_ws.resize(bufsz);
+	int wlen = ::MultiByteToWideChar(CP_UTF8, 0, print_buf.data(), bufsz, print_ws.data(), bufsz);
 	if (wlen <= 0)
 		return;
-
-	std::vector<wchar_t> ws(wlen);
-	::MultiByteToWideChar(CP_UTF8, 0, buf.data(), (int)buf.size(), ws.data(), wlen);
 
 	// Create the screen if it does not exist yet (before font/window is fixed).
 	if (screen.empty())
@@ -1700,21 +1784,15 @@ void CConBox::print(const char* text)
 	// Feed each wchar_t to the VT parser.  No null terminator in output (explicit byte length was
 	// passed to MultiByteToWideChar), so iterate over all wlen chars.
 	for (int i = 0; i < wlen; ++i)
-		vt_feed(ws[i]);
+		vt_feed(print_ws[i]);
 
 	// New output invalidates any selection (cell positions moved); clear it, scroll to bottom, repaint.
 	sel_active = false;
-	scroll_to_bottom();
+	int maxtop = (int)scrollback.size();   // total lines - rows = scrollback.size() (screen always = rows)
+	view_top = (maxtop > 0) ? maxtop : 0;
 	update_scrollbar();
 	bump_cursor();
 	Invalidate();
-}
-
-void CConBox::scroll_to_bottom()
-{
-	int total = (int)scrollback.size() + rows;
-	int maxtop = total - rows;
-	view_top = (maxtop > 0) ? maxtop : 0;
 }
 
 // Convert an xterm 256-color index to COLORREF: 0-15 base, 16-231 6x6x6 cube, 232-255 grayscale.
@@ -1771,8 +1849,8 @@ void CConBox::vt_feed(wchar_t wc)
 			return;
 		}
 		if (wc == L']') { vt_state = VT_OSC; return; }   // OSC: discard (window title etc.)
-		if (wc == L'7') { saved_row = cur_row; saved_col = cur_col; vt_state = VT_GROUND; return; }   // DECSC
-		if (wc == L'8') { cur_row = saved_row; cur_col = saved_col; clamp_cursor(); vt_state = VT_GROUND; return; }  // DECRC
+		if (wc == L'7') { saved_cur = { cur_row, cur_col }; vt_state = VT_GROUND; return; }   // DECSC
+		if (wc == L'8') { cur_row = saved_cur.row; cur_col = saved_cur.col; clamp_cursor(); vt_state = VT_GROUND; return; }  // DECRC
 		if (wc == L'M') {   // RI: at the region top scroll down, else move up one line
 			if (cur_row == scroll_top) scroll_down_region(1);
 			else if (cur_row > 0) cur_row--;
@@ -1793,7 +1871,7 @@ void CConBox::vt_feed(wchar_t wc)
 		}
 		if (wc == L'c') {   // RIS: reset to initial state
 			cur_row = 0; cur_col = 0;
-			saved_row = 0; saved_col = 0;
+			saved_cur = { 0, 0 };
 			scroll_top = 0; scroll_bot = rows - 1;
 			app_cursor_keys = false;
 			bracketed_paste = false;
@@ -2007,15 +2085,15 @@ void CConBox::dispatch_csi(wchar_t fin)
 			}
 			else if (n == 1048) {
 				// Cursor save (h) / restore (l), same as DECSC/DECRC.
-				if (set) { saved_row = cur_row; saved_col = cur_col; }
-				else { cur_row = saved_row; cur_col = saved_col; clamp_cursor(); }
+				if (set) { saved_cur = { cur_row, cur_col }; }
+				else { cur_row = saved_cur.row; cur_col = saved_cur.col; clamp_cursor(); }
 			}
 			// Other private modes (?7 autowrap is always on, etc.) ignored.
 		}
 		break;
 	}
-	case L's': saved_row = cur_row; saved_col = cur_col; break;                 // save cursor
-	case L'u': cur_row = saved_row; cur_col = saved_col; clamp_cursor(); break; // restore cursor
+	case L's': saved_cur = { cur_row, cur_col }; break;                              // save cursor
+	case L'u': cur_row = saved_cur.row; cur_col = saved_cur.col; clamp_cursor(); break; // restore cursor
 
 	case L'n':   // DSR (device status report): answer the child's query via the input sink.
 		if (!vt_priv && input_sink != nullptr) {
@@ -3120,14 +3198,14 @@ void CConBox::ensure_back_buffer(CDC* ref, int w, int h)
 	// Rebuild the bitmap if missing or the size changed.
 	if (back_bmp.GetSafeHandle() == nullptr || w != back_w || h != back_h) {
 		// Detach the old bitmap (restore the original) before discarding it.
-		if (back_old_bmp) {
-			back_dc.SelectObject(back_old_bmp);
-			back_old_bmp = nullptr;
+		if (back_bmp_saved) {
+			back_dc.SelectObject(back_bmp_saved);
+			back_bmp_saved = nullptr;
 		}
 		back_bmp.DeleteObject();
 
 		back_bmp.CreateCompatibleBitmap(ref, w, h);
-		back_old_bmp = back_dc.SelectObject(&back_bmp);
+		back_bmp_saved = back_dc.SelectObject(&back_bmp);
 		back_w = w;
 		back_h = h;
 	}
@@ -3155,6 +3233,10 @@ void CConBox::OnPaint()
 	dc.SetBkMode(TRANSPARENT);
 	UINT old_align = dc.SetTextAlign(TA_LEFT | TA_BASELINE);
 	CFont* old_font = dc.SelectObject(&efont);
+
+	// GDI call cache: only call SelectObject/SetTextColor when the value actually changes.
+	CFont*   last_font = nullptr;
+	COLORREF last_fg   = CLR_INVALID;
 
 	// Draw visible lines top to bottom (unified index view_top+row).
 	int total = (int)scrollback.size() + rows;
@@ -3238,11 +3320,12 @@ void CConBox::OnPaint()
 				// Glyph skipped for blank/trail (ch=0/' ') and blink-off; decorations always drawn.
 				if (c.ch != 0 && c.ch != L' ' && !(c.flags & CELL_BLINK && !blink_on)) {
 					bool cw = (c.flags & CELL_WIDE) != 0;
-					dc.SelectObject(cw ? &kfont_double : &efont_double);
-					dc.SetTextColor(fg);
+					CFont* df = cw ? &kfont_double : &efont_double;
+					if (df != last_font) { dc.SelectObject(df); last_font = df; }
+					if (fg != last_fg)   { dc.SetTextColor(fg); last_fg = fg; }
 					// adjust is scaled 2x for double-size glyphs (left/top position; right/bottom
 					// are already 2x via dw = 2*w*cell_w which uses the adjusted cell_w).
-					dc.TextOutW(px + 2 * adjust_left, py + dbl_base, &c.ch, 1);
+					::TextOutW(dc.GetSafeHdc(),px + 2 * adjust_left, py + dbl_base, &c.ch, 1);
 				}
 				if (c.flags & CELL_UNDERLINE)
 					dc.FillSolidRect(CRect(px, py + cell_h - 2, px + dw, py + cell_h), fg);
@@ -3263,9 +3346,9 @@ void CConBox::OnPaint()
 						bool cw = (c.flags & CELL_WIDE)   != 0;
 						CFont* f = cw ? (cb && ci ? &kfont_bold_italic : cb ? &kfont_bold : ci ? &kfont_italic : &kfont)
 						              : (cb && ci ? &efont_bold_italic : cb ? &efont_bold : ci ? &efont_italic : &efont);
-						dc.SelectObject(f);
-						dc.SetTextColor(fg);
-						dc.TextOutW(px + adjust_left, py + cell_base, &c.ch, 1);
+						if (f  != last_font) { dc.SelectObject(f);  last_font = f; }
+						if (fg != last_fg)   { dc.SetTextColor(fg); last_fg = fg; }
+						::TextOutW(dc.GetSafeHdc(),px + adjust_left, py + cell_base, &c.ch, 1);
 					}
 				}
 				// Underline and strikethrough decoration lines (drawn even on space/trail cells).
@@ -3333,7 +3416,7 @@ void CConBox::OnPaint()
 				bool cdrawn = (glyph_level >= 1 && DrawBlockElement(dc, wc, x, cur.top, cell_w, cell_h, cur_fg))
 				           || (glyph_level >= 2 && DrawBoxLine(dc, wc, x, cur.top, cell_w, cell_h, cur_fg));
 				if (!cdrawn)
-					dc.TextOutW(x + adjust_left, cur.top + cell_base, &wc, 1);
+					::TextOutW(dc.GetSafeHdc(),x + adjust_left, cur.top + cell_base, &wc, 1);
 				x += (wide ? 2 : 1) * cell_w;
 			}
 
@@ -3404,7 +3487,7 @@ void CConBox::OnPaint()
 						bool cdrawn = (glyph_level >= 1 && DrawBlockElement(dc, cc.ch, x, cur.top, cell_w, cell_h, cur_fg))
 						           || (glyph_level >= 2 && DrawBoxLine(dc, cc.ch, x, cur.top, cell_w, cell_h, cur_fg));
 						if (!cdrawn)
-							dc.TextOutW(x + adjust_left, cur.top + cell_base, &cc.ch, 1);
+							::TextOutW(dc.GetSafeHdc(),x + adjust_left, cur.top + cell_base, &cc.ch, 1);
 					}
 					x += w * cell_w;
 				}
@@ -3442,7 +3525,7 @@ void CConBox::OnPaint()
 
 // ===== EMF export =====
 // save_emf: renders the full scrollback+screen buffer to a series of EMF vector files.
-// Each page is a chunk of cfg_lines_per_page rows. If the first row of a page has CELL_DOUBLE
+// Each page is a chunk of cfg_lines_per_paper rows. If the first row of a page has CELL_DOUBLE
 // glyphs (which bleed upward by cell_h), an extra blank row is prepended (y_offset=cell_h) so the
 // bleed is not clipped. Rendering order per row: right-to-left, matching OnPaint (so CELL_DOUBLE
 // rightward bleed overwrites already-drawn cells, not later ones). Glyphs are drawn via
@@ -3451,25 +3534,27 @@ void CConBox::OnPaint()
 // as on screen DCs; TextOutW on an EMF DC renders immediately regardless of the path bracket.
 
 // (design: [PAINT]) -- same coordinate/cell logic as OnPaint but targets an EMF DC.
-void CConBox::save_emf(const char* dir)
+// Returns true if at least one EMF file was successfully written.
+bool CConBox::save_emf(const char* dir)
 {
-	if (!dir || !*dir) return;
+	if (!dir || !*dir) return false;
 
 	int total = (int)scrollback.size() + rows;
-	if (total <= 0) return;
+	if (total <= 0) return false;
 
 	// Convert dir (UTF-8) to wide string for Win32 path APIs.
 	int wlen = ::MultiByteToWideChar(CP_UTF8, 0, dir, -1, NULL, 0);
-	if (wlen <= 0) return;
+	if (wlen <= 0) return false;
 	std::vector<wchar_t> wdir(wlen);
 	::MultiByteToWideChar(CP_UTF8, 0, dir, -1, wdir.data(), wlen);
 
 	// Page width is fixed (same for all pages); height varies only when extra_top is added.
 	int page_w = margin_left + cols * cell_w + margin_right;
 
+	bool wrote_any = false;
 	int page_idx = 0;
-	for (int row_start = 0; row_start < total; row_start += cfg_lines_per_page, ++page_idx) {
-		int row_end = min(row_start + cfg_lines_per_page, total);
+	for (int row_start = 0; row_start < total; row_start += cfg_lines_per_paper, ++page_idx) {
+		int row_end = min(row_start + cfg_lines_per_paper, total);
 		int n_lines = row_end - row_start;
 
 		// If the first row of this page has any CELL_DOUBLE glyph, prepend a blank row so the
@@ -3490,7 +3575,7 @@ void CConBox::save_emf(const char* dir)
 
 		// Pass NULL for lpRect so GDI auto-computes the frame from actual drawing operations,
 		// giving a tight canvas that matches exactly the drawn content (no extra whitespace).
-		HDC hMeta = ::CreateEnhMetaFile(NULL, filename, NULL, NULL);
+		HDC hMeta = ::CreateEnhMetaFileW(NULL, filename, NULL, NULL);
 		if (!hMeta) continue;
 
 		// Wrap in CDC for DrawBlockElement/DrawBoxLine compatibility. Must Detach() before
@@ -3501,8 +3586,8 @@ void CConBox::save_emf(const char* dir)
 		cdc.SetTextAlign(TA_LEFT | TA_BASELINE);
 		CFont* old_font = cdc.SelectObject(&efont);
 
-		// Fill the page background with the default bg color.
-		cdc.FillSolidRect(CRect(0, 0, page_w, page_h), default_bg);
+		// Fill the page background with the paper bg color.
+		cdc.FillSolidRect(CRect(0, 0, page_w, page_h), paper_default_bg);
 
 		// Render rows. Right-to-left column order (same as OnPaint): CELL_DOUBLE glyphs bleed
 		// rightward; rendering right-to-left means the bleed overwrites already-drawn cells
@@ -3516,8 +3601,8 @@ void CConBox::save_emf(const char* dir)
 				const CharInfo& c = line[i];
 				int w  = (c.flags & CELL_WIDE) ? 2 : 1;
 				int px = margin_left + i * cell_w;
-				COLORREF fg = c.fg;
-				COLORREF bg = c.bg;
+				COLORREF fg = remap_paper_color(c.fg);
+				COLORREF bg = remap_paper_color(c.bg);
 
 				// --- Background ---
 				// CELL_DOUBLE: background covers the full 2x bleed area (upward by cell_h,
@@ -3530,31 +3615,31 @@ void CConBox::save_emf(const char* dir)
 						CRect(px, py, px + w * cell_w, py + cell_h), bg);
 				}
 
-				// --- Glyph ---
-				// Trail cells (ch=0) and spaces draw no glyph (but may still have decorations).
-				// Blink cells: always rendered visible (static EMF, no blink state).
-				if (c.ch != 0 && c.ch != L' ') {
-					if (c.flags & CELL_DOUBLE) {
-						// 2x-size glyph: uses efont_double/kfont_double (built in calc_cell_size).
-						// Always bold, ignores bold/italic SGR flags on double cells.
-						int dw       = 2 * w * cell_w;
-						int dbl_base = cell_base + adjust_top;
+				// --- Glyph + decorations ---
+				// Structure mirrors OnPaint: CELL_DOUBLE handled first (glyph skipped for ch=0/' '
+				// but decorations always drawn), non-double second (same skip rule for glyph only).
+				if (c.flags & CELL_DOUBLE) {
+					int dw       = 2 * w * cell_w;
+					int dbl_base = cell_base + adjust_top;
+					// Glyph: skipped for trail cells (ch=0) and spaces; blink always visible in EMF.
+					if (c.ch != 0 && c.ch != L' ') {
 						bool cw = (c.flags & CELL_WIDE) != 0;
 						cdc.SelectObject(cw ? &kfont_double : &efont_double);
 						cdc.SetTextColor(fg);
-						cdc.TextOutW(px + 2 * adjust_left, py + dbl_base, &c.ch, 1);
-						// Decorations for double: underline 2px at bottom, strike at midline.
-						if (c.flags & CELL_UNDERLINE)
-							cdc.FillSolidRect(
-								CRect(px, py + cell_h - 2, px + dw, py + cell_h), fg);
-						if (c.flags & CELL_STRIKE) {
-							int my = py + dbl_base - cell_h / 2;
-							cdc.FillSolidRect(CRect(px, my, px + dw, my + 2), fg);
-						}
-					} else {
-						// Normal glyph: block/box chars via DrawBlockElement/DrawBoxLine (already
-						// shape-based); other chars via SetTextColor + TextOutW (vector text record
-						// in the EMF -- on EMF DCs BeginPath/FillPath does not gate rendering).
+						::TextOutW(cdc.GetSafeHdc(),px + 2 * adjust_left, py + dbl_base, &c.ch, 1);
+					}
+					// Decorations always drawn (even for trail ch=0 and double-size spaces).
+					if (c.flags & CELL_UNDERLINE)
+						cdc.FillSolidRect(
+							CRect(px, py + cell_h - 2, px + dw, py + cell_h), fg);
+					if (c.flags & CELL_STRIKE) {
+						int my = py + dbl_base - cell_h / 2;
+						cdc.FillSolidRect(CRect(px, my, px + dw, my + 2), fg);
+					}
+				} else {
+					// Normal glyph: block/box chars via DrawBlockElement/DrawBoxLine;
+					// other chars via SetTextColor + TextOutW (vector text record in EMF).
+					if (c.ch != 0 && c.ch != L' ') {
 						bool drawn = false;
 						if (glyph_level >= 1)
 							drawn = DrawBlockElement(cdc, c.ch, px, py, cell_w, cell_h, fg);
@@ -3569,13 +3654,10 @@ void CConBox::save_emf(const char* dir)
 								: (cb&&ci ? &efont_bold_italic : cb ? &efont_bold : ci ? &efont_italic : &efont);
 							cdc.SelectObject(f);
 							cdc.SetTextColor(fg);
-							cdc.TextOutW(px + adjust_left, py + cell_base, &c.ch, 1);
+							::TextOutW(cdc.GetSafeHdc(),px + adjust_left, py + cell_base, &c.ch, 1);
 						}
 					}
-				}
-
-				// --- Decorations for non-double cells (drawn even on space / trail ch=0 cells) ---
-				if (!(c.flags & CELL_DOUBLE)) {
+					// Decorations drawn even on space / trail ch=0 cells.
 					if (c.flags & CELL_UNDERLINE)
 						cdc.FillSolidRect(
 							CRect(px, py + cell_h - 1, px + w * cell_w, py + cell_h), fg);
@@ -3590,20 +3672,235 @@ void CConBox::save_emf(const char* dir)
 		cdc.Detach();   // CDC must not own hMeta when CloseEnhMetaFile is called
 
 		HENHMETAFILE hmf = ::CloseEnhMetaFile(hMeta);   // writes the .emf file to disk
-		if (hmf) ::DeleteEnhMetaFile(hmf);               // release the in-memory handle
+		if (hmf) { ::DeleteEnhMetaFile(hmf); wrote_any = true; }
 	}
+	return wrote_any;
+}
+
+
+// ===== PDF export =====
+// save_pdf: renders scrollback+screen to a PDF file via the system PDF printer.
+// Finds the first printer whose name contains "PDF" (EnumPrintersW level 1), then retrieves
+// its DEVMODE via GetPrinterW level 2, sets a custom page size (dmPaperSize=DMPAPER_USER,
+// dmPaperWidth/Length in 0.1mm units), creates a printer DC, and drives GDI printing with
+// DOCINFO.lpszOutput pointing at the output file (no Save dialog shown).
+// Coordinate scaling: MM_ANISOTROPIC maps logical units (= screen pixels) to printer dots so
+// all existing cell_w/cell_h coordinates and the pre-built screen-DPI fonts work directly.
+// StartPage resets DC state, so mapping mode, bk mode, text align, and font are re-applied
+// after every StartPage.  The cell rendering loop is a verbatim copy of save_emf's loop.
+// (design: [PAINT])
+
+bool CConBox::save_pdf(const char* path)
+{
+	if (!path || !*path) return false;
+
+	int total = (int)scrollback.size() + rows;
+	if (total <= 0) return false;
+
+	// Convert output path to wide string.
+	int wlen = ::MultiByteToWideChar(CP_UTF8, 0, path, -1, NULL, 0);
+	if (wlen <= 0) return false;
+	std::vector<wchar_t> wpath(wlen);
+	::MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath.data(), wlen);
+
+	// --- Find a PDF-capable printer (name contains "PDF", case-insensitive) ---
+	DWORD needed = 0, count = 0;
+	::EnumPrintersW(PRINTER_ENUM_LOCAL | PRINTER_ENUM_CONNECTIONS,
+	                NULL, 1, NULL, 0, &needed, &count);
+	if (needed == 0) return false;
+	std::vector<BYTE> enum_buf(needed);
+	if (!::EnumPrintersW(PRINTER_ENUM_LOCAL | PRINTER_ENUM_CONNECTIONS,
+	                     NULL, 1, enum_buf.data(), needed, &needed, &count))
+		return false;
+
+	PRINTER_INFO_1W* pi1   = (PRINTER_INFO_1W*)enum_buf.data();
+	WCHAR*           pname = nullptr;
+	for (DWORD i = 0; i < count; ++i) {
+		if (!pi1[i].pName) continue;
+		WCHAR tmp[256];
+		wcsncpy_s(tmp, pi1[i].pName, _TRUNCATE);
+		_wcsupr_s(tmp, _countof(tmp));
+		if (wcsstr(tmp, L"PDF")) { pname = pi1[i].pName; break; }
+	}
+	if (!pname) return false;
+
+	// --- Content width in screen pixels (height is determined per-page below) ---
+	int page_w_px = margin_left + cols * cell_w + margin_right;
+
+	// --- Open printer; get driver name for CreateDCW ---
+	// Custom paper size (DMPAPER_USER) is silently ignored by the Microsoft Print to PDF
+	// driver -- it always reverts to its stored default (A4).  Instead we create the DC
+	// with the default DEVMODE, query the actual printable area (HORZRES/VERTRES), and
+	// derive how many terminal rows fit per page from that area.
+	HANDLE hPrinter = NULL;
+	if (!::OpenPrinterW(pname, &hPrinter, NULL)) return false;
+	DWORD pi2_needed = 0;
+	::GetPrinterW(hPrinter, 2, NULL, 0, &pi2_needed);
+	std::vector<BYTE> pi2_buf(pi2_needed);
+	if (!::GetPrinterW(hPrinter, 2, pi2_buf.data(), pi2_needed, &pi2_needed)) {
+		::ClosePrinter(hPrinter); return false;
+	}
+	::ClosePrinter(hPrinter);
+	PRINTER_INFO_2W* pi2 = (PRINTER_INFO_2W*)pi2_buf.data();
+
+	// --- Create printer DC (default paper, no DEVMODE override) ---
+	HDC hdc = ::CreateDCW(pi2->pDriverName, pname, pi2->pPortName, NULL);
+	if (!hdc) return false;
+
+	// --- Derive rows per page from the actual printable area ---
+	// Scale: fit content width exactly to the printable width (horzres device dots).
+	// At that scale, compute how many logical pixels are available vertically, then
+	// divide by cell_h to get complete rows.  The page height is then exactly
+	// margin_top + rows_per_page * cell_h + margin_bottom with no wasted space.
+	int horzres = ::GetDeviceCaps(hdc, HORZRES);
+	int vertres = ::GetDeviceCaps(hdc, VERTRES);
+
+	// avail_h: how many logical (screen-pixel) units fit in the printable height at the
+	// width-fit scale.  MulDiv avoids 32-bit overflow: (vertres * page_w_px) / horzres.
+	int avail_h      = ::MulDiv(vertres, page_w_px, horzres);
+	int rows_per_page = max(1, (avail_h - margin_top - margin_bottom) / cell_h);
+	int page_h_px    = margin_top + rows_per_page * cell_h + margin_bottom;
+
+	// Viewport height for this page_h_px (clamped to avoid off-by-one overflow).
+	int vp_x = horzres;
+	int vp_y = min(vertres, ::MulDiv(horzres, page_h_px, page_w_px));
+
+	// --- Start print job; lpszOutput routes output to file without a Save dialog ---
+	DOCINFOW di = {};
+	di.cbSize      = sizeof(di);
+	di.lpszDocName = L"ConBox";
+	di.lpszOutput  = wpath.data();
+	if (::StartDocW(hdc, &di) <= 0) {
+		::DeleteDC(hdc);
+		return false;
+	}
+
+	// Wrap in CDC for MFC drawing helpers (FillSolidRect, DrawBlockElement, etc.).
+	// Must Detach() before DeleteDC; never let CDC destructor own a printer HDC that was
+	// already passed to EndDoc/DeleteDC.
+	CDC cdc;
+	cdc.Attach(hdc);
+
+	// --- Page loop ---
+	for (int row_start = 0; row_start < total; row_start += rows_per_page) {
+		int row_end = min(row_start + rows_per_page, total);
+		int n_lines = row_end - row_start;
+
+		// Check for CELL_DOUBLE in the first row (needs an extra blank row above for bleed).
+		bool extra_top = false;
+		{
+			const Row& first = line_at(row_start);
+			for (const CharInfo& c : first) {
+				if (c.flags & CELL_DOUBLE) { extra_top = true; break; }
+			}
+		}
+		int y_offset = extra_top ? cell_h : 0;
+
+		::StartPage(hdc);
+
+		// StartPage resets DC state (mapping mode, selected objects, bk mode, text align).
+		// Re-apply after every StartPage so drawing calls use the correct coordinate system.
+		::SetMapMode(hdc, MM_ANISOTROPIC);
+		::SetWindowExtEx(hdc,  page_w_px, page_h_px, NULL);
+		::SetViewportExtEx(hdc, vp_x,     vp_y,      NULL);
+		cdc.SetBkMode(TRANSPARENT);
+		cdc.SetTextAlign(TA_LEFT | TA_BASELINE);
+		CFont* old_font = cdc.SelectObject(&efont);
+
+		// Page background.
+		cdc.FillSolidRect(CRect(0, 0, page_w_px, page_h_px), paper_default_bg);
+
+		// Cell rendering loop -- verbatim copy of save_emf's loop.
+		// Right-to-left column order so CELL_DOUBLE rightward bleed overwrites already-drawn cells.
+		for (int ri = 0; ri < n_lines; ++ri) {
+			const Row& line = line_at(row_start + ri);
+			int ncell = min((int)line.size(), cols);
+			int py = margin_top + y_offset + ri * cell_h;
+
+			for (int i = ncell - 1; i >= 0; --i) {
+				const CharInfo& c = line[i];
+				int w  = (c.flags & CELL_WIDE) ? 2 : 1;
+				int px = margin_left + i * cell_w;
+				COLORREF fg = remap_paper_color(c.fg);
+				COLORREF bg = remap_paper_color(c.bg);
+
+				// --- Background ---
+				if (c.flags & CELL_DOUBLE) {
+					cdc.FillSolidRect(
+						CRect(px, py - cell_h, px + 2 * w * cell_w, py + cell_h), bg);
+				} else {
+					cdc.FillSolidRect(
+						CRect(px, py, px + w * cell_w, py + cell_h), bg);
+				}
+
+				// --- Glyph + decorations (mirrors save_emf / OnPaint structure) ---
+				if (c.flags & CELL_DOUBLE) {
+					int dw       = 2 * w * cell_w;
+					int dbl_base = cell_base + adjust_top;
+					if (c.ch != 0 && c.ch != L' ') {
+						bool cw = (c.flags & CELL_WIDE) != 0;
+						cdc.SelectObject(cw ? &kfont_double : &efont_double);
+						cdc.SetTextColor(fg);
+						::TextOutW(cdc.GetSafeHdc(),px + 2 * adjust_left, py + dbl_base, &c.ch, 1);
+					}
+					// Decorations always drawn (even for trail ch=0 and double-size spaces).
+					if (c.flags & CELL_UNDERLINE)
+						cdc.FillSolidRect(
+							CRect(px, py + cell_h - 2, px + dw, py + cell_h), fg);
+					if (c.flags & CELL_STRIKE) {
+						int my = py + dbl_base - cell_h / 2;
+						cdc.FillSolidRect(CRect(px, my, px + dw, my + 2), fg);
+					}
+				} else {
+					if (c.ch != 0 && c.ch != L' ') {
+						bool drawn = false;
+						if (glyph_level >= 1)
+							drawn = DrawBlockElement(cdc, c.ch, px, py, cell_w, cell_h, fg);
+						if (!drawn && glyph_level >= 2)
+							drawn = DrawBoxLine(cdc, c.ch, px, py, cell_w, cell_h, fg);
+						if (!drawn) {
+							bool cb = (c.flags & CELL_BOLD)   != 0;
+							bool ci = (c.flags & CELL_ITALIC) != 0;
+							bool cw = (c.flags & CELL_WIDE)   != 0;
+							CFont* f = cw
+								? (cb&&ci ? &kfont_bold_italic : cb ? &kfont_bold : ci ? &kfont_italic : &kfont)
+								: (cb&&ci ? &efont_bold_italic : cb ? &efont_bold : ci ? &efont_italic : &efont);
+							cdc.SelectObject(f);
+							cdc.SetTextColor(fg);
+							::TextOutW(cdc.GetSafeHdc(),px + adjust_left, py + cell_base, &c.ch, 1);
+						}
+					}
+					// Decorations drawn even on space / trail ch=0 cells.
+					if (c.flags & CELL_UNDERLINE)
+						cdc.FillSolidRect(
+							CRect(px, py + cell_h - 1, px + w * cell_w, py + cell_h), fg);
+					if (c.flags & CELL_STRIKE)
+						cdc.FillSolidRect(
+							CRect(px, py + cell_h / 2, px + w * cell_w, py + cell_h / 2 + 1), fg);
+				}
+			}
+		}
+
+		cdc.SelectObject(old_font);
+		::EndPage(hdc);
+	}
+
+	cdc.Detach();
+	::EndDoc(hdc);
+	::DeleteDC(hdc);
+	return true;
 }
 
 
 // ===== Text extract =====
-// export_text: returns the full scrollback+screen buffer as UTF-8 text lines.
+// get_text_lines: returns the full scrollback+screen buffer as UTF-8 text lines.
 // Each element is a null-terminated std::string with no trailing newline. Trailing spaces trimmed.
 // Trail cell detection: put_char sets ch=0 on the trail but does NOT set CELL_WIDE there (only
 // the lead has CELL_WIDE). Trails are skipped by position (lead+1), not by flag check.
 // CELL_DOUBLE extras: Korean (CELL_WIDE+CELL_DOUBLE) = 4-cell advance -> skip trail + 2 blanks.
 //                     English/etc (CELL_DOUBLE only)  = 2-cell advance -> skip 1 blank.
 
-std::vector<std::string> CConBox::export_text() const
+std::vector<std::string> CConBox::get_text_lines() const
 {
 	int total = (int)scrollback.size() + rows;
 	std::vector<std::string> result;
@@ -3658,6 +3955,53 @@ std::vector<std::string> CConBox::export_text() const
 	}
 
 	return result;
+}
+
+
+// Open or close the raw child-output log file. Bytes are written in pump() before VT parsing so
+// VT codes are preserved exactly as the child emitted them (no conversion, no CR/LF translation).
+// Calling with nullptr/empty closes any open log; calling with a path creates/replaces the file.
+// No window is needed -- safe to call before open() so the file is ready before the child starts.
+int CConBox::save_log(const char* file_name)
+{
+	// Close any currently open log (idempotent; also the close path when file_name is null).
+	if (log_file != INVALID_HANDLE_VALUE) {
+		::CloseHandle(log_file);
+		log_file = INVALID_HANDLE_VALUE;
+	}
+	if (!file_name || !*file_name)
+		return 0;
+
+	// Convert UTF-8 path to wide for CreateFileW (same pattern as save_emf).
+	int wlen = ::MultiByteToWideChar(CP_UTF8, 0, file_name, -1, NULL, 0);
+	if (wlen <= 0)
+		return (int)::GetLastError();
+	std::vector<wchar_t> wpath(wlen);
+	::MultiByteToWideChar(CP_UTF8, 0, file_name, -1, wpath.data(), wlen);
+
+	// OPEN_ALWAYS: create if missing, otherwise append to the existing file.
+	log_file = ::CreateFileW(wpath.data(), GENERIC_WRITE, FILE_SHARE_READ,
+	                         NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+	if (log_file == INVALID_HANDLE_VALUE)
+		return (int)::GetLastError();
+
+	// Seek to end so new output is appended.
+	LARGE_INTEGER zero = {};
+	::SetFilePointerEx(log_file, zero, NULL, FILE_END);
+
+	// Write 4 blank lines, then a 100-column separator with the local start time.
+	// Layout: 5 CRLFs (ends previous content + 4 blank lines) then
+	//   "--- YYYY-MM-DD HH:MM:SS " (24 chars) + 76 dashes = 100 cols.
+	SYSTEMTIME st;
+	::GetLocalTime(&st);
+	char hdr[128];
+	int hlen = sprintf_s(hdr, sizeof(hdr),
+	                     "\r\n\r\n\r\n\r\n\r\n--- %04d-%02d-%02d %02d:%02d:%02d "
+	                     "----------------------------------------------------------------------------\r\n",
+	                     st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+	DWORD written;
+	::WriteFile(log_file, hdr, hlen, &written, NULL);
+	return 0;
 }
 
 
@@ -3920,6 +4264,11 @@ void CConBox::pump()
 			handle_child_exit();
 			return;
 		}
+		// Write raw bytes to log before VT parsing (VT codes intact, no conversion).
+		if (log_file != INVALID_HANDLE_VALUE) {
+			DWORD written;
+			::WriteFile(log_file, buf, got, &written, NULL);
+		}
 		buf[got] = '\0';   // print() expects null-terminated UTF-8
 		print(buf);
 		avail -= got;
@@ -3952,6 +4301,11 @@ void CConBox::OnDestroy()
 {
 	// Clean up child/polling timer before the window is destroyed (so polling never touches a dying window).
 	stop();
+	// Auto-close the log file so no bytes are lost if the window closes while logging.
+	if (log_file != INVALID_HANDLE_VALUE) {
+		::CloseHandle(log_file);
+		log_file = INVALID_HANDLE_VALUE;
+	}
 	KillTimer(BLINK_TIMER);
 	KillTimer(SBAR_TIMER);
 	CWnd::OnDestroy();
