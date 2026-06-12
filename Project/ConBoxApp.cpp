@@ -12,33 +12,33 @@
 #endif
 
 
-// CConBoxApp
+// cConBoxApp
 
-BEGIN_MESSAGE_MAP(CConBoxApp, CWinApp)
+BEGIN_MESSAGE_MAP(cConBoxApp, CWinApp)
 	ON_COMMAND(ID_HELP, &CWinApp::OnHelp)
 END_MESSAGE_MAP()
 
 
-// CConBoxApp 생성
+// cConBoxApp 생성
 
-CConBoxApp::CConBoxApp()
+cConBoxApp::cConBoxApp()
 {
 	// TODO: 여기에 생성 코드를 추가합니다.
 	// InitInstance에 모든 중요한 초기화 작업을 배치합니다.
 }
 
 
-// 유일한 CConBoxApp 개체입니다.
+// 유일한 cConBoxApp 개체입니다.
 
-CConBoxApp theApp;
+cConBoxApp theApp;
 
 
-// CConBoxApp 초기화
+// cConBoxApp 초기화
 
-BOOL CConBoxApp::InitInstance()
+BOOL cConBoxApp::InitInstance()
 {
 	// 디스플레이 배율(비100%) 환경에서 글자가 흐려지지 않도록 프로세스를 System DPI Aware 로 만든다.
-	// DPI 인식은 프로세스 단위 속성이므로 이식 대상 컨트롤(CConBox)이 아니라 호스트 앱에서 켠다.
+	// DPI 인식은 프로세스 단위 속성이므로 이식 대상 컨트롤(cConBox)이 아니라 호스트 앱에서 켠다.
 	// 윈도우/DC 생성 전에 호출해야 하므로 InitInstance 의 가장 앞에 둔다.
 	SetProcessDPIAware();
 
@@ -65,7 +65,7 @@ BOOL CConBoxApp::InitInstance()
 	// 적절한 내용으로 수정해야 합니다.
 	SetRegistryKey(_T("로컬 애플리케이션 마법사에서 생성된 애플리케이션"));
 
-	CConBoxDlg dlg;
+	cConBoxDlg dlg;
 	m_pMainWnd = &dlg;
 	INT_PTR nResponse = dlg.DoModal();
 	if (nResponse == IDOK)

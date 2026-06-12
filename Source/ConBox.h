@@ -24,9 +24,9 @@
 //     advances 2x so no manual spaces needed between big chars. Stored in CharInfo::flags.
 //
 // --- Usage (inside the host parent window) ---
-//     CConBox box;                            // usually held as a member
+//     cConBox box;                            // usually held as a member
 //     box.set_efont("Consolas", 13, "B");     // (optional) font; omitted = defaults
-//     box.open(parent, 0, 0, 400, 300);       // create child window by coords
+//     box.open(parent, 0, 0);                  // create child window at (left,top); size from cfg
 //     box.print("hello\n");                   // output (UTF-8) flows into the cell grid
 //
 // Two ways to use ConBox:
@@ -34,7 +34,7 @@
 //      set_input_sink() (raw mode: no local echo; keys encoded to VT/UTF-8). Works with any
 //      byte source (file/socket/host-managed process).
 //  (2) ConPTY child runner: one start(cmdline) call spawns a child (cmd/powershell/python REPL)
-//      and auto-wires its console I/O (console size taken from grid_cols()/grid_rows(); internally
+//      and auto-wires its console I/O (console size taken from grid_size(); internally
 //      reuses the input/resize sinks). Child output is polled by an internal timer into print().
 // With no sink and no start(), it is a read-only viewer of print() output.
 
@@ -79,14 +79,21 @@ enum {
 
 typedef std::vector<CharInfo> Row;
 
-class CConBox : public CWnd
+class cConBox : public CWnd
 {
 public:
-	CConBox();
-	virtual ~CConBox();
+	// Returned by grid_size(). rows, cols in ROW, COL order.
+	struct GridSize { int rows, cols; };
 
-	// Create the child window at coords (x0,y0)-(x1,y1) inside parent (no .rc resource needed).
-	void open(CWnd* parent, int x0, int y0, int x1, int y1);
+	cConBox();
+	virtual ~cConBox();
+
+	// Create the child window at (left, top) inside parent. Pixel size is computed from the
+	// cfg_rows/cfg_cols set by setup_from_ini() (defaults: 96 cols x 32 rows). If cfg_cmdline is
+	// non-empty, start() is called automatically after the window is created. Call after
+	// setup_from_ini() (fonts/margins must be set before the first layout). The host can then
+	// call GetClientRect() on the ConBox CWnd to get the actual pixel size for its own layout.
+	void open(CWnd* parent, int left = 0, int top = 0);
 
 	// Set the English font. size is in points. opts is an attribute string (see set_builtin_glyphs
 	// note below and ConBox.cpp ParseFontOpts for the grammar).
@@ -159,30 +166,20 @@ public:
 	// Default 10 on all sides. Calling after open() recomputes the grid.
 	void set_margin(int top, int left = -1, int bottom = -1, int right = -1);
 
-	// Return in w/h the client pixel size that holds cols x rows cells including set_margin padding.
-	// Cell px depends on font/DPI, so call after open(). Host uses this to size a window by grid.
-	void client_size_for_grid(int cols, int rows, int& w, int& h) const;
-
-	// Current screen grid columns/rows (valid after open()). Host uses these to size the child PTY.
-	int grid_cols() const { return cols; }
-	int grid_rows() const { return rows; }
+	// Current screen grid size (rows, cols). Valid after open().
+	GridSize grid_size() const { return { rows, cols }; }
 
 	// Load settings from an INI file (section-agnostic key matching). path is UTF-8; a relative
 	// path is resolved against the EXE directory (not the working directory). nullptr defaults to
-	// "ConBox.ini". If the file does not exist, it is created with compiled-in defaults and this
-	// call returns without changing any settings (they stay at their defaults).
+	// "ConBox.ini". If the file does not exist, it is created with compiled-in defaults and a
+	// notification is stored in ini_msg (printed by open() once the window exists). Settings stay
+	// at constructor defaults. If the file exists but cannot be opened, the same deferred print()
+	// path applies. Call before open() so fonts/margins are set before the first layout.
 	void setup_from_ini(const char* path = nullptr);
 
 	// Apply INI-format settings from a string. contents is UTF-8 with \n line endings (no BOM).
 	// Useful for programmatic injection of settings without a file.
 	void setup(const char* contents);
-
-	// Grid size and child cmdline read from the last setup_from_ini() or setup() call. The host uses these to size
-	// the window (resize_to_grid) and launch the child (start()), so it does not need to hard-code
-	// those values anymore.
-	int         config_cols()    const { return cfg_cols; }
-	int         config_rows()    const { return cfg_rows; }
-	const char* config_cmdline() const { return cfg_cmdline.c_str(); }
 
 	// Export all content (scrollback + screen) to a series of EMF vector files in dir (UTF-8 path).
 	// Files are named ConBox000.emf, ConBox001.emf, ...
@@ -226,26 +223,29 @@ public:
 	// (start() registers itself via this API internally.)
 	void set_input_sink(void (*sink)(const char* bytes, int len, void* user), void* user);
 
-	// Set the resize sink. When the grid (cols/rows) changes, the new size is reported here (to match
+	// Set the resize sink. When the grid (rows/cols) changes, the new size is reported here (to match
 	// the child's pseudo-console). nullptr = no notification. (start() registers itself here to wire
 	// ResizePseudoConsole.)
-	void set_resize_sink(void (*sink)(int cols, int rows, void* user), void* user);
+	void set_resize_sink(void (*sink)(int rows, int cols, void* user), void* user);
 
 	// === ConPTY child runner (optional) ===
 	// Using this group makes ConBox spawn a child and auto-wire its I/O. If start() is never called,
 	// the ConPTY members stay dormant and ConBox is a pure terminal view.
 
 	// Spawn cmdline (UTF-8, e.g. "python.exe", "cmd /c dir") under ConPTY. Console size is taken from
-	// grid_cols()/grid_rows(). Internally wires the input/resize sinks to itself and starts an output
+	// grid_size(). Internally wires the input/resize sinks to itself and starts an output
 	// polling timer. Restarts if already running. Returns true on success. Call after open() (the
 	// polling timer needs the window).
+	// The no-arg overload uses cfg_cmdline set by setup_from_ini() (also called automatically by
+	// open() when cfg_cmdline is non-empty).
+	bool start();
 	bool start(const char* cmdline);
 
 	// Send bytes (UTF-8/VT) to the child stdin. Normally called by the input-sink path.
 	void write(const char* data, int len);
 
-	// ResizePseudoConsole to cols x rows. Normally called by the resize-sink path.
-	void resize(int cols, int rows);
+	// ResizePseudoConsole to rows x cols. Normally called by the resize-sink path.
+	void resize(int rows, int cols);
 
 	// Tear down child/PTY/pipes/polling timer. Idempotent.
 	void stop();
@@ -433,8 +433,8 @@ private:
 	void (*input_sink)(const char* bytes, int len, void* user);
 	void* input_sink_user;
 
-	// Resize sink. Reports a new grid size (to sync the child PTY size).
-	void (*resize_sink)(int cols, int rows, void* user);
+	// Resize sink. Reports a new grid size (rows, cols order) to sync the child PTY size.
+	void (*resize_sink)(int rows, int cols, void* user);
 	void* resize_sink_user;
 
 	// === ConPTY child state (all dormant unless start() is used) ===
@@ -452,7 +452,7 @@ private:
 	void handle_child_exit();
 	// Static thunks start() registers on the input/resize sinks; route to this->write/resize.
 	static void child_input_thunk(const char* bytes, int len, void* user);
-	static void child_resize_thunk(int cols, int rows, void* user);
+	static void child_resize_thunk(int rows, int cols, void* user);
 
 	COLORREF default_fg; // default RGB(200,200,200)
 	COLORREF default_bg; // default RGB(32,32,32)
@@ -601,6 +601,7 @@ private:
 	int         cfg_rows;
 	std::string cfg_cmdline;
 	int         cfg_lines_per_paper; // EMF export: rows per page (lines_per_paper INI key; default 50)
+	std::string ini_msg;             // deferred message from setup_from_ini(); printed by open() once the window exists
 
 	// Double-buffer cache reused by OnPaint (not recreated each frame).
 	CDC back_dc;              // persistent memory DC

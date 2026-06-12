@@ -8,7 +8,7 @@ Concise notes Claude should recall each session. Implementation truth = `Source/
   `& "C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Current\Bin\MSBuild.exe" "D:\Work\Study\ConBox\Project\ConBox.sln" /t:Build /p:Configuration=Debug /p:Platform=x64`
 - 32-bit at the **solution** level is `x86`, NOT `Win32` (vcxproj level is Win32). Wrong → MSB4126.
 - Output `Project/Debug.64/ConBox.exe` (per-config `.64`/`.32`).
-- Portable unit is **ConBox.h + ConBox.cpp** only. `CConExe` was merged into `CConBox`; `ConExe.h/.cpp` deleted.
+- Portable unit is **ConBox.h + ConBox.cpp** only. `CConExe` was merged into `cConBox`; `ConExe.h/.cpp` deleted.
 - In Bash, MSBuild `/t:` flags get mangled into POSIX paths — build via the **PowerShell** tool instead.
 
 ## Source/ file conventions
@@ -54,7 +54,7 @@ Concise notes Claude should recall each session. Implementation truth = `Source/
   + DWM). Use the harness PNG dump; for a real WT window, `AttachThreadInput`+`CopyFromScreen`.
 
 ## DPI
-- Demo calls `SetProcessDPIAware()` as the first line of `CConBoxApp::InitInstance()` (before any
+- Demo calls `SetProcessDPIAware()` as the first line of `cConBoxApp::InitInstance()` (before any
   window/DC) → System DPI Aware (crisp at non-100%). DPI awareness is **process-wide** → the **host**
   sets it, not the control. Then `make_font`'s `GetDeviceCaps(LOGPIXELSY)` returns real DPI.
 - Verify at 125%/150%: text not blurry, layout/cursor/click aligned.
@@ -153,7 +153,7 @@ To reproduce `calc_cell_size` values (`cell_w`/`natw`/`kwid`):
   (`stop` then `exit_cb`; callback may `start()` again safely).
 - Output polling = ConBox's own window timer `PUMP_TIMER`(=3; distinct from CURSOR=1). Needs a
   running GUI message pump. The old message-only window is gone.
-- Lifetime: `CConBox::OnDestroy` (and the dtor, and demo's OnDestroy) call `stop()` first so polling
+- Lifetime: `cConBox::OnDestroy` (and the dtor, and demo's OnDestroy) call `stop()` first so polling
   never touches a dying window. Idempotent.
 - `start()` wires input/resize by registering itself on `set_input_sink`/`set_resize_sink` (same path
   a pure-view host would use).
@@ -235,7 +235,7 @@ To reproduce `calc_cell_size` values (`cell_w`/`natw`/`kwid`):
   on the second run, causing GDI to fall back to a substitute font with different metrics.
 - `CreateDefaultIni()` writes Korean UTF-8 comments as `\xNN` hex escapes to keep `.cpp` pure ASCII.
   Default INI filename is `ConBox.ini` (formerly `Config.ini`).
-- **Current INI defaults** (changed this session): `cmdline=cmd.exe` (was powershell.exe);
+- **Current INI defaults**: `cmdline=` (empty — no auto-start; was `cmd.exe`);
   `adjust_top=-2` (was 0); `builtin_glyphs=2` (was 1); `lines_per_page` renamed to `lines_per_paper`.
 - **Paper palette** (`paper_default_fg/bg`, `paper_ansi_colors[16]`): independent second color set for
   export (save_emf/save_pdf). Defaults use semantic inversion for white-bg export (see below).
@@ -244,6 +244,32 @@ To reproduce `calc_cell_size` values (`cell_w`/`natw`/`kwid`):
   through unchanged).
 - **Palette key naming**: `screen_palette00..15` / `paper_palette00..15` are 0-indexed (matching ANSI
   color indices 0-15 directly). Older sessions used 1-indexed keys (01..16); those are now gone.
+- **`setup_from_ini` error → deferred `print()`**: `ini_msg` (std::string private member) stores the
+  status message when the INI is missing or unreadable; `open()` calls `print(ini_msg.c_str())` and
+  clears it after the window is created. This avoids `MessageBoxW` (window doesn't exist yet at setup
+  time). The `w2u` lambda inside `setup_from_ini` converts `wide_path` (wstring) to UTF-8 inline.
+
+## open() / grid API (refactored)
+- **`open(parent, left=0, top=0)`** (was `open(parent, x0, y0, x1, y1)`): pixel size computed
+  internally from `cfg_rows`/`cfg_cols`; auto-starts if `cfg_cmdline` non-empty. Host uses
+  `GetClientRect()` on the ConBox `CWnd*` to get the pixel size afterward.
+- **Removed APIs**: `client_size_for_grid()`, `grid_cols()`, `grid_rows()`, `config_cols()`,
+  `config_rows()`, `config_cmdline()`. All replaced by `grid_size()` + `GetClientRect()` pattern.
+- **`struct GridSize { int rows, cols; }`** nested inside `cConBox` (public). Returned by `grid_size()`.
+- **`start()` no-arg** added (uses `cfg_cmdline`). The explicit `start(cmdline)` overload kept.
+- **ROW, COL order**: `resize(int rows, int cols)` and the `set_resize_sink` callback
+  `void(*)(int rows, int cols, void*)` are now ROW-first. (Was COL, ROW.)
+- **`set_exit_callback`** is NOT called automatically by `open()`. Default on child exit = do nothing.
+  The host must call it explicitly if it wants the window to close.
+- **INI path bug** (fixed): demo used `"Documents\\ConBox.ini"` (EXE-relative →
+  `Project/Debug.64/Documents/ConBox.ini`, nonexistent) → corrected to `"..\\..\\Documents\\ConBox.ini"`.
+  The old code was hidden because the ctor defaulted `cfg_cmdline = "cmd.exe"` and start() was called
+  explicitly — so the broken path went unnoticed.
+- **`CreatePtyPipes` local-var rename pitfall**: when `start(cmdline)` renamed locals from `cols`/`rows`
+  to `c`/`r`, the `CreatePtyPipes(cols, rows, ...)` call was not updated → runtime passed stale zeros.
+  Fixed to `CreatePtyPipes(c, r, ...)`. A symptom: child PTY sized 0x0, no output.
+- **Demo `resize_to_grid()`** takes no args; reads `con_box.GetClientRect()` directly (was
+  `client_size_for_grid(cols, rows)` with args read from `config_cols()/config_rows()`).
 
 ## EMF export (save_emf / get_text_lines)
 - **BeginPath/FillPath does NOT work on EMF DCs**: `TextOutW` on an EMF DC renders immediately

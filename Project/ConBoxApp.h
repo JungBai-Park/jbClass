@@ -11,14 +11,14 @@
 #include "resource.h"		// 주 기호입니다.
 
 
-// CConBoxApp:
+// cConBoxApp:
 // 이 클래스의 구현에 대해서는 ConBoxApp.cpp을(를) 참조하세요.
 //
 
-class CConBoxApp : public CWinApp
+class cConBoxApp : public CWinApp
 {
 public:
-	CConBoxApp();
+	cConBoxApp();
 
 // 재정의입니다.
 public:
@@ -29,4 +29,4 @@ public:
 	DECLARE_MESSAGE_MAP()
 };
 
-extern CConBoxApp theApp;
+extern cConBoxApp theApp;

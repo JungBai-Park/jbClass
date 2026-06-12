@@ -7,7 +7,7 @@ Paths are relative to the project root. When a detail is unspecified, follow **W
 
 ## 1. Overview
 
-- `CConBox` (`Source/ConBox.h` / `ConBox.cpp`): a portable MFC `CWnd`-derived terminal control.
+- `cConBox` (`Source/ConBox.h` / `ConBox.cpp`): a portable MFC `CWnd`-derived terminal control.
   **Single class** — the former ConPTY runner `CConExe` is merged in; `ConExe.h/.cpp` were removed.
 - Two usage modes (both supported by the one class):
   - **Pure terminal view**: host feeds output bytes via `print()` and optionally reads keystroke
@@ -42,19 +42,21 @@ Paths are relative to the project root. When a detail is unspecified, follow **W
 ## 2. Window / Grid API
 
 ```cpp
-void open(CWnd* parent, int x0, int y0, int x1, int y1);   // create child window by coords (no .rc)
-void client_size_for_grid(int cols, int rows, int& w, int& h) const;  // px size to fit cols x rows (+margins)
-int  grid_cols() const;   // current screen grid columns (English cells)
-int  grid_rows() const;   // current screen grid rows
+struct GridSize { int rows, cols; };   // nested inside cConBox
+
+void     open(CWnd* parent, int left = 0, int top = 0);  // create child window at (left,top); size from cfg
+GridSize grid_size() const;                              // current screen grid {rows, cols} (valid after open())
 ```
 
 - `open()` registers the window class `"ConBox"` (fixed name via `RegisterClassExW`). Multiple
   instances in one process are safe. Host/test code can locate any instance with
   `FindWindowEx(parent, NULL, L"ConBox", NULL)`.
-- `client_size_for_grid` returns the client pixel size to hold `cols` x `rows` cells including
-  `set_margin` padding; cell px depends on font/DPI so call after `open()`.
-- `grid_cols`/`grid_rows` give the current grid; `start()` internally reads them to size the child
-  console to match the view (no explicit cols/rows parameters needed).
+- Window pixel size is computed internally from `cfg_rows`/`cfg_cols` (set by `setup_from_ini()`;
+  defaults 32 rows × 96 cols). Call `setup_from_ini()` before `open()`.
+- If `cfg_cmdline` is non-empty at the time of `open()`, `start()` is called automatically.
+- After `open()`, the host calls `GetClientRect()` on the ConBox `CWnd*` to get the pixel size for
+  its own layout (no separate `client_size_for_grid` API needed).
+- `grid_size()` returns the current actual grid after `open()` (may differ from cfg after a resize).
 
 ---
 
@@ -296,23 +298,26 @@ Launches a console child via ConPTY (pseudo console) and connects its I/O to thi
 The child sees a real console, so line tools through full-screen TUIs run by one path.
 
 ```cpp
+bool start();                                          // launch child using cfg_cmdline (also called by open())
 bool start(const char* cmdline);                       // launch child (cmdline UTF-8); call after open()
 void write(const char* data, int len);                // bytes -> child stdin (input sink calls this)
-void resize(int cols, int rows);                       // ResizePseudoConsole (resize sink calls this)
+void resize(int rows, int cols);                       // ResizePseudoConsole; ROW,COL order (resize sink calls this)
 void stop();                                           // tear down child/PTY/pipes/timer (idempotent)
 bool is_running() const;
 void set_exit_callback(void (*cb)(void* user), void* user);  // fired once on child's natural exit
 void pump();                                           // read pending child output -> print()
 // generic hooks (also usable for pure-view mode without start()):
 void set_input_sink(void (*sink)(const char* bytes, int len, void* user), void* user);
-void set_resize_sink(void (*sink)(int cols, int rows, void* user), void* user);
+void set_resize_sink(void (*sink)(int rows, int cols, void* user), void* user);  // ROW,COL order
 ```
 
-- `start` reads the current grid size (`grid_cols()`, `grid_rows()`), then makes input/output pipes +
-  a pseudo console sized to match, spawns the child (STARTUPINFOEX +
-  `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE_HANDLE`), and **internally registers itself** on the input
-  sink (→`write`) and resize sink (→`resize`); an internal timer polls output into `print()`. Requires
-  the window to exist (call after `open()`). If already running, restarts.
+- `start()` (no-arg) uses `cfg_cmdline`. `open()` calls it automatically when `cfg_cmdline` is
+  non-empty. `start(cmdline)` uses an explicit command line. Both read the current grid size via
+  `grid_size()`, make input/output pipes + a pseudo console sized to match, spawn the child
+  (STARTUPINFOEX + `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE_HANDLE`), and **internally register
+  themselves** on the input sink (→`write`) and resize sink (→`resize`); an internal timer polls
+  output into `print()`. Requires the window to exist (call after `open()`). If already running,
+  restarts.
 - `resize` calls `ResizePseudoConsole`; the resize sink fires it when the grid changes.
 - `set_exit_callback`: on the child's **natural exit** (e.g. shell `exit`, EOF), called once after
   cleanup (so `is_running()` is false and the callback may `start()` again). Not called for explicit
@@ -403,16 +408,16 @@ void set_resize_sink(void (*sink)(int cols, int rows, void* user), void* user);
 
 ## 13. Demo (`Project/`)
 
-- An MFC dialog app (`CConBoxDlg`) hosts ConBox as a child window for portability testing
+- An MFC dialog app (`cConBoxDlg`) hosts ConBox as a child window for portability testing
   (ConBox source stays demo-free).
 - No OK/Cancel; ConBox fills the client area with a **5px** bezel margin. Titlebar has min/max;
   resizing the window resizes ConBox.
-- On startup `con_box.setup_from_ini("../../Documents/ConBox.ini")` is called before `open()`; all
+- On startup `con_box.setup_from_ini("..\\..\\Documents\\ConBox.ini")` is called before `open()`; all
   font, color, cursor, margin, grid-size, and cmdline settings come from the INI file. Individual
   `set_efont`/`set_kfont`/`adjust`/`set_cursor`/`start("powershell.exe")` calls were removed from
   the demo; use the config file instead.
-- Startup sizes the main window so ConBox is **`config_cols()` x `config_rows()` cells** (default
-  96 x 32) via `client_size_for_grid`, centered on the work area.
+- Startup: `open(this, 5, 5)` sizes ConBox from INI cfg (default 96×32 cells); `client_size_for_grid()`
+  then computes the dialog size, centered on the work area.
 - `set_exit_callback` closes the window when the child exits.
 - The app is **System DPI Aware** (crisp at non-100% scaling) — set by the host
   (`SetProcessDPIAware()`), not the control, since DPI awareness is process-wide.
@@ -428,20 +433,18 @@ void set_resize_sink(void (*sink)(int cols, int rows, void* user), void* user);
 ```cpp
 void setup_from_ini(const char* path = nullptr);  // load INI file; nullptr -> "ConBox.ini" next to EXE
 void setup(const char* contents);                 // apply INI-format settings from a string (UTF-8)
-int         config_cols()    const;               // grid_cols from last setup call (default 96)
-int         config_rows()    const;               // grid_rows from last setup call (default 32)
-const char* config_cmdline() const;               // cmdline from last setup call (default "powershell.exe")
 ```
 
 - Sections are cosmetic; keys are matched by **name only** (section-agnostic).
 - `setup_from_ini`: relative path resolved against **EXE directory**, not the working directory.
-  If the file does not exist it is **auto-created** with compiled-in defaults; returns without
-  applying anything (settings stay at constructor defaults).
+  If the file does not exist it is **auto-created** with compiled-in defaults; a notification
+  message is stored in `ini_msg` and printed by `open()` once the window exists. Settings stay at
+  constructor defaults. If the file exists but cannot be opened, the same deferred `print()` path
+  is used (warning message printed after `open()`). In both error cases, settings stay at defaults.
 - `setup`: applies INI-format content from a string — useful for embedding config in the host
   without a separate file. Same key/value rules as `setup_from_ini`.
 - Call either **before `open()`** so fonts/margins are set before the first layout.
-- `config_cols`/`config_rows`/`config_cmdline` return the values read; the host uses them to call
-  `resize_to_grid` and `start()` after `open()`.
+  After `open()` the host calls `GetClientRect()` on the ConBox `CWnd*` to size the surrounding window.
 
 ### Configurable keys
 
@@ -461,7 +464,7 @@ const char* config_cmdline() const;               // cmdline from last setup cal
 | `builtin_glyphs` | `set_builtin_glyphs` | 2 |
 | `scrollback_cap` | `max_scrollback` | 5000 |
 | `grid_cols`, `grid_rows` | stored in `cfg_cols`/`cfg_rows` | 96, 32 |
-| `cmdline` | stored in `cfg_cmdline` | cmd.exe |
+| `cmdline` | stored in `cfg_cmdline` | "" (empty = no auto-start) |
 | `lines_per_paper` | stored in `cfg_lines_per_paper` | 50 |
 
 - **`screen_palette00..15`**: ANSI 16-color base palette (0-indexed, matching ANSI indices directly). Format `#RRGGBB`. Defaults match classic xterm colors (black/red/green/yellow/blue/magenta/cyan/white ×2 bright). Changing these recolors all SGR 30-37/40-47/90-97/100-107 screen output.

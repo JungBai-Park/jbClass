@@ -1,6 +1,6 @@
 // ConBox.cpp
 //
-// Implementation of CConBox. To only USE the control, ConBox.h is enough; read this file when
+// Implementation of cConBox. To only USE the control, ConBox.h is enough; read this file when
 // MODIFYING behavior. Use the table of contents below to Grep to one function instead of reading
 // the whole file.
 //
@@ -10,7 +10,7 @@
 //   window/font     : open, make_font, apply_default_fonts, calc_cell_size,
 //                     set_efont, set_kfont, set_builtin_glyphs
 //   color/cursor    : set_fg_color, set_bg_color, set_cursor_blend, set_cursor_blink, set_cursor, bump_cursor, remap_paper_color, OnTimer
-//   margin          : set_margin, client_size_for_grid
+//   margin          : set_margin, grid_size
 //   config          : setup_from_ini, setup, CreateDefaultIni(static), ResolveIniPath(static), ParseIni(static), ParseColor(static)
 //   cursor geometry : blend_cursor_color, cursor_screen_pos, get_cursor_rect, is_hangul_mode
 //   grid/output     : update_metrics, blank_row, reset_screen, line_at, clamp_cursor, erase_cells,
@@ -27,7 +27,7 @@
 //                     OnLButtonUp, OnMouseMove, OnRButtonDown, OnDropFiles
 //   painting        : ensure_back_buffer, OnPaint
 //   export          : save_emf, save_pdf, get_text_lines, save_log
-//   child (ConPTY)  : Utf8ToWide/CreatePtyPipes(static), start, write, resize, stop, is_running,
+//   child (ConPTY)  : Utf8ToWide/CreatePtyPipes(static), start(no-arg)/start(cmdline), write, resize, stop, is_running,
 //                     set_exit_callback, pump, handle_child_exit, child_input_thunk/child_resize_thunk, OnDestroy
 //
 // ===== DESIGN OVERVIEW =====
@@ -180,7 +180,7 @@ enum { VT_GROUND = 0, VT_ESC = 1, VT_CSI = 2, VT_OSC = 3 };
 
 // MAX_SCROLLBACK is now the instance member max_scrollback (configurable via config()).
 
-BEGIN_MESSAGE_MAP(CConBox, CWnd)
+BEGIN_MESSAGE_MAP(cConBox, CWnd)
 	ON_WM_PAINT()
 	ON_WM_ERASEBKGND()
 	ON_WM_SIZE()
@@ -197,10 +197,10 @@ BEGIN_MESSAGE_MAP(CConBox, CWnd)
 	ON_WM_MOUSELEAVE()
 	ON_WM_RBUTTONDOWN()
 	ON_WM_DROPFILES()
-	ON_MESSAGE(WM_IME_STARTCOMPOSITION, &CConBox::OnImeStart)
-	ON_MESSAGE(WM_IME_COMPOSITION, &CConBox::OnImeComp)
-	ON_MESSAGE(WM_IME_ENDCOMPOSITION, &CConBox::OnImeEnd)
-	ON_MESSAGE(WM_IME_NOTIFY, &CConBox::OnImeNotify)
+	ON_MESSAGE(WM_IME_STARTCOMPOSITION, &cConBox::OnImeStart)
+	ON_MESSAGE(WM_IME_COMPOSITION, &cConBox::OnImeComp)
+	ON_MESSAGE(WM_IME_ENDCOMPOSITION, &cConBox::OnImeEnd)
+	ON_MESSAGE(WM_IME_NOTIFY, &cConBox::OnImeNotify)
 END_MESSAGE_MAP()
 
 // Whether a char is double-width (Korean, CJK, etc.): 1 cell for English, 2 cells for this range.
@@ -456,7 +456,7 @@ static bool DrawBoxLine(CDC& dc, wchar_t ch, int px, int py, int cw, int chh, CO
 	}
 }
 
-CConBox::CConBox()
+cConBox::cConBox()
 {
 	default_fg = DEFAULT_FG;
 	default_bg = DEFAULT_BG;
@@ -561,7 +561,7 @@ CConBox::CConBox()
 	max_scrollback = 5000;
 	cfg_cols = 96;
 	cfg_rows = 32;
-	cfg_cmdline = "cmd.exe";
+	cfg_cmdline = "";
 	cfg_lines_per_paper = 50;
 
 	// Default 16-color ANSI palette (matches the hardcoded base16[] in Xterm256ToRgb).
@@ -606,7 +606,7 @@ CConBox::CConBox()
 	print_ws.reserve(8192);
 }
 
-CConBox::~CConBox()
+cConBox::~cConBox()
 {
 	// Tear down child/PTY/polling if still up (OnDestroy usually handles it first; this is a safety net).
 	stop();
@@ -784,13 +784,13 @@ static void CreateDefaultIni(const wchar_t* path)
 		"scrollback_cap = 5000           ; \xEC\x8A\xA4\xED\x81\xAC\xEB\xA1\xA4\xEB\xB0\xB1 \xEC\xB5\x9C\xEB\x8C\x80 \xEC\xA4\x84 \xEC\x88\x98\n"
 		"\n"
 		"[child]\n"
-		"cmdline = cmd.exe               ; \xEC\x8B\xA4\xED\x96\x89\xED\x95\xA0 \xEC\x9E\x90\xEC\x8B\x9D \xED\x94\x84\xEB\xA1\x9C\xEC\x84\xB8\xEC\x8A\xA4 \xEB\xAA\x85\xEB\xA0\xB9\xEC\xA4\x84\n",
+		"cmdline =                       ; \xEC\x8B\xA4\xED\x96\x89\xED\x95\xA0 \xEC\x9E\x90\xEC\x8B\x9D \xED\x94\x84\xEB\xA1\x9C\xEC\x84\xB8\xEC\x8A\xA4 \xEB\xAA\x85\xEB\xA0\xB9\xEC\xA4\x84 (\xEB\xB9\x84\xEC\x9B\x8C\xEB\x91\x90\xEB\xA9\xB4 \xEC\x9E\x90\xEB\x8F\x99 \xEC\x8B\xA4\xED\x96\x89 \xEC\x95\x88\xED\x95\xA8)\n",
 		f);
 	fclose(f);
 }
 
 // Apply INI-format settings from a string. contents: UTF-8 with \n line endings.
-void CConBox::setup(const char* contents)
+void cConBox::setup(const char* contents)
 {
 	if (!contents) return;
 
@@ -867,22 +867,37 @@ void CConBox::setup(const char* contents)
 }
 
 // Load settings from an INI file.  Sections are ignored; keys are matched by name only.
-// Relative paths are resolved against the EXE directory.  If the file does not exist it is
-// created with compiled-in defaults and this call returns (settings stay at their defaults).
-void CConBox::setup_from_ini(const char* path)
+// Relative paths are resolved against the EXE directory.
+// - File not found: auto-created with compiled-in defaults at the resolved path; a status message is
+//   stored in ini_msg and printed by open() once the window exists. Settings stay at constructor defaults.
+// - File found but cannot be opened: same deferred print() path, no settings changed.
+void cConBox::setup_from_ini(const char* path)
 {
-	const char* src = (path && *path) ? path : "ConBox.ini";
+	bool explicit_path = (path && *path);
+	const char* src = explicit_path ? path : "ConBox.ini";
 	std::wstring wide_path = ResolveIniPath(src);
+
+	// Helper: wstring -> UTF-8 string (for the deferred print() message).
+	auto w2u = [](const std::wstring& ws) -> std::string {
+		int n = ::WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), -1, nullptr, 0, nullptr, nullptr);
+		std::string s(n > 0 ? n - 1 : 0, '\0');
+		if (n > 0) ::WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), -1, &s[0], n, nullptr, nullptr);
+		return s;
+	};
 
 	if (::GetFileAttributesW(wide_path.c_str()) == INVALID_FILE_ATTRIBUTES) {
 		CreateDefaultIni(wide_path.c_str());
-		return;   // defaults already set in the constructor
+		ini_msg = "ConBox: INI file not found. Created with defaults:\r\n" + w2u(wide_path) + "\r\n";
+		return;
 	}
 
 	// Read entire file into a string and pass to setup().
 	FILE* f = nullptr;
 	_wfopen_s(&f, wide_path.c_str(), L"r");
-	if (!f) return;
+	if (!f) {
+		ini_msg = "ConBox: Cannot open INI file:\r\n" + w2u(wide_path) + "\r\n";
+		return;
+	}
 
 	std::string content;
 	char buf[4096];
@@ -895,7 +910,7 @@ void CConBox::setup_from_ini(const char* path)
 	setup(content.c_str());
 }
 
-void CConBox::open(CWnd* parent, int x0, int y0, int x1, int y1)
+void cConBox::open(CWnd* parent, int left, int top)
 {
 	// Register the "ConBox" window class on first call; subsequent calls (multiple instances) skip.
 	// Fixed name allows FindWindowEx(parent, NULL, L"ConBox", NULL) from host/test scripts.
@@ -913,7 +928,17 @@ void CConBox::open(CWnd* parent, int x0, int y0, int x1, int y1)
 		::RegisterClassExW(&wc);
 	}
 
-	CRect rc(x0, y0, x1, y1);
+	// Compute cell metrics before creating the window so the pixel size can be derived from the
+	// configured grid. calc_cell_size() falls back to GetDC(NULL) when the window does not exist yet,
+	// so this is safe to call here. (Font defaults fill in if the host did not call set_efont/set_kfont.)
+	apply_default_fonts();
+	calc_cell_size();
+
+	// Window size = configured grid (cfg_rows x cfg_cols cells) plus the margins.
+	int pw = cfg_cols * cell_w + margin_left + margin_right;
+	int ph = cfg_rows * cell_h + margin_top  + margin_bottom;
+	CRect rc(left, top, left + pw, top + ph);
+
 	// No WS_VSCROLL: a native vertical scrollbar would shrink the client area the first time scrollback
 	// appears, reflowing the grid and resizing the child PTY (a visible flash). Instead the overlay
 	// scrollbar (draw_overlay_scrollbar) is painted over the right edge and never reserves client space.
@@ -921,9 +946,6 @@ void CConBox::open(CWnd* parent, int x0, int y0, int x1, int y1)
 		WS_CHILD | WS_VISIBLE,
 		rc, parent, 0);
 
-	// Fonts are fixed now (defaults if the host set none), so compute cell size and grid.
-	apply_default_fonts();
-	calc_cell_size();
 	update_metrics();
 	update_scrollbar();
 
@@ -937,9 +959,19 @@ void CConBox::open(CWnd* parent, int x0, int y0, int x1, int y1)
 		SetTimer(CURSOR_TIMER, cursor_blink_ms, NULL);
 	blink_on = true;
 	SetTimer(BLINK_TIMER, 500, NULL);   // SGR blink: 500ms toggle (always running)
+
+	// Print any deferred INI status message (stored by setup_from_ini before the window existed).
+	if (!ini_msg.empty()) {
+		print(ini_msg.c_str());
+		ini_msg.clear();
+	}
+
+	// Auto-start child if a cmdline was configured.
+	if (!cfg_cmdline.empty())
+		start(cfg_cmdline.c_str());
 }
 
-void CConBox::make_font(CFont& font, LOGFONTW& lf_out, int& width_pct, const char* name, float size, const char* opts)
+void cConBox::make_font(CFont& font, LOGFONTW& lf_out, int& width_pct, const char* name, float size, const char* opts)
 {
 	HDC hdc = ::GetDC(NULL);
 	int dpi = ::GetDeviceCaps(hdc, LOGPIXELSY);
@@ -975,7 +1007,7 @@ static void MakeDoubleFont(CFont& dst, CFont& src)
 	dst.Attach(::CreateFontIndirectW(&lf));
 }
 
-void CConBox::apply_default_fonts()
+void cConBox::apply_default_fonts()
 {
 	// Defaults: English Cascadia Mono 12pt normal, Korean Malgun Gothic normal (wt.exe Claude profile).
 	// Korean size 0 = match-English-height mode (kfont_match_efont=true in the ctor), consistent with
@@ -996,7 +1028,7 @@ void CConBox::apply_default_fonts()
 }
 
 // (design: [FONT])
-void CConBox::calc_cell_size()
+void cConBox::calc_cell_size()
 {
 	BOOL has_wnd = ::IsWindow(m_hWnd);
 	HWND meas_wnd = has_wnd ? m_hWnd : NULL;
@@ -1107,7 +1139,7 @@ void CConBox::calc_cell_size()
 	MakeDoubleFont(kfont_double, kfont);
 }
 
-void CConBox::set_efont(const char* name, float size, const char* opts)
+void cConBox::set_efont(const char* name, float size, const char* opts)
 {
 	make_font(efont, efont_lf, efont_width_pct, name, size, opts);
 	MakeFontVariant(efont_bold,        efont_lf, true,  false);
@@ -1122,7 +1154,7 @@ void CConBox::set_efont(const char* name, float size, const char* opts)
 	}
 }
 
-void CConBox::set_kfont(const char* name, float size, const char* opts)
+void cConBox::set_kfont(const char* name, float size, const char* opts)
 {
 	make_font(kfont, kfont_lf, kfont_width_pct, name, size, opts);
 	MakeFontVariant(kfont_bold,        kfont_lf, true,  false);
@@ -1147,7 +1179,7 @@ void CConBox::set_kfont(const char* name, float size, const char* opts)
 	}
 }
 
-void CConBox::adjust(int left, int top, int right, int bottom)
+void cConBox::adjust(int left, int top, int right, int bottom)
 {
 	// Stored per-side pixel padding persists until the next font change.
 	adjust_left = left;
@@ -1168,7 +1200,7 @@ void CConBox::adjust(int left, int top, int right, int bottom)
 	}
 }
 
-void CConBox::set_builtin_glyphs(int level)
+void cConBox::set_builtin_glyphs(int level)
 {
 	if (level < 0) level = 0;
 	if (level > 2) level = 2;
@@ -1179,19 +1211,19 @@ void CConBox::set_builtin_glyphs(int level)
 		Invalidate();
 }
 
-void CConBox::set_fg_color(COLORREF fg)
+void cConBox::set_fg_color(COLORREF fg)
 {
 	default_fg = fg;
 	cur_fg = fg;
 }
 
-void CConBox::set_bg_color(COLORREF bg)
+void cConBox::set_bg_color(COLORREF bg)
 {
 	default_bg = bg;
 	cur_bg = bg;
 }
 
-void CConBox::set_cursor_blend(int bg_weight, int fg_weight)
+void cConBox::set_cursor_blend(int bg_weight, int fg_weight)
 {
 	// Clamp negatives to 0; ignore a zero sum (no meaning).
 	if (bg_weight < 0) bg_weight = 0;
@@ -1209,7 +1241,7 @@ void CConBox::set_cursor_blend(int bg_weight, int fg_weight)
 	}
 }
 
-void CConBox::set_cursor_blink(int interval_ms)
+void cConBox::set_cursor_blink(int interval_ms)
 {
 	// interval_ms <= 0: follow the system caret rate (GetCaretBlinkTime). If the system has blink
 	// disabled (INFINITE), cursor_blink_ms stays 0 = always on (no timer). This matches the INI
@@ -1230,7 +1262,7 @@ void CConBox::set_cursor_blink(int interval_ms)
 	}
 }
 
-void CConBox::set_cursor(int type)
+void cConBox::set_cursor(int type)
 {
 	// type 0 = default. Default = blinking underline (3), matching the classic conhost.exe cursor.
 	if (type == 0)
@@ -1248,7 +1280,7 @@ void CConBox::set_cursor(int type)
 	}
 }
 
-void CConBox::bump_cursor()
+void cConBox::bump_cursor()
 {
 	// Make the cursor visible now and restart the timer so it stays solid for a beat after input/move
 	// (so no off-frame lands right then). Fixed (even) types never blink, so leave their timer alone.
@@ -1259,7 +1291,7 @@ void CConBox::bump_cursor()
 	}
 }
 
-void CConBox::OnTimer(UINT_PTR id)
+void cConBox::OnTimer(UINT_PTR id)
 {
 	if (id == CURSOR_TIMER) {
 		if ((cursor_type & 1) == 0)   // fixed (even) type: ignore the blink tick
@@ -1317,7 +1349,7 @@ void CConBox::OnTimer(UINT_PTR id)
 	CWnd::OnTimer(id);
 }
 
-void CConBox::set_margin(int top, int left, int bottom, int right)
+void cConBox::set_margin(int top, int left, int bottom, int right)
 {
 	// CSS-shorthand omission: resolve left before right (right can follow left).
 	if (left < 0) left = top;
@@ -1342,19 +1374,11 @@ void CConBox::set_margin(int top, int left, int bottom, int right)
 	}
 }
 
-void CConBox::client_size_for_grid(int cols, int rows, int& w, int& h) const
-{
-	// Client area = glyph area (cols x cell_w, rows x cell_h) plus the margins. cell_w/cell_h are
-	// fixed in open() from font/DPI.
-	if (cols < 0) cols = 0;
-	if (rows < 0) rows = 0;
-	w = cols * cell_w + margin_left + margin_right;
-	h = rows * cell_h + margin_top + margin_bottom;
-}
+
 
 // Cursor block color: mix default bg and fg per channel at cursor_bg_weight:cursor_fg_weight. The
 // default 6:4 is near-bg so a glyph drawn over the block in fg stays legible. Independent of SGR colors.
-COLORREF CConBox::blend_cursor_color() const
+COLORREF cConBox::blend_cursor_color() const
 {
 	int bw = cursor_bg_weight;
 	int fw = cursor_fg_weight;
@@ -1370,7 +1394,7 @@ COLORREF CConBox::blend_cursor_color() const
 
 // Map a screen COLORREF to its paper (export) equivalent.
 // Matches default_fg/bg and ansi_colors[0..15]; truecolor / 256-color values pass through.
-COLORREF CConBox::remap_paper_color(COLORREF c) const
+COLORREF cConBox::remap_paper_color(COLORREF c) const
 {
 	if (c == default_fg) return paper_default_fg;
 	if (c == default_bg) return paper_default_bg;
@@ -1379,7 +1403,7 @@ COLORREF CConBox::remap_paper_color(COLORREF c) const
 	return c;
 }
 
-bool CConBox::cursor_screen_pos(int& row_out, int& vx_out) const
+bool cConBox::cursor_screen_pos(int& row_out, int& vx_out) const
 {
 	if (screen.empty())
 		return false;
@@ -1392,7 +1416,7 @@ bool CConBox::cursor_screen_pos(int& row_out, int& vx_out) const
 	return true;
 }
 
-bool CConBox::get_cursor_rect(CRect& rc) const
+bool cConBox::get_cursor_rect(CRect& rc) const
 {
 	int row, vx;
 	if (!cursor_screen_pos(row, vx))
@@ -1412,7 +1436,7 @@ bool CConBox::get_cursor_rect(CRect& rc) const
 
 // Whether the IME is in Korean (jamo) mode: ImmGetConversionStatus's IME_CMODE_NATIVE flag. Correct
 // right after a Korean/English toggle (before composition starts).
-bool CConBox::is_hangul_mode() const
+bool cConBox::is_hangul_mode() const
 {
 	HIMC himc = ImmGetContext(m_hWnd);
 	if (!himc)
@@ -1427,7 +1451,7 @@ bool CConBox::is_hangul_mode() const
 	return native;
 }
 
-void CConBox::update_metrics()
+void cConBox::update_metrics()
 {
 	int old_cols = cols, old_rows = rows;
 
@@ -1445,10 +1469,10 @@ void CConBox::update_metrics()
 
 	// If the grid actually changed and a resize sink is set, notify it (to sync the child PTY size).
 	if ((cols != old_cols || rows != old_rows) && resize_sink != nullptr)
-		resize_sink(cols, rows, resize_sink_user);
+		resize_sink(rows, cols, resize_sink_user);
 }
 
-Row CConBox::blank_row() const
+Row cConBox::blank_row() const
 {
 	// Filled with the current SGR background so erase/scroll follow the background color.
 	CharInfo c;
@@ -1459,7 +1483,7 @@ Row CConBox::blank_row() const
 	return Row(cols < 1 ? 1 : cols, c);
 }
 
-void CConBox::reset_screen()
+void cConBox::reset_screen()
 {
 	// Fit screen to the current rows x cols. Existing lines are kept but padded/truncated to cols and
 	// the row count adjusted to rows (cell-level pad/truncate only; no fine reflow).
@@ -1493,7 +1517,7 @@ void CConBox::reset_screen()
 }
 
 // (design: [COORD]/[DM])
-const Row& CConBox::line_at(int idx) const
+const Row& cConBox::line_at(int idx) const
 {
 	// Unified index: scrollback first, then the current screen.
 	int sb = (int)scrollback.size();
@@ -1502,7 +1526,7 @@ const Row& CConBox::line_at(int idx) const
 	return screen[idx - sb];
 }
 
-void CConBox::clamp_cursor()
+void cConBox::clamp_cursor()
 {
 	if (cur_row < 0) cur_row = 0;
 	if (cur_row > rows - 1) cur_row = rows - 1;
@@ -1510,7 +1534,7 @@ void CConBox::clamp_cursor()
 	if (cur_col > cols) cur_col = cols;   // cols = "just past line end" (wraps on the next glyph)
 }
 
-void CConBox::erase_cells(int row, int c0, int c1)
+void cConBox::erase_cells(int row, int c0, int c1)
 {
 	if (row < 0 || row >= (int)screen.size())
 		return;
@@ -1525,7 +1549,7 @@ void CConBox::erase_cells(int row, int c0, int c1)
 	}
 }
 
-void CConBox::scroll_lines_up(int top, int bot, int n)
+void cConBox::scroll_lines_up(int top, int bot, int n)
 {
 	// Rotate [top, bot] up by n (drop n top lines, add n blanks at the bottom). Pure line move, does
 	// not touch scrollback (the caller pushes first if preservation is needed).
@@ -1542,7 +1566,7 @@ void CConBox::scroll_lines_up(int top, int bot, int n)
 	}
 }
 
-void CConBox::scroll_lines_down(int top, int bot, int n)
+void cConBox::scroll_lines_down(int top, int bot, int n)
 {
 	// Rotate [top, bot] down by n (drop n bottom lines, add n blanks at the top).
 	if (top < 0) top = 0;
@@ -1558,7 +1582,7 @@ void CConBox::scroll_lines_down(int top, int bot, int n)
 	}
 }
 
-void CConBox::scroll_up_region(int n)
+void cConBox::scroll_up_region(int n)
 {
 	// Scroll [scroll_top, scroll_bot] up by n. Only on the main screen with the region top at the
 	// screen top (scroll_top==0) are the displaced lines preserved into scrollback. On the alt screen
@@ -1578,13 +1602,13 @@ void CConBox::scroll_up_region(int n)
 	scroll_lines_up(scroll_top, scroll_bot, n);
 }
 
-void CConBox::scroll_down_region(int n)
+void cConBox::scroll_down_region(int n)
 {
 	// RI/SD. Does not touch scrollback.
 	scroll_lines_down(scroll_top, scroll_bot, n);
 }
 
-void CConBox::line_feed()
+void cConBox::line_feed()
 {
 	// At the region bottom, scroll the region up (cursor stays on that line); otherwise advance one
 	// line without leaving the screen.
@@ -1595,7 +1619,7 @@ void CConBox::line_feed()
 	}
 }
 
-void CConBox::insert_lines(int n)
+void cConBox::insert_lines(int n)
 {
 	// IL: only when the cursor is inside the scroll region. Insert n blank lines at the cursor line,
 	// pushing lines below toward scroll_bot. Cursor moves to column 1.
@@ -1606,7 +1630,7 @@ void CConBox::insert_lines(int n)
 	cur_col = 0;
 }
 
-void CConBox::delete_lines(int n)
+void cConBox::delete_lines(int n)
 {
 	// DL: only inside the scroll region. Delete n lines from the cursor line, pulling lines up and
 	// filling blanks at the region bottom. Cursor moves to column 1.
@@ -1617,7 +1641,7 @@ void CConBox::delete_lines(int n)
 	cur_col = 0;
 }
 
-void CConBox::insert_chars(int n)
+void cConBox::insert_chars(int n)
 {
 	// ICH: insert n blanks at the cursor within the line; right cells shift and overflow past cols is
 	// dropped. Cursor stays put.
@@ -1637,7 +1661,7 @@ void CConBox::insert_chars(int n)
 	line.resize(cols, blank);   // drop overflow to keep line width = cols
 }
 
-void CConBox::delete_chars(int n)
+void cConBox::delete_chars(int n)
 {
 	// DCH: delete n cells at the cursor within the line, pull right cells in, fill blanks at the end.
 	if (cur_row < 0 || cur_row >= (int)screen.size())
@@ -1656,7 +1680,7 @@ void CConBox::delete_chars(int n)
 	line.resize(cols, blank);   // refill the end to keep line width = cols
 }
 
-void CConBox::enter_alt_screen()
+void cConBox::enter_alt_screen()
 {
 	// Back up the main screen and cursor, switch to a blank alt screen. Scrollback remains but is
 	// frozen (hidden) while alt_active.
@@ -1673,7 +1697,7 @@ void CConBox::enter_alt_screen()
 	alt_active = true;
 }
 
-void CConBox::leave_alt_screen()
+void cConBox::leave_alt_screen()
 {
 	// Restore the backed-up main screen and cursor.
 	if (!alt_active)
@@ -1691,7 +1715,7 @@ void CConBox::leave_alt_screen()
 }
 
 // (design: [VT])
-void CConBox::put_char(wchar_t wc)
+void cConBox::put_char(wchar_t wc)
 {
 	// Write one glyph at the cursor, autowrapping first if it would exceed cols. A wide glyph goes in
 	// the lead cell and sets the next cell to trail (ch=0).
@@ -1731,7 +1755,7 @@ void CConBox::put_char(wchar_t wc)
 	cur_col += advance;
 }
 
-void CConBox::print(const char* text)
+void cConBox::print(const char* text)
 {
 	if (text == nullptr)
 		return;
@@ -1817,7 +1841,7 @@ static COLORREF Xterm256ToRgb(int n, const COLORREF* pal)
 }
 
 // (design: [VT])
-void CConBox::vt_feed(wchar_t wc)
+void cConBox::vt_feed(wchar_t wc)
 {
 	// Parser state machine. State (vt_state etc.) is a member, so a sequence survives print() chunks.
 	switch (vt_state) {
@@ -1927,7 +1951,7 @@ void CConBox::vt_feed(wchar_t wc)
 }
 
 // (design: [VT])
-void CConBox::dispatch_csi(wchar_t fin)
+void cConBox::dispatch_csi(wchar_t fin)
 {
 	// Sequences prefixed with '<' '=' '>' (2nd DA, kitty keyboard protocol, XTMODKEYS...) are
 	// unsupported. Their final byte (u/m/q...) must not be misparsed as a standard command (e.g.
@@ -2122,7 +2146,7 @@ void CConBox::dispatch_csi(wchar_t fin)
 	}
 }
 
-void CConBox::update_scrollbar()
+void cConBox::update_scrollbar()
 {
 	// No native scrollbar (the overlay bar is what the user sees). This now only clamps/pins view_top;
 	// the overlay's visibility is driven by sbar_show()/SBAR_TIMER, its geometry by sbar_geometry().
@@ -2148,13 +2172,13 @@ void CConBox::update_scrollbar()
 	if (view_top > maxtop) view_top = maxtop;
 }
 
-BOOL CConBox::OnEraseBkgnd(CDC* dc)
+BOOL cConBox::OnEraseBkgnd(CDC* dc)
 {
 	// Background is erased in OnPaint to avoid flicker; return TRUE to block the default erase.
 	return TRUE;
 }
 
-void CConBox::OnSize(UINT type, int cx, int cy)
+void cConBox::OnSize(UINT type, int cx, int cy)
 {
 	CWnd::OnSize(type, cx, cy);
 
@@ -2168,7 +2192,7 @@ void CConBox::OnSize(UINT type, int cx, int cy)
 	Invalidate();
 }
 
-UINT CConBox::OnGetDlgCode()
+UINT cConBox::OnGetDlgCode()
 {
 	// Take arrows/Tab/Enter/chars directly so a parent dialog does not intercept them.
 	return DLGC_WANTALLKEYS | DLGC_WANTCHARS | DLGC_WANTARROWS | DLGC_WANTTAB;
@@ -2178,7 +2202,7 @@ UINT CConBox::OnGetDlgCode()
 
 // Compute the gutter (track) and thumb rects for the current view. Returns false when there is nothing
 // to scroll (no scrollback, or the alt screen owns the surface), in which case the bar is not drawn.
-bool CConBox::sbar_geometry(CRect& track, CRect& thumb) const
+bool cConBox::sbar_geometry(CRect& track, CRect& thumb) const
 {
 	if (alt_active)
 		return false;
@@ -2214,7 +2238,7 @@ bool CConBox::sbar_geometry(CRect& track, CRect& thumb) const
 }
 
 // Make the overlay fully opaque and (re)start the fade timer. Called on user scroll and gutter hover.
-void CConBox::sbar_show()
+void cConBox::sbar_show()
 {
 	if (!::IsWindow(m_hWnd))
 		return;
@@ -2352,7 +2376,7 @@ static void DrawTriangle(CDC& dc, const CRect& rc, COLORREF color, int baseAlpha
 // Composite the overlay scrollbar into the back buffer (called last in OnPaint, on top of glyphs/cursor).
 // A translucent rounded thumb (brighter when hovering/dragging); a faint groove behind it while active.
 // Arrow buttons at gutter top/bottom scroll by 1 line on click. All fade via sbar_alpha.
-void CConBox::draw_overlay_scrollbar(CDC& dc)
+void cConBox::draw_overlay_scrollbar(CDC& dc)
 {
 	if (sbar_alpha <= 0)
 		return;
@@ -2402,7 +2426,7 @@ void CConBox::draw_overlay_scrollbar(CDC& dc)
 	DrawTriangle(dc, btn_dn, thumb_color, opcap, (BYTE)sbar_alpha, false);
 }
 
-BOOL CConBox::OnMouseWheel(UINT flags, short zDelta, CPoint pt)
+BOOL cConBox::OnMouseWheel(UINT flags, short zDelta, CPoint pt)
 {
 	// Scrollback view is frozen on the alt screen (the child owns the screen); ignore the wheel.
 	if (alt_active)
@@ -2427,7 +2451,7 @@ BOOL CConBox::OnMouseWheel(UINT flags, short zDelta, CPoint pt)
 // ===== Mouse drag selection / clipboard =====
 // hit_test: client pixel coords -> unified (scrollback+screen) row index + cell column. Coords outside
 // the margins clamp to the edge cell.
-void CConBox::hit_test(CPoint pt, int& abs_row, int& col) const
+void cConBox::hit_test(CPoint pt, int& abs_row, int& col) const
 {
 	int total = (int)scrollback.size() + rows;
 
@@ -2454,7 +2478,7 @@ void CConBox::hit_test(CPoint pt, int& abs_row, int& col) const
 
 // copy_selection: extract the selected text as Unicode to the clipboard. Sort the row range, collect
 // each line's selected cells, trim trailing spaces, join lines with CR+LF. Trail cells (ch=0) skipped.
-void CConBox::copy_selection()
+void cConBox::copy_selection()
 {
 	if (!sel_active) return;
 
@@ -2534,7 +2558,7 @@ void CConBox::copy_selection()
 	::CloseClipboard();
 }
 
-void CConBox::clear_selection()
+void cConBox::clear_selection()
 {
 	if (sel_active) {
 		sel_active = false;
@@ -2542,7 +2566,7 @@ void CConBox::clear_selection()
 	}
 }
 
-void CConBox::OnLButtonDown(UINT flags, CPoint pt)
+void cConBox::OnLButtonDown(UINT flags, CPoint pt)
 {
 	// Finalize any IME composition first (a click is also a composition-ending trigger).
 	finalize_composition();
@@ -2602,7 +2626,7 @@ void CConBox::OnLButtonDown(UINT flags, CPoint pt)
 	Invalidate();
 }
 
-void CConBox::OnLButtonDblClk(UINT flags, CPoint pt)
+void cConBox::OnLButtonDblClk(UINT flags, CPoint pt)
 {
 	// Double-click: select the "word" under the cursor (a maximal run of non-space cells).
 	// Whitespace class (ch==' ' or ch==0) expands over adjacent spaces; word class over non-spaces.
@@ -2651,7 +2675,7 @@ void CConBox::OnLButtonDblClk(UINT flags, CPoint pt)
 	Invalidate();
 }
 
-void CConBox::OnLButtonUp(UINT flags, CPoint pt)
+void cConBox::OnLButtonUp(UINT flags, CPoint pt)
 {
 	// End a thumb drag (if any) before the selection path.
 	if (sbar_dragging) {
@@ -2680,7 +2704,7 @@ void CConBox::OnLButtonUp(UINT flags, CPoint pt)
 	Invalidate();
 }
 
-void CConBox::OnMouseMove(UINT flags, CPoint pt)
+void cConBox::OnMouseMove(UINT flags, CPoint pt)
 {
 	// Dragging the overlay thumb: map the cursor y to view_top (inverse of sbar_geometry's thumb_y).
 	if (sbar_dragging) {
@@ -2733,7 +2757,7 @@ void CConBox::OnMouseMove(UINT flags, CPoint pt)
 	Invalidate();
 }
 
-void CConBox::OnMouseLeave()
+void cConBox::OnMouseLeave()
 {
 	// Left the window: drop gutter hover so the overlay can fade. The fade timer is already running
 	// (started by sbar_show on hover); just refresh the hold window so it lingers briefly, then fades.
@@ -2752,7 +2776,7 @@ void CConBox::OnMouseLeave()
 	}
 }
 
-void CConBox::OnRButtonDown(UINT flags, CPoint pt)
+void cConBox::OnRButtonDown(UINT flags, CPoint pt)
 {
 	finalize_composition();
 	ime_committed = false;   // a click is not an arrow; don't let it enable the arrow correction
@@ -2761,7 +2785,7 @@ void CConBox::OnRButtonDown(UINT flags, CPoint pt)
 	paste_clipboard();
 }
 
-void CConBox::OnDropFiles(HDROP hdrop)
+void cConBox::OnDropFiles(HDROP hdrop)
 {
 	// Type dropped file paths to the child stdin (wt.exe behavior).
 	// Paths with spaces are wrapped in double quotes; multiple files are space-separated.
@@ -2790,7 +2814,7 @@ void CConBox::OnDropFiles(HDROP hdrop)
 	DragFinish(hdrop);
 }
 
-LRESULT CConBox::OnImeStart(WPARAM w, LPARAM l)
+LRESULT cConBox::OnImeStart(WPARAM w, LPARAM l)
 {
 	// Move the composition/candidate windows to the cursor and set the composing font to Korean. We
 	// draw the composing glyph ourselves, so no default composition window (return below).
@@ -2825,7 +2849,7 @@ LRESULT CConBox::OnImeStart(WPARAM w, LPARAM l)
 }
 
 // (design: [IME])
-LRESULT CConBox::OnImeComp(WPARAM w, LPARAM l)
+LRESULT cConBox::OnImeComp(WPARAM w, LPARAM l)
 {
 	// Committed text (GCS_RESULTSTR) goes to the child as UTF-8; the uncommitted part (GCS_COMPSTR) is
 	// stored in comp_str and drawn by ConBox in the cursor cell (OnPaint). System inline display is
@@ -2878,7 +2902,7 @@ LRESULT CConBox::OnImeComp(WPARAM w, LPARAM l)
 	return 0;
 }
 
-LRESULT CConBox::OnImeEnd(WPARAM w, LPARAM l)
+LRESULT cConBox::OnImeEnd(WPARAM w, LPARAM l)
 {
 	// Composition ended: clear our composing display (comp_str) and repaint. The committed part was
 	// already sent in OnImeComp (GCS_RESULTSTR) and is drawn by the child's echo.
@@ -2893,7 +2917,7 @@ LRESULT CConBox::OnImeEnd(WPARAM w, LPARAM l)
 	return Default();
 }
 
-LRESULT CConBox::OnImeNotify(WPARAM w, LPARAM l)
+LRESULT cConBox::OnImeNotify(WPARAM w, LPARAM l)
 {
 	// A conversion-mode change (e.g. the Korean/English key) notifies here. Repaint the cursor area to
 	// reflect the matching width (long/short) at once. Other notifications (candidate window etc.) go
@@ -2910,25 +2934,25 @@ LRESULT CConBox::OnImeNotify(WPARAM w, LPARAM l)
 	return res;
 }
 
-void CConBox::set_input_sink(void (*sink)(const char* bytes, int len, void* user), void* user)
+void cConBox::set_input_sink(void (*sink)(const char* bytes, int len, void* user), void* user)
 {
 	input_sink = sink;
 	input_sink_user = user;
 }
 
-void CConBox::set_resize_sink(void (*sink)(int cols, int rows, void* user), void* user)
+void cConBox::set_resize_sink(void (*sink)(int rows, int cols, void* user), void* user)
 {
 	resize_sink = sink;
 	resize_sink_user = user;
 }
 
-void CConBox::send_input_bytes(const char* bytes, int len)
+void cConBox::send_input_bytes(const char* bytes, int len)
 {
 	if (input_sink != nullptr && bytes != nullptr && len > 0)
 		input_sink(bytes, len, input_sink_user);
 }
 
-void CConBox::send_input_wide(const wchar_t* ws, int n)
+void cConBox::send_input_wide(const wchar_t* ws, int n)
 {
 	if (input_sink == nullptr || ws == nullptr || n <= 0)
 		return;
@@ -2943,7 +2967,7 @@ void CConBox::send_input_wide(const wchar_t* ws, int n)
 // Encode non-char keys (arrows/edit keys) as VT sequences to the child. Printable chars / Enter / Tab /
 // Backspace / Esc / Ctrl+letter go through the WM_CHAR path (OnChar), not here (avoids duplication).
 // Returns true if it sent something.
-bool CConBox::terminal_keydown(UINT vk, bool ctrl, bool shift)
+bool cConBox::terminal_keydown(UINT vk, bool ctrl, bool shift)
 {
 	// Ctrl+C: with a selection, copy + clear it; otherwise send interrupt (0x03).
 	if (ctrl && (vk == 'C')) {
@@ -3023,7 +3047,7 @@ bool CConBox::terminal_keydown(UINT vk, bool ctrl, bool shift)
 	return false;
 }
 
-void CConBox::paste_clipboard()
+void cConBox::paste_clipboard()
 {
 	// Send clipboard Unicode text to the child stdin. In bracketed paste mode wrap it in
 	// ESC[200~ / ESC[201~ so the child handles the paste as one chunk.
@@ -3046,7 +3070,7 @@ void CConBox::paste_clipboard()
 	::CloseClipboard();
 }
 
-bool CConBox::finalize_composition()
+bool cConBox::finalize_composition()
 {
 	// Force-commit an in-progress Korean composition. CPS_COMPLETE dispatches WM_IME_COMPOSITION
 	// (GCS_RESULTSTR) synchronously, so before this returns OnImeComp has already sent the completed
@@ -3071,7 +3095,7 @@ bool CConBox::finalize_composition()
 	return had;
 }
 
-void CConBox::OnChar(UINT ch, UINT rep, UINT flags)
+void cConBox::OnChar(UINT ch, UINT rep, UINT flags)
 {
 	// Terminal (raw) mode: no local edit/echo; send chars/control bytes to the child. (WM_CHAR is the
 	// post-layout/IME result, so it suits printable/control byte sending.)
@@ -3110,7 +3134,7 @@ void CConBox::OnChar(UINT ch, UINT rep, UINT flags)
 	// Read-only viewer (no input sink): no local edit/echo.
 }
 
-void CConBox::OnKeyDown(UINT vk, UINT rep, UINT flags)
+void cConBox::OnKeyDown(UINT vk, UINT rep, UINT flags)
 {
 	// Terminal (raw) mode: arrows/edit keys as VT sequences; printable / Enter / Backspace / Tab / Esc
 	// go through WM_CHAR (OnChar). No local line editing.
@@ -3190,7 +3214,7 @@ void CConBox::OnKeyDown(UINT vk, UINT rep, UINT flags)
 // Lazily prepare the double-buffer memory DC/bitmap. The DC is created once and reused; the bitmap is
 // rebuilt only when the client size changes (avoids a CreateCompatibleDC/Bitmap per frequent repaint
 // such as cursor blink).
-void CConBox::ensure_back_buffer(CDC* ref, int w, int h)
+void cConBox::ensure_back_buffer(CDC* ref, int w, int h)
 {
 	if (back_dc.GetSafeHdc() == nullptr)
 		back_dc.CreateCompatibleDC(ref);
@@ -3212,7 +3236,7 @@ void CConBox::ensure_back_buffer(CDC* ref, int w, int h)
 }
 
 // (design: [PAINT]/[IME])
-void CConBox::OnPaint()
+void cConBox::OnPaint()
 {
 	CPaintDC paintDC(this);
 
@@ -3535,7 +3559,7 @@ void CConBox::OnPaint()
 
 // (design: [PAINT]) -- same coordinate/cell logic as OnPaint but targets an EMF DC.
 // Returns true if at least one EMF file was successfully written.
-bool CConBox::save_emf(const char* dir)
+bool cConBox::save_emf(const char* dir)
 {
 	if (!dir || !*dir) return false;
 
@@ -3690,7 +3714,7 @@ bool CConBox::save_emf(const char* dir)
 // after every StartPage.  The cell rendering loop is a verbatim copy of save_emf's loop.
 // (design: [PAINT])
 
-bool CConBox::save_pdf(const char* path)
+bool cConBox::save_pdf(const char* path)
 {
 	if (!path || !*path) return false;
 
@@ -3900,7 +3924,7 @@ bool CConBox::save_pdf(const char* path)
 // CELL_DOUBLE extras: Korean (CELL_WIDE+CELL_DOUBLE) = 4-cell advance -> skip trail + 2 blanks.
 //                     English/etc (CELL_DOUBLE only)  = 2-cell advance -> skip 1 blank.
 
-std::vector<std::string> CConBox::get_text_lines() const
+std::vector<std::string> cConBox::get_text_lines() const
 {
 	int total = (int)scrollback.size() + rows;
 	std::vector<std::string> result;
@@ -3962,7 +3986,7 @@ std::vector<std::string> CConBox::get_text_lines() const
 // VT codes are preserved exactly as the child emitted them (no conversion, no CR/LF translation).
 // Calling with nullptr/empty closes any open log; calling with a path creates/replaces the file.
 // No window is needed -- safe to call before open() so the file is ready before the child starts.
-int CConBox::save_log(const char* file_name)
+int cConBox::save_log(const char* file_name)
 {
 	// Close any currently open log (idempotent; also the close path when file_name is null).
 	if (log_file != INVALID_HANDLE_VALUE) {
@@ -4064,21 +4088,26 @@ static bool CreatePtyPipes(int cols, int rows,
 	return true;
 }
 
+bool cConBox::start()
+{
+	return start(cfg_cmdline.c_str());
+}
+
 // (design: [PTY])
-bool CConBox::start(const char* cmdline)
+bool cConBox::start(const char* cmdline)
 {
 	// Restart if already running.
 	stop();
 
 	// Size the child console to the current grid (always matched).
-	int cols = grid_cols();
-	int rows = grid_rows();
-	if (cols < 1) cols = 1;
-	if (rows < 1) rows = 1;
+	int c = this->cols;
+	int r = this->rows;
+	if (c < 1) c = 1;
+	if (r < 1) r = 1;
 
 	// Pipes + pseudo console. The PTY-side ends are closed after spawn.
 	HANDLE pty_in_read = nullptr, pty_out_write = nullptr;
-	if (!CreatePtyPipes(cols, rows, h_pc, in_write, out_read, pty_in_read, pty_out_write)) {
+	if (!CreatePtyPipes(c, r, h_pc, in_write, out_read, pty_in_read, pty_out_write)) {
 		stop();
 		return false;
 	}
@@ -4147,8 +4176,8 @@ bool CConBox::start(const char* cmdline)
 
 	// Wire input (ConBox keys -> child stdin) and resize (grid -> ResizePseudoConsole) to itself, reusing
 	// the generic sink mechanism (same path as a pure-view host's set_input_sink).
-	set_input_sink(&CConBox::child_input_thunk, this);
-	set_resize_sink(&CConBox::child_resize_thunk, this);
+	set_input_sink(&cConBox::child_input_thunk, this);
+	set_resize_sink(&cConBox::child_resize_thunk, this);
 
 	// Output polling timer on ConBox's own window. start() must be called after open() (the timer needs
 	// the window).
@@ -4158,7 +4187,7 @@ bool CConBox::start(const char* cmdline)
 	return true;
 }
 
-void CConBox::write(const char* data, int len)
+void cConBox::write(const char* data, int len)
 {
 	if (in_write == nullptr || data == nullptr || len <= 0)
 		return;
@@ -4166,49 +4195,49 @@ void CConBox::write(const char* data, int len)
 	::WriteFile(in_write, data, (DWORD)len, &written, NULL);
 }
 
-void CConBox::child_input_thunk(const char* bytes, int len, void* user)
+void cConBox::child_input_thunk(const char* bytes, int len, void* user)
 {
-	CConBox* self = (CConBox*)user;
+	cConBox* self = (cConBox*)user;
 	if (self != nullptr)
 		self->write(bytes, len);
 }
 
-void CConBox::resize(int cols, int rows)
+void cConBox::resize(int rows, int cols)
 {
 	// Only resize while the pseudo console is alive. The child detects the size change and repaints.
 	if (h_pc == nullptr || !child_running)
 		return;
-	if (cols < 1) cols = 1;
 	if (rows < 1) rows = 1;
+	if (cols < 1) cols = 1;
 	COORD size;
 	size.X = (SHORT)cols;
 	size.Y = (SHORT)rows;
 	::ResizePseudoConsole(h_pc, size);
 }
 
-void CConBox::child_resize_thunk(int cols, int rows, void* user)
+void cConBox::child_resize_thunk(int rows, int cols, void* user)
 {
-	CConBox* self = (CConBox*)user;
+	cConBox* self = (cConBox*)user;
 	if (self != nullptr)
-		self->resize(cols, rows);
+		self->resize(rows, cols);
 }
 
-void CConBox::set_exit_callback(void (*cb)(void* user), void* user)
+void cConBox::set_exit_callback(void (*cb)(void* user), void* user)
 {
 	exit_cb = cb;
 	exit_cb_user = user;
 }
 
-void CConBox::stop()
+void cConBox::stop()
 {
 	// Kill the polling timer first (so pump is no longer called). KillTimer only while the window lives.
 	if (GetSafeHwnd() != nullptr)
 		KillTimer(PUMP_TIMER);
 
 	// Release the input/resize sinks start() wired to itself (with no child, input is dropped).
-	if (input_sink == &CConBox::child_input_thunk)
+	if (input_sink == &cConBox::child_input_thunk)
 		set_input_sink(nullptr, nullptr);
-	if (resize_sink == &CConBox::child_resize_thunk)
+	if (resize_sink == &cConBox::child_resize_thunk)
 		set_resize_sink(nullptr, nullptr);
 
 	// Closing the pseudo console ends the child console session.
@@ -4236,12 +4265,12 @@ void CConBox::stop()
 	child_running = false;
 }
 
-bool CConBox::is_running() const
+bool cConBox::is_running() const
 {
 	return child_running;
 }
 
-void CConBox::pump()
+void cConBox::pump()
 {
 	if (!child_running || out_read == nullptr)
 		return;
@@ -4286,7 +4315,7 @@ void CConBox::pump()
 	}
 }
 
-void CConBox::handle_child_exit()
+void cConBox::handle_child_exit()
 {
 	// The child exited naturally. Grab the callback info first, then clean up, then call the callback
 	// with cleanup done (is_running()==false) so it may immediately start() again without conflict.
@@ -4297,7 +4326,7 @@ void CConBox::handle_child_exit()
 		cb(user);
 }
 
-void CConBox::OnDestroy()
+void cConBox::OnDestroy()
 {
 	// Clean up child/polling timer before the window is destroyed (so polling never touches a dying window).
 	stop();

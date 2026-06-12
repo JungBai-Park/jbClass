@@ -14,17 +14,17 @@
 #endif
 
 
-// CConBoxDlg 대화 상자
+// cConBoxDlg 대화 상자
 
 
 
-CConBoxDlg::CConBoxDlg(CWnd* pParent /*=nullptr*/)
+cConBoxDlg::cConBoxDlg(CWnd* pParent /*=nullptr*/)
     : CDialog(IDD_CONBOX_DIALOG, pParent)
 {
     m_hIcon = AfxGetApp()->LoadIcon(IDR_MAINFRAME);
 }
 
-void CConBoxDlg::DoDataExchange(CDataExchange* pDX)
+void cConBoxDlg::DoDataExchange(CDataExchange* pDX)
 {
     CDialog::DoDataExchange(pDX);
 }
@@ -36,7 +36,7 @@ static const UINT ID_SAVE_TEXT = 0xE020;
 static const UINT ID_SAVE_PDF  = 0xE030;
 static const UINT ID_LOG       = 0xE040;
 
-BEGIN_MESSAGE_MAP(CConBoxDlg, CDialog)
+BEGIN_MESSAGE_MAP(cConBoxDlg, CDialog)
     ON_WM_PAINT()
     ON_WM_QUERYDRAGICON()
     ON_WM_SIZE()
@@ -45,9 +45,9 @@ BEGIN_MESSAGE_MAP(CConBoxDlg, CDialog)
 END_MESSAGE_MAP()
 
 
-// CConBoxDlg 메시지 처리기
+// cConBoxDlg 메시지 처리기
 
-BOOL CConBoxDlg::OnInitDialog()
+BOOL cConBoxDlg::OnInitDialog()
 {
     CDialog::OnInitDialog();
 
@@ -81,25 +81,25 @@ BOOL CConBoxDlg::OnInitDialog()
 
     // setup_from_ini() 로 폰트, 색상, 커서, 마진, 그리드 크기, 자식 명령줄을 한 번에 불러온다.
     // 파일이 없으면 기본값으로 자동 생성된다.
+    SetCurrentDirectory(_T("D:\\Work\\Study\\ConBox"));
     con_box.setup_from_ini("..\\..\\Documents\\ConBox.ini");
 
-    // ConBox 를 자식 창으로 만든다. (위치/크기는 아래 resize_to_grid 가 정한다.)
-    con_box.open(this, 0, 0, 10, 10);
+    // ConBox 를 자식 창으로 만든다. 크기는 INI 의 grid_cols/rows 설정을 따른다.
+    // cmdline 이 비어 있지 않으면 open() 내부에서 start() 를 자동 호출한다.
+    con_box.open(this, 5, 5);
 
-    // config 에서 읽은 그리드 크기로 메인 창 크기를 조정한다.
-    resize_to_grid(con_box.config_cols(), con_box.config_rows());
+    // open() 이 결정한 ConBox 크기에 맞춰 대화상자 크기를 조정하고 화면 중앙으로 배치한다.
+    resize_to_grid();
 
-    // 자식 프로세스를 기동한다. config 에서 읽은 명령줄을 사용한다.
-    con_box.set_exit_callback(&CConBoxDlg::on_child_exit, this);
-    SetCurrentDirectory(_T("D:\\Work\\Study\\ConBox"));
-    con_box.start(con_box.config_cmdline());
+    // 자식이 종료되면 대화상자를 닫는다.
+    con_box.set_exit_callback(&cConBoxDlg::on_child_exit, this);
 
     // 키보드 입력을 받도록 ConBox 에 포커스를 준다.
     con_box.SetFocus();
     return FALSE;  // 포커스를 직접 설정했으므로 FALSE 를 반환한다.
 }
 
-void CConBoxDlg::OnDestroy()
+void cConBoxDlg::OnDestroy()
 {
     // 창이 닫힐 때(타이틀바 X 포함) 자식/출력펌프/타이머를 먼저 깔끔히 정리한다. 그래야
     // 출력 펌프가 파괴 중인 ConBox 를 건드려 죽지 않고, 디버그 로그/캡처도 정상 마감된다.
@@ -108,18 +108,18 @@ void CConBoxDlg::OnDestroy()
     CDialog::OnDestroy();
 }
 
-void CConBoxDlg::on_child_exit(void* user)
+void cConBoxDlg::on_child_exit(void* user)
 {
     // ConExe 자식(cmd.exe)이 종료되면 호출된다. 호출 시점에는 이미 ConExe 정리가 끝나
     // is_running()==false 다. 데모에서는 자식이 끝나면 메인 윈도우를 닫는다.
     // 이 콜백은 ConExe 출력 펌프(타이머) 안에서 호출되므로, 펌프 스택을 빠져나온 뒤
     // 안전하게 닫히도록 즉시 닫지 않고 WM_CLOSE 를 게시(PostMessage)한다.
-    CConBoxDlg* self = (CConBoxDlg*)user;
+    cConBoxDlg* self = (cConBoxDlg*)user;
     if (self != nullptr && self->GetSafeHwnd() != NULL)
         self->PostMessage(WM_CLOSE);
 }
 
-void CConBoxDlg::layout_children()
+void cConBoxDlg::layout_children()
 {
     // ConBox 가 아직 없으면(초기화 도중) 아무것도 하지 않는다.
     if (con_box.GetSafeHwnd() == NULL)
@@ -138,20 +138,20 @@ void CConBoxDlg::layout_children()
     con_box.MoveWindow(margin, margin, box_w, box_h);
 }
 
-void CConBoxDlg::resize_to_grid(int cols, int rows)
+void cConBoxDlg::resize_to_grid()
 {
     if (con_box.GetSafeHwnd() == NULL)
         return;
 
-    // 가로 cols 칸 x 세로 rows 줄을 담는 데 필요한 ConBox 클라이언트 픽셀(안쪽 여백 포함).
+    // open() 이 결정한 ConBox 클라이언트 크기를 직접 읽는다.
     // ConBox 는 오버레이 스크롤바(클라이언트를 잠식하지 않음)를 쓰므로 스크롤바 폭 보정이 불필요하다.
-    int bw = 0, bh = 0;
-    con_box.client_size_for_grid(cols, rows, bw, bh);
+    CRect box_rc;
+    con_box.GetClientRect(&box_rc);
 
     // 데모는 ConBox 를 사방 5px 마진(베젤)으로 배치하므로(layout_children 과 같은 값),
     // 대화상자 클라이언트는 그만큼 더 크다.
     const int margin = 5;
-    CRect want(0, 0, bw + 2 * margin, bh + 2 * margin);
+    CRect want(0, 0, box_rc.Width() + 2 * margin, box_rc.Height() + 2 * margin);
 
     // 클라이언트 사각형을 현재 창 스타일 기준의 창 사각형(테두리/타이틀바 포함)으로 키운다.
     CalcWindowRect(&want, CWnd::adjustBorder);
@@ -171,7 +171,7 @@ void CConBoxDlg::resize_to_grid(int cols, int rows)
     layout_children();
 }
 
-void CConBoxDlg::OnSize(UINT type, int cx, int cy)
+void cConBoxDlg::OnSize(UINT type, int cx, int cy)
 {
     CDialog::OnSize(type, cx, cy);
     layout_children();
@@ -181,7 +181,7 @@ void CConBoxDlg::OnSize(UINT type, int cx, int cy)
 //  아래 코드가 필요합니다.  문서/뷰 모델을 사용하는 MFC 애플리케이션의 경우에는
 //  프레임워크에서 이 작업을 자동으로 수행합니다.
 
-void CConBoxDlg::OnPaint()
+void cConBoxDlg::OnPaint()
 {
     if (IsIconic())
     {
@@ -208,12 +208,12 @@ void CConBoxDlg::OnPaint()
 
 // 사용자가 최소화된 창을 끄는 동안에 커서가 표시되도록 시스템에서
 //  이 함수를 호출합니다.
-HCURSOR CConBoxDlg::OnQueryDragIcon()
+HCURSOR cConBoxDlg::OnQueryDragIcon()
 {
     return static_cast<HCURSOR>(m_hIcon);
 }
 
-void CConBoxDlg::OnSysCommand(UINT id, LPARAM lparam)
+void cConBoxDlg::OnSysCommand(UINT id, LPARAM lparam)
 {
     // WM_SYSCOMMAND: low 4 bits of id carry system-internal flags; mask them before comparing.
     if ((id & 0xFFF0) == ID_SAVE_EMF) {
