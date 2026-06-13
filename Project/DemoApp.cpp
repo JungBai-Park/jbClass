@@ -26,11 +26,14 @@ void DemoMain();
 
 class cDemoApp : public CWinApp {
 public:
+    void attach(CWnd* wnd) { m_pMainWnd = wnd; }
     virtual BOOL InitInstance() {
         INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_WIN95_CLASSES };
         InitCommonControlsEx(&icc);
         CWinApp::InitInstance();
         DemoMain();
+        m_pMainWnd = nullptr;   // null before DestroyWindow: prevents CFrameWnd from posting WM_QUIT
+        DeleteLayOutWindows();
         return FALSE;        // DemoMain ran its own loop; exit the app
     }
     // ExitInstance normally returns AfxGetCurrentMessage()->wParam (the last pumped message's
@@ -42,18 +45,20 @@ class cDemoWnd : public cModalFrame {
 };
 
 cDemoApp theApp;
-cDemoWnd theWnd;
-cConBox  conBox;
 
 void DemoMain() {
-    theWnd.open();
-    cModalFrame* Top = static_cast<cModalFrame*>(LayOut(this, &theWnd, 603, -945, 1492, -125));
+    cDemoWnd *Top = new cDemoWnd;
+    theApp.attach(Top);
+
+    Top->open();
+    LayOut(New, Top, 516, -970, 1491, -155);
     Top->CenterWindow();
-    theApp.m_pMainWnd = Top;
     Top->timer(500);   // 0.5s repeating timer
 
-    conBox.setup_from_ini("..\\..\\Documents\\ConBox.ini");
-    conBox.open(Top, 5, 5);
+    cConBox* conBox = new cConBox;
+    conBox->setup_from_ini("..\\..\\Documents\\ConBox.ini");
+    conBox->open(Top, 5, 5);
+    LayOut(New, conBox, 152, 97, 812, 492);
 
     CEdit*     edit   = LayOut(Edit,   Top, 476, 623, 851, 658);
     CButton*   button = LayOut(Button, Top, 685, 715, 855, 745, "Close");
@@ -74,8 +79,4 @@ void DemoMain() {
             ::SetWindowTextW(Top->m_hWnd, title);
         }
     }
-
-    if (conBox.GetSafeHwnd()) conBox.DestroyWindow();  // detach before global dtor to avoid phantom MFC handle-map leak
-    DeleteLayOutWindows();   // destroys children (edit/button/label/combo) then Top, reverse-registration order
-    theApp.m_pMainWnd = nullptr;
 }

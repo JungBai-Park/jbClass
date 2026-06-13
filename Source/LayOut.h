@@ -211,13 +211,19 @@ private:
 //   Header     CHeaderCtrl*      (not yet initialised by string)
 //   Modal      cModalFrame*      creates + shows the top-level host window
 //   Zone       CWnd*             container child window (COLOR_BTNFACE bg); use as parent
-//   this       CWnd*             attach + move an already-open window (no create/destroy)
+//   New        CWnd*             attach + move an already-created (new'd) window; registry OWNS it
+//                                (DeleteLayOutWindows DestroyWindow+deletes it -- pass a new'd obj)
+//   AsItIs     CWnd*             attach + move a BORROWED window (registry won't destroy it);
+//                                prefer New -- AsItIs must NOT be a global/static (see note below)
 //
 // Examples:
 //   CEdit*    e = LayOut(Edit,   parent, 10,10,200,30);
 //   CButton*  b = LayOut(Button, parent, 10,50,100,30, "OK");
 //   CComboBox*c = LayOut(Combo,  parent, 10,90,200,60, "A,B,C");
-//   CWnd*     w = LayOut(this,   myWnd,  10,10,200,30);  // already-created window
+//   cFoo*     w = new cFoo;       // LayOut(New,...): allocate first, then open,
+//   w->open(parent, ...);        //   then register -- open() signature varies per class
+//   LayOut(New, w, 10,10,200,30);//   registry owns w; DeleteLayOutWindows() deletes it
+//   CWnd*     x = LayOut(AsItIs, myWnd,  10,10,200,30);    // borrowed; you own myWnd (not global)
 // _DEBUG: pass __FILE__/__LINE__ so live editing can rewrite the call site.
 // Release: pass nullptr/0 -- keeps source paths OUT of the release binary
 // (the whole edit/rewrite machinery is compiled out; only signal interop remains).
@@ -251,15 +257,27 @@ CHeaderCtrl*     LayOutHeader   (CWnd* p,int x0,int y0,int x1,int y1,const char*
 class cModalFrame;
 cModalFrame*     LayOutModal    (CWnd* p,int x0,int y0,int x1,int y1,const char* f,int ln);
 CWnd*            LayOutZone     (CWnd* p,int x0,int y0,int x1,int y1,const char* f,int ln);
-// LayOut(this, wnd, x0,y0,x1,y1): attach an already-open window and move it.
-// wnd must be already Create()d. The registry owns the cLayOut only (not the CWnd).
+// LayOut(AsItIs, wnd, x0,y0,x1,y1): attach an already-open window and move it.
+// LayOut(AsItIs, wnd, 0,0,0,0)    : attach-only; window stays at its current position.
+// wnd must be already Create()d. The registry owns the cLayOut only (not the CWnd):
 // DeleteLayOutWindows() removes the subclass but does NOT destroy or delete wnd.
-CWnd*            LayOutthis     (CWnd* p,int x0,int y0,int x1,int y1,const char* f,int ln);
+// PREFER LayOut(New, new ...) for windows you create for the UI. Use AsItIs only for a
+// BORROWED window whose lifetime is managed elsewhere. OK for a stack/member window
+// (destroyed at a scope before app exit); NEVER a global/static object -- its destruction
+// is deferred past the CRT leak snapshot and triggers a phantom empty-dump leak (Learned 4.8).
+CWnd*            LayOutAsItIs   (CWnd* p,int x0,int y0,int x1,int y1,const char* f,int ln);
+// LayOut(New, wnd, x0,y0,x1,y1): like LayOut(AsItIs,...) EXCEPT the registry OWNS wnd.
+// "New" signals that wnd was heap-allocated with new -- DeleteLayOutWindows() removes the
+// subclass AND DestroyWindow()+delete the wnd, so wnd MUST be a new'd pointer (never stack/
+// member/global). Recommended for externally-created CWnd-derived windows (e.g. new cConBox):
+// torn down INSIDE the host loop, their heap members (std::string/vector/deque) are freed
+// before the CRT leak snapshot -- avoiding the phantom empty-dump leak a global object causes.
+CWnd*            LayOutNew      (CWnd* p,int x0,int y0,int x1,int y1,const char* f,int ln);
 
 // Call once at the end of the host window lifetime.
 // Iterates the registry in REVERSE registration order (children before parent):
-//   LayOut(Edit/Button/...): delete cLayOut (removes subclass) -> DestroyWindow -> delete wnd
-//   LayOut(this, ...):       delete cLayOut only -- the CWnd was borrowed, not created here
+//   LayOut(Edit/Button/...)/LayOut(New,...): delete cLayOut (removes subclass) -> DestroyWindow -> delete wnd
+//   LayOut(AsItIs, ...):                    delete cLayOut only -- the CWnd was borrowed, not created here
 // TRAP: Do NOT call DestroyWindow() yourself on LayOut-registered controls before
 //   calling this. It is redundant (DeleteLayOutWindows skips already-destroyed HWNDs)
 //   and the USAGE example that shows Top->DestroyWindow() first is WRONG -- do not copy it.
@@ -287,9 +305,9 @@ bool LayOutRewrite(const char* file, int line, const RECT& rect);
 // cModalFrame -- minimal host implementing the surveil/listen/report protocol.
 // ============================================================================
 // A plain top-level CFrameWnd that:
-//   - is live-editable itself: the LayOut(Modal,...) factory (or a manual
-//     LayOut(this, &wnd, ...) call) attaches a registry-owned cLayOut, so its
-//     position/size can be edited like any control (middle button to toggle,
+//   - is live-editable itself: the LayOut(Modal,...) factory attaches a
+//     registry-owned cLayOut, so its position/size can be edited like any control
+//     (middle button to toggle,
 //     drag/arrow keys to move/resize, Enter to commit),
 //   - paints its client area with COLOR_BTNFACE (dialog background color),
 //   - applies the system UI font (lfMessageFont) to all New*-created child controls,
@@ -320,9 +338,10 @@ bool LayOutRewrite(const char* file, int line, const RECT& rect);
 //     if (ev == Top)       ...             // timer fired
 //     if (ev == (CWnd*)b) ...             // b signaled
 //     // NOTE: do NOT call Top->DestroyWindow() -- DeleteLayOutWindows() does it.
-//     // If other CWnd objects not registered via LayOut() (e.g. a global cConBox)
-//     // share the same parent, call their DestroyWindow() BEFORE DeleteLayOutWindows()
-//     // to prevent a phantom MFC handle-map leak when global destructors fire later.
+//     // For other CWnd-derived windows (e.g. cConBox), new them and attach via
+//     // LayOut(New, wnd, ...) so DeleteLayOutWindows() deletes them here too. Avoid a
+//     // global/static instance: its STL members are freed only at static destruction
+//     // (after the CRT leak snapshot), producing a phantom empty-dump "memory leaks".
 //     DeleteLayOutWindows();  // reverse order: remove subclass -> DestroyWindow -> delete
 
 class cModalFrame : public CFrameWnd {
@@ -334,7 +353,7 @@ public:
     // registry-owned cLayOut afterwards (like every other factory).
     bool open(CWnd* parent, int x0, int y0, int x1, int y1);
     // Create only (hidden, zero rect). Position + show + attach afterwards
-    // via LayOut(this, &wnd, x0,y0,x1,y1).
+    // via LayOut(New, &wnd, x0,y0,x1,y1) (or LayOut(Modal,...) which does it all).
     bool open(CWnd* parent = nullptr);
 
     // Set a repeating timer. period > 0: fire every period ms, listen() returns

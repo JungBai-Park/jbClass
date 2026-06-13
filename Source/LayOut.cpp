@@ -8,7 +8,7 @@
     SECTION INDEX (grep these)
     --------------------------
     [LIFETIME]   ctor / dtor / attach / open / initialize / active()
-    [FACTORY]    cLayOutZone class + LayOut* hidden-control factories + LayOutthis + DeleteLayOutWindows
+    [FACTORY]    cLayOutZone class + LayOut* hidden-control factories + LayOutAsItIs/LayOutNew + DeleteLayOutWindows
     [UTIL]       AlignText
     [DETECT]     signal_map + set_default_signal_codes
     [PROC]       proc (static) -> dispatch (instance message router)
@@ -25,6 +25,9 @@
     - Exiting via middle button does NOT commit. Enter or left double-click
       commits (rewrites source). ESC cancels and restores the pre-edit rect
       stored in last_rect (no source rewrite).
+    - On Enter commit and ESC cancel, PeekMessageW discards the trailing
+      WM_CHAR ('\r' or '\x1b') that TranslateMessage posts before DispatchMessage
+      runs, so the key does not leak to the child window as input.
     - Only one control is in edit mode at a time (active()). Entering edit on
       another control silently drops the previous one (no commit).
     - Arrow = move snapping left/top to a 5px grid; Ctrl+Arrow = 1px move;
@@ -378,16 +381,54 @@ CWnd* LayOutZone(CWnd* parent, int x0, int y0, int x1, int y1,
     return finish_new_window(w, ok, parent, x0, y0, x1, y1, file, line, nullptr);
 }
 
-CWnd* LayOutthis(CWnd* self, int x0, int y0, int x1, int y1,
-                 const char* file, int line) {
+// Borrowed attach: registry stores only the cLayOut, caller owns the CWnd.
+// Prefer LayOutNew for windows you create for the UI; use this only for a window whose
+// lifetime is managed elsewhere, and NEVER a global/static object (deferred destruction
+// past the leak snapshot -> phantom empty-dump leak).
+CWnd* LayOutAsItIs(CWnd* self, int x0, int y0, int x1, int y1,
+                   const char* file, int line) {
     ensure_cleanup_guard();
     cLayOut* p = new cLayOut;
     // wnd=nullptr: registry owns only the cLayOut; caller owns the CWnd.
     new_window_registry().push_back({ nullptr, p });
     p->attach(self);
-    p->open(x0, y0, x1, y1, file, line);
-    self->MoveWindow(CRect(x0, y0, x1, y1));
+    if (x0 == 0 && y0 == 0 && x1 == 0 && y1 == 0) {
+        // (0,0,0,0): attach-only mode. Read current rect so last_rect is valid for ESC restore.
+        CRect rc;
+        self->GetWindowRect(&rc);
+        CWnd* par = self->GetParent();
+        if (par) par->ScreenToClient(&rc);
+        p->open(rc.left, rc.top, rc.right, rc.bottom, file, line);
+    } else {
+        p->open(x0, y0, x1, y1, file, line);
+        self->MoveWindow(CRect(x0, y0, x1, y1));
+    }
     // cModalFrame::open(parent) creates hidden; no-op if already visible.
+    self->ShowWindow(SW_SHOW);
+    return self;
+}
+
+// Same as LayOutAsItIs but the registry OWNS the new'd window: { self, p } instead of
+// { nullptr, p }. DeleteLayOutWindows() then DestroyWindow()s and deletes it, so a
+// heap-allocated external CWnd (e.g. new cConBox) is fully torn down inside the host loop,
+// freeing its STL members before the CRT leak snapshot at exit (no phantom empty dump).
+CWnd* LayOutNew(CWnd* self, int x0, int y0, int x1, int y1,
+                const char* file, int line) {
+    ensure_cleanup_guard();
+    cLayOut* p = new cLayOut;
+    new_window_registry().push_back({ self, p });   // { self, ... }: registry owns the CWnd
+    p->attach(self);
+    if (x0 == 0 && y0 == 0 && x1 == 0 && y1 == 0) {
+        // (0,0,0,0): attach-only mode. Read current rect so last_rect is valid for ESC restore.
+        CRect rc;
+        self->GetWindowRect(&rc);
+        CWnd* par = self->GetParent();
+        if (par) par->ScreenToClient(&rc);
+        p->open(rc.left, rc.top, rc.right, rc.bottom, file, line);
+    } else {
+        p->open(x0, y0, x1, y1, file, line);
+        self->MoveWindow(CRect(x0, y0, x1, y1));
+    }
     self->ShowWindow(SW_SHOW);
     return self;
 }
@@ -791,8 +832,11 @@ LRESULT cLayOut::dispatch(HWND h, UINT msg, WPARAM w, LPARAM l) {
             if (vk == VK_LEFT || vk == VK_RIGHT || vk == VK_UP ||
                 vk == VK_DOWN || vk == VK_RETURN)
                 on_key(h, vk);
-            else if (vk == VK_ESCAPE)
+            else if (vk == VK_ESCAPE) {
                 leave_edit(h, false);           // cancel without commit
+                MSG dummy;
+                ::PeekMessageW(&dummy, h, WM_CHAR, WM_CHAR, PM_REMOVE);
+            }
             return 0;                           // eat ALL keydowns in edit mode
         }
         case WM_CHAR:
@@ -861,7 +905,14 @@ void cLayOut::leave_edit(HWND h, bool commit) {
 }
 
 void cLayOut::on_key(HWND h, UINT vk) {
-    if (vk == VK_RETURN) { leave_edit(h, true); return; }
+    if (vk == VK_RETURN) {
+        leave_edit(h, true);
+        // TranslateMessage already posted WM_CHAR '\r' before DispatchMessage ran this
+        // subclass proc. Discard it so the commit Enter does not leak to the child window.
+        MSG dummy;
+        ::PeekMessageW(&dummy, h, WM_CHAR, WM_CHAR, PM_REMOVE);
+        return;
+    }
 
     bool shift = (::GetKeyState(VK_SHIFT)   & 0x8000) != 0;
     bool ctrl  = (::GetKeyState(VK_CONTROL) & 0x8000) != 0;
@@ -1141,7 +1192,7 @@ bool cModalFrame::open(CWnd* parent, int x0, int y0, int x1, int y1) {
 
 bool cModalFrame::open(CWnd* parent) {
     // Create only, stay hidden: the caller positions, shows, and attaches the
-    // editor afterwards via LayOut(this, &wnd, x0,y0,x1,y1).
+    // editor afterwards via LayOut(New, &wnd, x0,y0,x1,y1) (or LayOut(Modal,...)).
     if (!::IsWindow(m_hWnd)) {
         Create(nullptr, nullptr, WS_OVERLAPPEDWINDOW, CRect(0, 0, 0, 0), parent);
         if (::IsWindow(m_hWnd)) ::SetWindowTextW(m_hWnd, L"cLayOut Demo");

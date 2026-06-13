@@ -38,6 +38,7 @@ Project-wide environment, encoding, folder, build, and coding rules are defined 
   - Enter or left-button double click confirms the edit and rewrites the source code.
   - Escape restores the `last_rect` captured before entering edit mode and does not rewrite source code.
   - Leaving edit mode by clicking the middle mouse button again does not rewrite source code.
+  - The Enter and Escape key events are fully consumed by the edit session. The trailing `WM_CHAR` (`'\r'` or `'\x1b'`) that `TranslateMessage` posts before the subclass proc runs is discarded via `PeekMessageW` so it does not reach the child window.
 
 ### 1.4 Host Framework Interoperability
 
@@ -59,6 +60,9 @@ Project-wide environment, encoding, folder, build, and coding rules are defined 
   - `LayOutButton`: `BS_PUSHBUTTON`.
   - `LayOutEdit`: `ES_MULTILINE | ES_AUTOVSCROLL`.
 - `AlignText` maps a keypad-style placement value from 1 to 9 to the text alignment behavior appropriate for the window class.
+- `LayOut(AsItIs, wnd, x0,y0,x1,y1)` attaches `cLayOut` to an already-created `CWnd` and moves it to the given rect (borrowed: the registry owns only the `cLayOut`, not the `CWnd`). When all four coordinates are `0`, it operates in attach-only mode: the window is not moved, and `last_rect` is populated from the current `GetWindowRect` result (parent-relative). Prefer `LayOut(New, ...)` for windows created for the UI; reserve `LayOut(AsItIs, ...)` for borrowed windows whose lifetime is owned elsewhere, and never for a global/static instance.
+- `LayOut(New, wnd, x0,y0,x1,y1)` behaves like `LayOut(AsItIs, ...)` but transfers ownership of the `new`'d `wnd` to the registry, so `DeleteLayOutWindows()` also `DestroyWindow`s and `delete`s it (`wnd` must therefore be heap-allocated with `new`). Externally-created `CWnd`-derived windows (e.g. `new cConBox`) must use this form rather than a global/static instance, so their heap members are released inside the host loop before the CRT exit leak snapshot.
+- The host `CWinApp` subclass must call `m_pMainWnd = nullptr` then `DeleteLayOutWindows()` in `InitInstance()` immediately after the modal loop function returns. Nulling `m_pMainWnd` first prevents `CFrameWnd::OnDestroy` from posting `WM_QUIT` when it destroys the main window.
 
 ## 2. ConBox
 

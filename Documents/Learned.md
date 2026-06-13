@@ -11,7 +11,7 @@ This file records project-specific pitfalls and implementation details that are 
 - Known x64 Debug build command:
 
 ```powershell
-& "C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Current\Bin\MSBuild.exe" "Project\ConBox.sln" /t:Build /p:Configuration=Debug /p:Platform=x64
+& "C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Current\Bin\MSBuild.exe" "Project\jbClass.sln" /t:Build /p:Configuration=Debug /p:Platform=x64
 ```
 
 - Build output uses configuration-specific suffix directories such as `Project\Debug.64\` and `Project\Debug.32\`.
@@ -79,13 +79,23 @@ This file records project-specific pitfalls and implementation details that are 
 - `cLayOut` stores a borrowed reference and does not own the target control.
 - Declare variables so each `cLayOut` instance is destroyed before the related `CWnd` member or stack variable.
 - `DeleteLayOutWindows()` processes the registry in reverse-registration order: `delete cLayOut` (removes subclass) → `DestroyWindow` → `delete wnd`. It handles everything; do NOT call `DestroyWindow()` separately on registered controls -- it is redundant and creates confusion.
-- `LayOut(this, wnd, ...)` registers with `wnd = nullptr`. `DeleteLayOutWindows()` removes the subclass only and does not call `DestroyWindow` or `delete` on that window.
+- `LayOut(AsItIs, wnd, ...)` (helper `LayOutAsItIs`, formerly `LayOutthis`) registers with `wnd = nullptr`. `DeleteLayOutWindows()` removes the subclass only and does not call `DestroyWindow` or `delete` on that window. Prefer `LayOut(New, new ...)`: `AsItIs` is borrowed-only -- fine for a stack/member window, but never a global/static one (deferred destruction -> phantom leak, see 4.8). `New` requires a heap(`new`) object (it `delete`s wnd).
 - If the parent window is destroyed first and `WM_NCDESTROY` arrives, immediately clear the target pointer to avoid double release.
 - `cModalFrame` lifetime is manually controlled by `DeleteLayOutWindows()`. Its `PostNcDestroy` must be a no-op and must not call `delete this`.
 - When opening a modal sub-frame inside an event loop, do not call `DeleteLayOutWindows()` from the child unexpectedly. It can erase global registry resources that include the main window. Reactivate the parent after the dialog closes, then clean up outside the loop.
-- Global `CWnd`-derived objects (e.g. `cConBox conBox`) that are NOT registered via the LayOut factory must have `DestroyWindow()` called explicitly BEFORE `DeleteLayOutWindows()`. Without this, the global destructor fires after MFC's cleanup, leaving a stale HWND in the handle map and triggering a phantom "Detected memory leaks!" message.
+- Externally-created `CWnd`-derived windows (e.g. `cConBox`) should be `new`-allocated and attached via `LayOut(New, wnd, x0,y0,x1,y1)` (= `LayOutNew`). This registers `{ wnd, p }` so `DeleteLayOutWindows()` runs the full owned path (remove subclass -> `DestroyWindow` -> `delete`) just like a factory control. Do NOT use a global/static instance + `LayOut(AsItIs, ...)` for such windows -- see 4.8 for why (phantom empty-dump leak from STL members freed too late).
+- `LayOutNew` differs from `LayOutAsItIs` only in the registry entry: `{ self, p }` (owned) vs `{ nullptr, p }` (borrowed). Both still attach the editing subclass, so the window stays live-editable.
+- `CFrameWnd::OnDestroy()` calls `AfxPostQuitMessage(0)` when `AfxGetThread()->m_pMainWnd == this`. Call `m_pMainWnd = nullptr` BEFORE `DeleteLayOutWindows()` so the check fails and WM_QUIT is not posted. The host `CWinApp::InitInstance()` is the right place: call them in order right after the modal loop function returns.
+- `DeleteLayOutWindows()` is safe to call multiple times (clears the registry; second call is a no-op). A `NEW_WINDOW_CLEANUP_GUARD` static object also calls it at process exit as a safety net, but that fires after the CRT leak snapshot -- explicit call from `InitInstance` is still required to avoid the phantom empty-dump warning.
 
-### 3.4 CEdit Vertical Alignment
+### 3.4 Edit-Mode Key Commit and WM_CHAR Leak
+
+- When `PreTranslateMessage` returns `FALSE` for a `WM_KEYDOWN` in edit mode, the MFC pump calls `TranslateMessage` **before** `DispatchMessage`. `TranslateMessage` posts `WM_CHAR` to the queue immediately -- before the subclass proc runs and sets `editing = false`.
+- After `leave_edit()` returns, `editing` is false, so the queued `WM_CHAR` (`'\r'` for Enter, `'\x1b'` for ESC) passes through the subclass proc and reaches the child window as input.
+- Fix: call `::PeekMessageW(&dummy, h, WM_CHAR, WM_CHAR, PM_REMOVE)` immediately after `leave_edit()` in both paths (Enter commit in `on_key`, ESC cancel in the `WM_KEYDOWN` dispatch). `TranslateMessage` has already run at that point so the char is in the queue and can be removed.
+- Double-click commit does not have this issue -- mouse messages do not generate `WM_CHAR`.
+
+### 3.5 CEdit Vertical Alignment
 
 - `EM_SETRECT` is ignored by single-line edit controls.
 - To adjust vertical margins, the edit control must include `ES_MULTILINE`.
@@ -148,4 +158,8 @@ This file records project-specific pitfalls and implementation details that are 
 ### 4.8 DemoApp Exit Code and MFC Memory Leak Message
 
 - `CWinApp::ExitInstance()` returns `AfxGetCurrentMessage()->wParam` -- the last pumped message's wParam. When `InitInstance` drives its own modal loop and returns `FALSE`, this yields a meaningless non-zero exit code. Override `ExitInstance()` to `return 0` explicitly.
-- "Detected memory leaks! Dumping objects -> Object dump complete." (empty dump) is an MFC false positive. MFC's leak check fires when `_NORMAL_BLOCK` count differs between the initial snapshot and shutdown, but `_CrtMemDumpAllObjectsSince` only prints `_CLIENT_BLOCK` objects. An empty dump means no user-code (`DEBUG_NEW`) leaks exist. The `_NORMAL_BLOCK` difference comes from MFC's internal `CHandleMap` / STL nodes and cannot be eliminated without suppressing the check. It is safe to ignore.
+- "Detected memory leaks! Dumping objects -> Object dump complete." with an EMPTY dump:
+  - The header fires when the `_NORMAL_BLOCK` count differs between the initial snapshot and shutdown, but `_CrtMemDumpAllObjectsSince` only prints `_CLIENT_BLOCK` (`DEBUG_NEW`) objects. An empty dump means no user-code leaks -- the difference is in `_NORMAL_BLOCK` (raw `::operator new`, e.g. STL allocators).
+  - ROOT CAUSE (confirmed, not an unfixable MFC quirk): a global/static `CWnd`-derived object (e.g. a global `cConBox`) holds STL members (`std::deque`/`vector`/`string`: scrollback, screen grid, buffers). A global object's destructor runs at STATIC DESTRUCTION, which is AFTER the CRT leak snapshot. So those STL allocations are still live at snapshot time -> `_NORMAL_BLOCK` count differs -> header. They are not `_CLIENT_BLOCK`, so the dump is empty. Symptom matches exactly.
+  - Calling `DestroyWindow()` on the global does NOT fix it: that frees only the HWND, not the C++ object's STL members (which live until static destruction).
+  - FIX: do not keep such objects global. `new` them and let `DeleteLayOutWindows()` `delete` them inside the host loop (via `LayOut(New, ...)`, see 3.3), so all heap members are freed BEFORE the snapshot. This removes the warning entirely (verified). Prefer this over suppressing the check (`_CrtSetDbgFlag`), which would also hide real leaks.
