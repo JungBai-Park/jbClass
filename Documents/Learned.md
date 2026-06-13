@@ -51,15 +51,21 @@ This file records project-specific pitfalls and implementation details that are 
 - Example: replacing `dc.TextOutW(` can damage `cdc.TextOutW(`.
 - Replace the longest and most specific patterns first, then manually inspect the result.
 
-## 3. LayOut
+### 2.4 Factory Macro Hazards (FrameBox Add*/Open)
+
+- The `Add*`/`Open` factory macros are global, function-like, case-sensitive textual substitutions defined at the bottom of `FrameBox.h`.
+- `Open` collides with MFC's own `Open(...)` members (e.g. `CFile::Open` in `afxpriv.h`): a function-like `Open` macro rewrites those declarations and breaks the header with cascading parse errors. Include any MFC header that declares an `Open(...)` member (notably `afxpriv.h`, needed for `AfxHookWindowCreate`) BEFORE `FrameBox.h`, so it is parsed before the macro exists. Consumers that pull no such header after `FrameBox.h` are unaffected.
+- Do NOT write `Add*/Open` (or any `...*/...`) inside a `/* */` block comment: the `*/` closes the comment early and everything after it compiles as code. Use `Add... / Open` or a `//` line comment instead. (Hit this in both `FrameBox.h` and `FrameBox.cpp` headers this session.)
+
+## 3. FrameBox
 
 ### 3.1 Host Notification Reflection
 
 - Notifications such as `BN_CLICKED`, `EN_CHANGE`, `CBN_SELCHANGE`, and scroll request codes are delivered to the parent window, not directly to the control.
-- To let the `cLayOut` subclass receive a reflected notification, the host must send the callback to the control HWND:
+- To let the `Parasite` subclass receive a reflected notification, the host must send the callback to the control HWND:
 
 ```cpp
-::SendMessage(ctrlHwnd, WM_EVOL_CALLBACK, 0, (LPARAM)(int)code);
+::SendMessage(ctrlHwnd, WM_PARASITE_CALLBACK, 0, (LPARAM)(int)code);
 ```
 
 - Do not call `wnd->WindowProc(...)` through a C++ object pointer for this path. It bypasses the `SetWindowSubclass` chain and loses the notification.
@@ -67,26 +73,24 @@ This file records project-specific pitfalls and implementation details that are 
 
 ### 3.2 Source Rewriter Limits
 
-- `LayOut(Type, parent, x0, y0, x1, y1 [,init])` injects `__FILE__` and `__LINE__`.
-- The rewriter searches for `"LayOut("`, skips the first two arguments, then updates only the four coordinate literals.
-- Extra arguments such as initialization text must be preserved.
+- The `Add*`/`Open` macros inject `__FILE__` and `__LINE__`; coordinates are ALWAYS the first four arguments.
+- The rewriter anchors on a member-call on the target line: `.`/`->` followed by an uppercase-initial identifier and `(` whose first argument is an integer literal (covers `AddStatic`/`AddNew`/`Open`/...). It then rewrites the first four comma/paren-delimited integer literals, with NO leading-argument skip (the old `"LayOut("` + skip-2 logic is gone).
+- The trailing argument (init string for controls, window pointer for `AddNew`/`AddAsItIs`) must be preserved; it is.
 - The rewriter supports only single-line calls with integer literals.
 - UTF-16 BOM source files are not supported. ANSI and UTF-8 files are supported.
 - Create a `.bak` file before rewriting.
 
 ### 3.3 Lifetime and Ownership
 
-- `cLayOut` stores a borrowed reference and does not own the target control.
-- Declare variables so each `cLayOut` instance is destroyed before the related `CWnd` member or stack variable.
-- `DeleteLayOutWindows()` processes the registry in reverse-registration order: `delete cLayOut` (removes subclass) → `DestroyWindow` → `delete wnd`. It handles everything; do NOT call `DestroyWindow()` separately on registered controls -- it is redundant and creates confusion.
-- `LayOut(AsItIs, wnd, ...)` (helper `LayOutAsItIs`, formerly `LayOutthis`) registers with `wnd = nullptr`. `DeleteLayOutWindows()` removes the subclass only and does not call `DestroyWindow` or `delete` on that window. Prefer `LayOut(New, new ...)`: `AsItIs` is borrowed-only -- fine for a stack/member window, but never a global/static one (deferred destruction -> phantom leak, see 4.8). `New` requires a heap(`new`) object (it `delete`s wnd).
-- If the parent window is destroyed first and `WM_NCDESTROY` arrives, immediately clear the target pointer to avoid double release.
-- `cModalFrame` lifetime is manually controlled by `DeleteLayOutWindows()`. Its `PostNcDestroy` must be a no-op and must not call `delete this`.
-- When opening a modal sub-frame inside an event loop, do not call `DeleteLayOutWindows()` from the child unexpectedly. It can erase global registry resources that include the main window. Reactivate the parent after the dialog closes, then clean up outside the loop.
-- Externally-created `CWnd`-derived windows (e.g. `cConBox`) should be `new`-allocated and attached via `LayOut(New, wnd, x0,y0,x1,y1)` (= `LayOutNew`). This registers `{ wnd, p }` so `DeleteLayOutWindows()` runs the full owned path (remove subclass -> `DestroyWindow` -> `delete`) just like a factory control. Do NOT use a global/static instance + `LayOut(AsItIs, ...)` for such windows -- see 4.8 for why (phantom empty-dump leak from STL members freed too late).
-- `LayOutNew` differs from `LayOutAsItIs` only in the registry entry: `{ self, p }` (owned) vs `{ nullptr, p }` (borrowed). Both still attach the editing subclass, so the window stays live-editable.
-- `CFrameWnd::OnDestroy()` calls `AfxPostQuitMessage(0)` when `AfxGetThread()->m_pMainWnd == this`. Call `m_pMainWnd = nullptr` BEFORE `DeleteLayOutWindows()` so the check fails and WM_QUIT is not posted. The host `CWinApp::InitInstance()` is the right place: call them in order right after the modal loop function returns.
-- `DeleteLayOutWindows()` is safe to call multiple times (clears the registry; second call is a no-op). A `NEW_WINDOW_CLEANUP_GUARD` static object also calls it at process exit as a safety net, but that fires after the CRT leak snapshot -- explicit call from `InitInstance` is still required to avoid the phantom empty-dump warning.
+- `Parasite` stores a borrowed reference and does not own the target control.
+- Each `FrameBox` OWNS its children through a per-instance registry (the global `new_window_registry()` / `DeleteLayOutWindows()` are gone). `~FrameBox()` (= `close()`) processes the registry in reverse-registration order: `delete Parasite` (removes subclass) -> `DestroyWindow` -> `delete wnd`. A child-frame entry's `delete wnd` recurses into that child's `~FrameBox`, tearing down grandchildren. Do NOT call `DestroyWindow()` separately on registered controls -- it is redundant.
+- `AddAsItIs(..., wnd)` registers `{ nullptr, Parasite }` (borrowed): teardown removes the subclass only. `AddNew(..., wnd)` registers `{ wnd, Parasite }` (owned): teardown also `DestroyWindow`s + `delete`s wnd, so wnd must be a heap (`new`) object. Both attach the editing subclass, so the window stays live-editable.
+- The root `FrameBox` is created with `new`, bound via `attach(theApp)`, opened via `Open(...)`, and `delete`d by the function that created it (the modal-loop driver) before `InitInstance` returns. `attach()` sets `m_pMainWnd = this`; `close()` clears it FIRST so destruction never leaves a dangling main window.
+- Because `FrameBox` is `CWnd`-based (not `CFrameWnd`), `OnDestroy` does not post `WM_QUIT`; the old `m_pMainWnd = nullptr` + `DeleteLayOutWindows()` dance in `InitInstance` is no longer needed.
+- A child frame (`AddZone`/`AddFrame`) closing tears down only its OWN registry, so the former footgun -- a child calling the global `DeleteLayOutWindows()` and wiping the main window -- cannot happen anymore.
+- If the parent window is destroyed first (`WM_NCDESTROY`), `~Parasite` skips `RemoveWindowSubclass` (HWND already gone) and never deletes the target, so teardown is safe in either order.
+- `FrameBox::PostNcDestroy` must be a no-op (lifetime is owner-managed; a self-delete would double-free).
+- `FrameBox` creates its window via the `AfxHookWindowCreate` + `CreateWindowExW` pattern (see 2.2), exactly like `cConBox`: it registers one shared `"FrameBox"` class and selects top-level / `WS_CHILD` zone / `WS_POPUP` purely by the style passed at creation.
 
 ### 3.4 Edit-Mode Key Commit and WM_CHAR Leak
 
@@ -151,9 +155,9 @@ This file records project-specific pitfalls and implementation details that are 
 
 - `CWnd`-derived custom windows do not receive focus automatically on click (unlike standard controls such as `CEdit`).
 - `OnLButtonDown` must call `SetFocus()` explicitly so the window can receive keyboard input.
-- `cModalFrame::PreTranslateMessage` unconditionally consumes `VK_RETURN` and `VK_ESCAPE` even in normal (non-edit) mode. A window that needs these keys (e.g. ConBox returning `DLGC_WANTALLKEYS`) will never receive them unless a guard is added.
-- Fix: check `focus->SendMessage(WM_GETDLGCODE) & DLGC_WANTALLKEYS` before the ESC/Enter intercept and yield to `CFrameWnd::PreTranslateMessage` when true.
-- TRAP: the `editing_hwnd()` guard in `PreTranslateMessage` only yields to the cLayOut subclass proc during control repositioning. It does NOT mean ESC/Enter are consumed only in edit mode -- they are always consumed in normal mode too (except for `DLGC_WANTALLKEYS` windows).
+- `FrameBox::PreTranslateMessage` unconditionally consumes `VK_RETURN` and `VK_ESCAPE` even in normal (non-edit) mode. A window that needs these keys (e.g. ConBox returning `DLGC_WANTALLKEYS`) will never receive them unless a guard is added.
+- Fix: check `focus->SendMessage(WM_GETDLGCODE) & DLGC_WANTALLKEYS` before the ESC/Enter intercept and yield to `CWnd::PreTranslateMessage` when true.
+- TRAP: the `editing_hwnd()` guard in `PreTranslateMessage` only yields to the Parasite subclass proc during control repositioning. It does NOT mean ESC/Enter are consumed only in edit mode -- they are always consumed in normal mode too (except for `DLGC_WANTALLKEYS` windows).
 
 ### 4.8 DemoApp Exit Code and MFC Memory Leak Message
 
@@ -162,4 +166,4 @@ This file records project-specific pitfalls and implementation details that are 
   - The header fires when the `_NORMAL_BLOCK` count differs between the initial snapshot and shutdown, but `_CrtMemDumpAllObjectsSince` only prints `_CLIENT_BLOCK` (`DEBUG_NEW`) objects. An empty dump means no user-code leaks -- the difference is in `_NORMAL_BLOCK` (raw `::operator new`, e.g. STL allocators).
   - ROOT CAUSE (confirmed, not an unfixable MFC quirk): a global/static `CWnd`-derived object (e.g. a global `cConBox`) holds STL members (`std::deque`/`vector`/`string`: scrollback, screen grid, buffers). A global object's destructor runs at STATIC DESTRUCTION, which is AFTER the CRT leak snapshot. So those STL allocations are still live at snapshot time -> `_NORMAL_BLOCK` count differs -> header. They are not `_CLIENT_BLOCK`, so the dump is empty. Symptom matches exactly.
   - Calling `DestroyWindow()` on the global does NOT fix it: that frees only the HWND, not the C++ object's STL members (which live until static destruction).
-  - FIX: do not keep such objects global. `new` them and let `DeleteLayOutWindows()` `delete` them inside the host loop (via `LayOut(New, ...)`, see 3.3), so all heap members are freed BEFORE the snapshot. This removes the warning entirely (verified). Prefer this over suppressing the check (`_CrtSetDbgFlag`), which would also hide real leaks.
+  - FIX (implemented): do not keep such objects global. `new` them and let `~FrameBox()` `delete` them inside the host loop -- attach external windows via `AddNew(...)` and the root frame via `new` + `delete Top` before `InitInstance` returns (see 3.3) -- so all heap members are freed BEFORE the snapshot. This removes the warning entirely (verified: clean build + run, exit code 0, no leak dump). Prefer this over suppressing the check (`_CrtSetDbgFlag`), which would also hide real leaks.

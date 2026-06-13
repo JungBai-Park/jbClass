@@ -1,22 +1,22 @@
 ﻿/*
-    LayOut.cpp - cLayOut implementation.
+    FrameBox.cpp - Parasite implementation.
 
-    See LayOut.h for the public contract, ownership rules and the host
+    See FrameBox.h for the public contract, ownership rules and the host
     protocol. This file is the subclass procedure plus the live
     layout editor and the source-code rewriter.
 
     SECTION INDEX (grep these)
     --------------------------
     [LIFETIME]   ctor / dtor / attach / open / initialize / active()
-    [FACTORY]    cLayOutZone class + LayOut* hidden-control factories + LayOutAsItIs/LayOutNew + DeleteLayOutWindows
     [UTIL]       AlignText
     [DETECT]     signal_map + set_default_signal_codes
     [PROC]       proc (static) -> dispatch (instance message router)
     [EDIT]       toggle/enter/leave edit, on_key, on_drag, paint_frame, get_rect
-    [SIGNAL]     signal()  (post WM_EVOL_REPORT)
-    [REWRITE]    find_char + LayOutRewrite  (rewrite LayOut(...) literals)
-    [HOST]       cModalFrame: ctor, PreTranslateMessage (ESC/Enter), timer,
-                 open, WindowProc, surveil, listen_core, listen overloads
+    [SIGNAL]     signal()  (post WM_PARASITE_REPORT)
+    [REWRITE]    find_char + LayOutRewrite  (rewrite Add.../Open(...) literals)
+    [HOST]       FrameBox: ctor/dtor/close, create_window, open, attach, timer,
+                 add_* member factories + finish_child, WindowProc,
+                 PreTranslateMessage (ESC/Enter), surveil, listen_core
 
     BEHAVIOUR
     ---------
@@ -41,15 +41,19 @@
       WM_NCLBUTTONDOWN; for child windows SetCapture + WM_MOUSEMOVE is used.
 */
 
+#include <afxwin.h>
+#include <afxpriv.h>   // AfxHookWindowCreate / AfxUnhookWindowCreate (MFC window creation hook).
+                       // MUST precede FrameBox.h: the Open()/Add* factory macros would otherwise
+                       // expand MFC's own Open(...) members (e.g. CFile::Open) in afxpriv.h.
 #include <vector>
 #include <string>
-#include "LayOut.h"
+#include "FrameBox.h"
 
 // ======================================================================
 // [LIFETIME]
 // ======================================================================
 
-cLayOut::cLayOut()
+Parasite::Parasite()
     : target(nullptr), signal_count(0), report(nullptr)
 #if defined(_DEBUG)
     , file(nullptr), line(0), editing(false), drag_edge(0)
@@ -60,7 +64,7 @@ cLayOut::cLayOut()
 #endif
 }
 
-cLayOut::~cLayOut() {
+Parasite::~Parasite() {
 #if defined(_DEBUG)
     if (active() == this) active() = nullptr;
 #endif
@@ -69,54 +73,27 @@ cLayOut::~cLayOut() {
     target = nullptr;
 }
 
-void cLayOut::attach(CWnd* t) {
+void Parasite::attach(CWnd* t) {
     target = t;
 }
 
 #if defined(_DEBUG)
-cLayOut*& cLayOut::active() {
-    static cLayOut* p = nullptr;
+Parasite*& Parasite::active() {
+    static Parasite* p = nullptr;
     return p;
 }
 
-HWND cLayOut::editing_hwnd() {
-    cLayOut* p = active();
+HWND Parasite::editing_hwnd() {
+    Parasite* p = active();
     return (p && p->target) ? p->target->m_hWnd : NULL;
 }
 #endif
 
 // ======================================================================
-// [FACTORY]  hidden-control factories owned by an internal registry
+// [HELPERS]  process-wide UI font shared by FrameBox child factories
 // ======================================================================
 
 namespace {
-    const int NEW_WINDOW_FIRST_ID = 1001;
-
-    struct NewWindowEntry { CWnd* wnd; cLayOut* layout; };
-
-    std::vector<NewWindowEntry>& new_window_registry() {
-        static std::vector<NewWindowEntry> list;
-        return list;
-    }
-
-    int& next_new_window_id() {
-        static int id = NEW_WINDOW_FIRST_ID;
-        return id;
-    }
-
-    int allocate_new_window_id() {
-        return next_new_window_id()++;
-    }
-
-    struct NEW_WINDOW_CLEANUP_GUARD {
-        ~NEW_WINDOW_CLEANUP_GUARD() { DeleteLayOutWindows(); }
-    };
-
-    void ensure_cleanup_guard() {
-        static NEW_WINDOW_CLEANUP_GUARD guard;
-        UNREFERENCED_PARAMETER(guard);
-    }
-
     // Returns the process-wide UI font (Segoe UI 9pt on Vista+).
     // Controls created via Create() default to the legacy SYSTEM_FONT bitmap font;
     // sending WM_SETFONT here makes them match dialog/Explorer appearance.
@@ -130,323 +107,6 @@ namespace {
         }
         return font;
     }
-
-    // Register (wnd, proc) pair, then attach/open/initialize. Returns wnd.
-    // ASSERT fires in debug on creation failure; returns nullptr on release.
-    template <class T>
-    T* finish_new_window(T* wnd, BOOL created,
-                         CWnd* parent, int x0, int y0, int x1, int y1,
-                         const char* file, int line,
-                         const char* init) {
-        ASSERT(created);
-        if (!created) {
-            delete wnd;
-            return nullptr;
-        }
-        ::SendMessageW(wnd->m_hWnd, WM_SETFONT,
-                       reinterpret_cast<WPARAM>(default_ui_font()), FALSE);
-        ensure_cleanup_guard();
-        cLayOut* p = new cLayOut;
-        new_window_registry().push_back({ wnd, p });
-        p->attach(wnd);
-        p->open(x0, y0, x1, y1, file, line);
-        p->initialize(init);
-        return wnd;
-    }
-}
-
-// cLayOutZone: container child window with COLOR_BTNFACE background.
-// Created via RegisterClassExW + CreateWindowExW + SubclassWindow so that
-// MFC's OnNcDestroy fires and clears m_hWnd, preventing a double-destroy in
-// ~CWnd() when DeleteLayOutWindows() calls DestroyWindow() then delete.
-// PostNcDestroy is a no-op because DeleteLayOutWindows manages the lifetime.
-// WS_EX_CONTROLPARENT lets Tab navigate through the Zone's child controls.
-class cLayOutZone : public CWnd {
-public:
-    BOOL CreateZone(CWnd* parent, UINT id, int x0, int y0, int x1, int y1) {
-        static bool done = false;
-        if (!done) {
-            WNDCLASSEXW wc = { sizeof(wc) };
-            wc.style         = CS_HREDRAW | CS_VREDRAW;
-            wc.lpfnWndProc   = ::DefWindowProcW;
-            wc.hInstance     = ::GetModuleHandleW(NULL);
-            wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
-            wc.hCursor       = ::LoadCursorW(NULL, (LPCWSTR)IDC_ARROW);
-            wc.lpszClassName = L"cLayOutZone";
-            ::RegisterClassExW(&wc);
-            done = true;
-        }
-        HWND hw = ::CreateWindowExW(
-            WS_EX_CONTROLPARENT, L"cLayOutZone", nullptr,
-            WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_CLIPCHILDREN,
-            x0, y0, x1 - x0, y1 - y0,
-            parent->GetSafeHwnd(), (HMENU)(UINT_PTR)id,
-            ::GetModuleHandleW(NULL), nullptr);
-        if (!hw) return FALSE;
-        // Replace DefWindowProcW with AfxWndProc so MFC routes WM_NCDESTROY
-        // through CWnd::OnNcDestroy, which clears m_hWnd cleanly.
-        SubclassWindow(hw);
-        return TRUE;
-    }
-    virtual void PostNcDestroy() override {}   // lifetime managed by DeleteLayOutWindows
-protected:
-    afx_msg BOOL OnEraseBkgnd(CDC* pDC) {
-        CRect rc; GetClientRect(&rc);
-        pDC->FillSolidRect(&rc, ::GetSysColor(COLOR_BTNFACE));
-        return TRUE;
-    }
-    DECLARE_MESSAGE_MAP()
-};
-BEGIN_MESSAGE_MAP(cLayOutZone, CWnd)
-    ON_WM_ERASEBKGND()
-END_MESSAGE_MAP()
-
-CButton* LayOutButton(CWnd* parent, int x0, int y0, int x1, int y1,
-                   const char* file, int line, const char* init) {
-    CButton* w = new CButton;
-    BOOL ok = w->Create(nullptr, WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
-                        CRect(x0, y0, x1, y1), parent, allocate_new_window_id());
-    return finish_new_window(w, ok, parent, x0, y0, x1, y1, file, line, init);
-}
-
-CEdit* LayOutEdit(CWnd* parent, int x0, int y0, int x1, int y1,
-               const char* file, int line, const char* init) {
-    CEdit* w = new CEdit;
-    // ES_MULTILINE: enables SetRect() for vertical alignment (EM_SETRECT is
-    // ignored on single-line edits). ES_WANTRETURN is NOT set so Enter still
-    // routes to the default button; ES_AUTOHSCROLL is replaced by ES_AUTOVSCROLL.
-    BOOL ok = w->Create(WS_CHILD | WS_VISIBLE | WS_BORDER | ES_MULTILINE | ES_AUTOVSCROLL | WS_TABSTOP,
-                        CRect(x0, y0, x1, y1), parent, allocate_new_window_id());
-    return finish_new_window(w, ok, parent, x0, y0, x1, y1, file, line, init);
-}
-
-CStatic* LayOutStatic(CWnd* parent, int x0, int y0, int x1, int y1,
-                   const char* file, int line, const char* init) {
-    CStatic* w = new CStatic;
-    // SS_LEFT: left-align text; SS_CENTERIMAGE: vertically center text
-    BOOL ok = w->Create(nullptr, WS_CHILD | WS_VISIBLE | SS_LEFT | SS_CENTERIMAGE | SS_NOTIFY,
-                        CRect(x0, y0, x1, y1), parent, allocate_new_window_id());
-    return finish_new_window(w, ok, parent, x0, y0, x1, y1, file, line, init);
-}
-
-CComboBox* LayOutCombo(CWnd* parent, int x0, int y0, int x1, int y1,
-                    const char* file, int line, const char* init) {
-    CComboBox* w = new CComboBox;
-    BOOL ok = w->Create(WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP,
-                        CRect(x0, y0, x1, y1), parent, allocate_new_window_id());
-    return finish_new_window(w, ok, parent, x0, y0, x1, y1, file, line, init);
-}
-
-CListBox* LayOutList(CWnd* parent, int x0, int y0, int x1, int y1,
-                  const char* file, int line, const char* init) {
-    CListBox* w = new CListBox;
-    BOOL ok = w->Create(WS_CHILD | WS_VISIBLE | WS_BORDER | LBS_NOTIFY | WS_VSCROLL |
-                        WS_TABSTOP, CRect(x0, y0, x1, y1), parent,
-                        allocate_new_window_id());
-    return finish_new_window(w, ok, parent, x0, y0, x1, y1, file, line, init);
-}
-
-CRichEditCtrl* LayOutRichEdit(CWnd* parent, int x0, int y0, int x1, int y1,
-                           const char* file, int line, const char* init) {
-    AfxInitRichEdit2();
-    CRichEditCtrl* w = new CRichEditCtrl;
-    BOOL ok = w->Create(WS_CHILD | WS_VISIBLE | WS_BORDER | ES_MULTILINE |
-                        ES_AUTOVSCROLL | ES_AUTOHSCROLL | WS_VSCROLL |
-                        WS_TABSTOP, CRect(x0, y0, x1, y1), parent,
-                        allocate_new_window_id());
-    return finish_new_window(w, ok, parent, x0, y0, x1, y1, file, line, init);
-}
-
-CListCtrl* LayOutListCtrl(CWnd* parent, int x0, int y0, int x1, int y1,
-                       const char* file, int line, const char* init) {
-    CListCtrl* w = new CListCtrl;
-    BOOL ok = w->Create(WS_CHILD | WS_VISIBLE | WS_BORDER | LVS_REPORT | LVS_SINGLESEL |
-                        WS_TABSTOP, CRect(x0, y0, x1, y1), parent,
-                        allocate_new_window_id());
-    return finish_new_window(w, ok, parent, x0, y0, x1, y1, file, line, init);
-}
-
-CTreeCtrl* LayOutTreeCtrl(CWnd* parent, int x0, int y0, int x1, int y1,
-                       const char* file, int line, const char* init) {
-    CTreeCtrl* w = new CTreeCtrl;
-    BOOL ok = w->Create(WS_CHILD | WS_VISIBLE | WS_BORDER | TVS_HASBUTTONS |
-                        TVS_HASLINES | TVS_LINESATROOT | WS_TABSTOP,
-                        CRect(x0, y0, x1, y1), parent, allocate_new_window_id());
-    return finish_new_window(w, ok, parent, x0, y0, x1, y1, file, line, init);
-}
-
-CTabCtrl* LayOutTabCtrl(CWnd* parent, int x0, int y0, int x1, int y1,
-                     const char* file, int line, const char* init) {
-    CTabCtrl* w = new CTabCtrl;
-    BOOL ok = w->Create(WS_CHILD | WS_VISIBLE | TCS_TABS | WS_TABSTOP,
-                        CRect(x0, y0, x1, y1), parent, allocate_new_window_id());
-    return finish_new_window(w, ok, parent, x0, y0, x1, y1, file, line, init);
-}
-
-CDateTimeCtrl* LayOutDateTime(CWnd* parent, int x0, int y0, int x1, int y1,
-                           const char* file, int line, const char* init) {
-    CDateTimeCtrl* w = new CDateTimeCtrl;
-    BOOL ok = w->Create(WS_CHILD | WS_VISIBLE | DTS_SHORTDATEFORMAT | WS_TABSTOP,
-                        CRect(x0, y0, x1, y1), parent, allocate_new_window_id());
-    return finish_new_window(w, ok, parent, x0, y0, x1, y1, file, line, init);
-}
-
-CMonthCalCtrl* LayOutMonthCal(CWnd* parent, int x0, int y0, int x1, int y1,
-                           const char* file, int line, const char* init) {
-    CMonthCalCtrl* w = new CMonthCalCtrl;
-    BOOL ok = w->Create(WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP,
-                        CRect(x0, y0, x1, y1), parent, allocate_new_window_id());
-    return finish_new_window(w, ok, parent, x0, y0, x1, y1, file, line, init);
-}
-
-CSpinButtonCtrl* LayOutSpin(CWnd* parent, int x0, int y0, int x1, int y1,
-                         const char* file, int line, const char* init) {
-    CSpinButtonCtrl* w = new CSpinButtonCtrl;
-    BOOL ok = w->Create(WS_CHILD | WS_VISIBLE | UDS_ARROWKEYS | UDS_SETBUDDYINT |
-                        WS_TABSTOP, CRect(x0, y0, x1, y1), parent,
-                        allocate_new_window_id());
-    return finish_new_window(w, ok, parent, x0, y0, x1, y1, file, line, init);
-}
-
-CSliderCtrl* LayOutSlider(CWnd* parent, int x0, int y0, int x1, int y1,
-                       const char* file, int line, const char* init) {
-    CSliderCtrl* w = new CSliderCtrl;
-    BOOL ok = w->Create(WS_CHILD | WS_VISIBLE | TBS_AUTOTICKS | WS_TABSTOP,
-                        CRect(x0, y0, x1, y1), parent, allocate_new_window_id());
-    return finish_new_window(w, ok, parent, x0, y0, x1, y1, file, line, init);
-}
-
-CScrollBar* LayOutScrollBar(CWnd* parent, int x0, int y0, int x1, int y1,
-                         const char* file, int line, const char* init) {
-    CScrollBar* w = new CScrollBar;
-    BOOL ok = w->Create(WS_CHILD | WS_VISIBLE | SBS_HORZ, CRect(x0, y0, x1, y1), parent,
-                        allocate_new_window_id());
-    return finish_new_window(w, ok, parent, x0, y0, x1, y1, file, line, init);
-}
-
-CIPAddressCtrl* LayOutIPAddress(CWnd* parent, int x0, int y0, int x1, int y1,
-                             const char* file, int line, const char* init) {
-    CIPAddressCtrl* w = new CIPAddressCtrl;
-    BOOL ok = w->Create(WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP,
-                        CRect(x0, y0, x1, y1), parent, allocate_new_window_id());
-    return finish_new_window(w, ok, parent, x0, y0, x1, y1, file, line, init);
-}
-
-CHotKeyCtrl* LayOutHotKey(CWnd* parent, int x0, int y0, int x1, int y1,
-                       const char* file, int line, const char* init) {
-    CHotKeyCtrl* w = new CHotKeyCtrl;
-    BOOL ok = w->Create(WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP,
-                        CRect(x0, y0, x1, y1), parent, allocate_new_window_id());
-    return finish_new_window(w, ok, parent, x0, y0, x1, y1, file, line, init);
-}
-
-CProgressCtrl* LayOutProgress(CWnd* parent, int x0, int y0, int x1, int y1,
-                           const char* file, int line, const char* init) {
-    CProgressCtrl* w = new CProgressCtrl;
-    BOOL ok = w->Create(WS_CHILD | WS_VISIBLE | PBS_SMOOTH, CRect(x0, y0, x1, y1), parent,
-                        allocate_new_window_id());
-    return finish_new_window(w, ok, parent, x0, y0, x1, y1, file, line, init);
-}
-
-CStatusBarCtrl* LayOutStatus(CWnd* parent, int x0, int y0, int x1, int y1,
-                          const char* file, int line, const char* init) {
-    CStatusBarCtrl* w = new CStatusBarCtrl;
-    BOOL ok = w->Create(WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP, CRect(x0, y0, x1, y1), parent,
-                        allocate_new_window_id());
-    return finish_new_window(w, ok, parent, x0, y0, x1, y1, file, line, init);
-}
-
-CHeaderCtrl* LayOutHeader(CWnd* parent, int x0, int y0, int x1, int y1,
-                       const char* file, int line, const char* init) {
-    CHeaderCtrl* w = new CHeaderCtrl;
-    BOOL ok = w->Create(WS_CHILD | WS_VISIBLE | HDS_BUTTONS | HDS_HORZ,
-                        CRect(x0, y0, x1, y1), parent, allocate_new_window_id());
-    return finish_new_window(w, ok, parent, x0, y0, x1, y1, file, line, init);
-}
-
-cModalFrame* LayOutModal(CWnd* parent, int x0, int y0, int x1, int y1,
-                      const char* file, int line) {
-    cModalFrame* w = new cModalFrame;
-    // open() creates+shows only; finish_new_window registers { w, p } and
-    // p subclasses the frame, so the frame itself is live-editable.
-    BOOL ok = w->open(parent, x0, y0, x1, y1);
-    return finish_new_window(w, ok, parent, x0, y0, x1, y1, file, line, nullptr);
-}
-
-CWnd* LayOutZone(CWnd* parent, int x0, int y0, int x1, int y1,
-                 const char* file, int line) {
-    cLayOutZone* w = new cLayOutZone;
-    BOOL ok = w->CreateZone(parent, static_cast<UINT>(allocate_new_window_id()),
-                            x0, y0, x1, y1);
-    return finish_new_window(w, ok, parent, x0, y0, x1, y1, file, line, nullptr);
-}
-
-// Borrowed attach: registry stores only the cLayOut, caller owns the CWnd.
-// Prefer LayOutNew for windows you create for the UI; use this only for a window whose
-// lifetime is managed elsewhere, and NEVER a global/static object (deferred destruction
-// past the leak snapshot -> phantom empty-dump leak).
-CWnd* LayOutAsItIs(CWnd* self, int x0, int y0, int x1, int y1,
-                   const char* file, int line) {
-    ensure_cleanup_guard();
-    cLayOut* p = new cLayOut;
-    // wnd=nullptr: registry owns only the cLayOut; caller owns the CWnd.
-    new_window_registry().push_back({ nullptr, p });
-    p->attach(self);
-    if (x0 == 0 && y0 == 0 && x1 == 0 && y1 == 0) {
-        // (0,0,0,0): attach-only mode. Read current rect so last_rect is valid for ESC restore.
-        CRect rc;
-        self->GetWindowRect(&rc);
-        CWnd* par = self->GetParent();
-        if (par) par->ScreenToClient(&rc);
-        p->open(rc.left, rc.top, rc.right, rc.bottom, file, line);
-    } else {
-        p->open(x0, y0, x1, y1, file, line);
-        self->MoveWindow(CRect(x0, y0, x1, y1));
-    }
-    // cModalFrame::open(parent) creates hidden; no-op if already visible.
-    self->ShowWindow(SW_SHOW);
-    return self;
-}
-
-// Same as LayOutAsItIs but the registry OWNS the new'd window: { self, p } instead of
-// { nullptr, p }. DeleteLayOutWindows() then DestroyWindow()s and deletes it, so a
-// heap-allocated external CWnd (e.g. new cConBox) is fully torn down inside the host loop,
-// freeing its STL members before the CRT leak snapshot at exit (no phantom empty dump).
-CWnd* LayOutNew(CWnd* self, int x0, int y0, int x1, int y1,
-                const char* file, int line) {
-    ensure_cleanup_guard();
-    cLayOut* p = new cLayOut;
-    new_window_registry().push_back({ self, p });   // { self, ... }: registry owns the CWnd
-    p->attach(self);
-    if (x0 == 0 && y0 == 0 && x1 == 0 && y1 == 0) {
-        // (0,0,0,0): attach-only mode. Read current rect so last_rect is valid for ESC restore.
-        CRect rc;
-        self->GetWindowRect(&rc);
-        CWnd* par = self->GetParent();
-        if (par) par->ScreenToClient(&rc);
-        p->open(rc.left, rc.top, rc.right, rc.bottom, file, line);
-    } else {
-        p->open(x0, y0, x1, y1, file, line);
-        self->MoveWindow(CRect(x0, y0, x1, y1));
-    }
-    self->ShowWindow(SW_SHOW);
-    return self;
-}
-
-void DeleteLayOutWindows() {
-    std::vector<NewWindowEntry>& list = new_window_registry();
-    for (int i = static_cast<int>(list.size()) - 1; i >= 0; i--) {
-        NewWindowEntry& e = list[static_cast<size_t>(i)];
-        delete e.layout;   // removes subclass before HWND is destroyed
-        if (e.wnd) {
-            if (e.wnd->m_hWnd && ::IsWindow(e.wnd->m_hWnd))
-                e.wnd->DestroyWindow();
-            delete e.wnd;
-        }
-    }
-    list.clear();
-    list.shrink_to_fit();   // release internal buffer so the CRT leak checker is silent
-    next_new_window_id() = NEW_WINDOW_FIRST_ID;
 }
 
 // Convert a UTF-8 string to a std::wstring for Windows API calls.
@@ -458,7 +118,7 @@ static std::wstring utf8_to_wide(const char* s) {
     return w;
 }
 
-void cLayOut::initialize(const char* init) {
+void Parasite::initialize(const char* init) {
     if (!init || !target || !::IsWindow(target->m_hWnd)) return;
 
     wchar_t cls[64] = {};
@@ -622,7 +282,7 @@ namespace {
                                  SIG_CODE(HDN_ITEMDBLCLICK) };
 
     // Add a row to support a new control type. The host must reflect the
-    // matching command/notify/scroll code as WM_EVOL_CALLBACK lParam.
+    // matching command/notify/scroll code as WM_PARASITE_CALLBACK lParam.
     const LAYOUT_SIGMAP signal_map[] = {
         { L"Button",             sig_button,   _countof(sig_button)   },
         { L"Edit",               sig_edit,     _countof(sig_edit)     },
@@ -651,11 +311,11 @@ namespace {
 #undef SIG_CODE
 }
 
-void cLayOut::clear_signal_codes() {
+void Parasite::clear_signal_codes() {
     signal_count = 0;
 }
 
-bool cLayOut::add_signal_code(int code) {
+bool Parasite::add_signal_code(int code) {
     if (code == -1) return true;
     if (has_signal_code(code)) return true;
     if (signal_count >= MAX_SIGNAL_CODES) return false;
@@ -663,24 +323,24 @@ bool cLayOut::add_signal_code(int code) {
     return true;
 }
 
-void cLayOut::set_signal_code(int code) {
+void Parasite::set_signal_code(int code) {
     clear_signal_codes();
     if (code != -1) add_signal_code(code);
 }
 
-void cLayOut::set_signal_codes(const int* codes, int count) {
+void Parasite::set_signal_codes(const int* codes, int count) {
     clear_signal_codes();
     if (!codes || count <= 0) return;
     for (int i = 0; i < count; i++) add_signal_code(codes[i]);
 }
 
-bool cLayOut::has_signal_code(int code) const {
+bool Parasite::has_signal_code(int code) const {
     for (int i = 0; i < signal_count; i++)
         if (signal_codes[i] == code) return true;
     return false;
 }
 
-void cLayOut::set_default_signal_codes(const wchar_t* cls) {
+void Parasite::set_default_signal_codes(const wchar_t* cls) {
     clear_signal_codes();
     for (const LAYOUT_SIGMAP& e : signal_map) {
         if (_wcsicmp(cls, e.cls) == 0) {
@@ -690,7 +350,7 @@ void cLayOut::set_default_signal_codes(const wchar_t* cls) {
     }
 }
 
-bool cLayOut::open(int x0, int y0, int x1, int y1,
+bool Parasite::layout(int x0, int y0, int x1, int y1,
                         const char* f, int ln) {
     if (!target || !::IsWindow(target->m_hWnd)) return false;
 
@@ -739,19 +399,19 @@ static HCURSOR cursor_for_zone(int zone) {
 }
 #endif
 
-LRESULT CALLBACK cLayOut::proc(HWND hWnd, UINT msg, WPARAM wParam,
+LRESULT CALLBACK Parasite::proc(HWND hWnd, UINT msg, WPARAM wParam,
                                         LPARAM lParam, UINT_PTR, DWORD_PTR ref) {
-    cLayOut* self = reinterpret_cast<cLayOut*>(ref);
+    Parasite* self = reinterpret_cast<Parasite*>(ref);
     return self->dispatch(hWnd, msg, wParam, lParam);
 }
 
-LRESULT cLayOut::dispatch(HWND h, UINT msg, WPARAM w, LPARAM l) {
+LRESULT Parasite::dispatch(HWND h, UINT msg, WPARAM w, LPARAM l) {
     // -- signal protocol (works in both normal and edit mode) --
     switch (msg) {
-    case WM_EVOL_SURVEIL:
+    case WM_PARASITE_SURVEIL:
         report = reinterpret_cast<CWnd*>(w);   // host pointer, or 0 to clear
         return reinterpret_cast<LRESULT>(target);
-    case WM_EVOL_CALLBACK:
+    case WM_PARASITE_CALLBACK:
         if (has_signal_code(static_cast<int>(l))) signal();
         return 0;
     case WM_NCDESTROY: {
@@ -858,14 +518,14 @@ LRESULT cLayOut::dispatch(HWND h, UINT msg, WPARAM w, LPARAM l) {
 // ======================================================================
 #if defined(_DEBUG)
 
-void cLayOut::toggle_edit(HWND h) {
+void Parasite::toggle_edit(HWND h) {
     if (editing) leave_edit(h, false);        // middle-click exit: no commit
     else          enter_edit(h);
 }
 
-void cLayOut::enter_edit(HWND h) {
+void Parasite::enter_edit(HWND h) {
     if (active() && active() != this) {        // drop the previous active one
-        cLayOut* prev = active();
+        Parasite* prev = active();
         if (prev->target) prev->leave_edit(prev->target->m_hWnd, false);
     }
     editing = true;
@@ -874,7 +534,7 @@ void cLayOut::enter_edit(HWND h) {
     paint_frame(h);
 }
 
-void cLayOut::leave_edit(HWND h, bool commit) {
+void Parasite::leave_edit(HWND h, bool commit) {
     editing = false;
     if (active() == this) active() = nullptr;
 
@@ -904,7 +564,7 @@ void cLayOut::leave_edit(HWND h, bool commit) {
     ::InvalidateRect(h, NULL, TRUE);
 }
 
-void cLayOut::on_key(HWND h, UINT vk) {
+void Parasite::on_key(HWND h, UINT vk) {
     if (vk == VK_RETURN) {
         leave_edit(h, true);
         // TranslateMessage already posted WM_CHAR '\r' before DispatchMessage ran this
@@ -954,7 +614,7 @@ void cLayOut::on_key(HWND h, UINT vk) {
     paint_frame(h);
 }
 
-void cLayOut::on_drag(HWND h, LPARAM l) {
+void Parasite::on_drag(HWND h, LPARAM l) {
     bool is_child = (::GetWindowLongW(h, GWL_STYLE) & WS_CHILD) != 0;
 
     CPoint mouse(GET_X_LPARAM(l), GET_Y_LPARAM(l));
@@ -975,7 +635,7 @@ void cLayOut::on_drag(HWND h, LPARAM l) {
     ::SetCapture(h);
 }
 
-void cLayOut::paint_frame(HWND h) {
+void Parasite::paint_frame(HWND h) {
     CWnd* w = CWnd::FromHandle(h);
     CClientDC dc(w);
     CRect rc;
@@ -985,7 +645,7 @@ void cLayOut::paint_frame(HWND h) {
     dc.FrameRect(&rc, &red);
 }
 
-void cLayOut::get_rect(HWND h, CRect& out) {
+void Parasite::get_rect(HWND h, CRect& out) {
     ::GetWindowRect(h, &out);                  // screen coords
     HWND parent = ::GetParent(h);
     if (parent)                                // -> parent client coords
@@ -998,9 +658,9 @@ void cLayOut::get_rect(HWND h, CRect& out) {
 // [SIGNAL]
 // ======================================================================
 
-void cLayOut::signal() {
+void Parasite::signal() {
     if (report && ::IsWindow(report->m_hWnd))
-        ::PostMessage(report->m_hWnd, WM_EVOL_REPORT,
+        ::PostMessage(report->m_hWnd, WM_PARASITE_REPORT,
                       reinterpret_cast<WPARAM>(target), 0);
 }
 
@@ -1036,7 +696,7 @@ static const char* find_char(int ch, const char* line) {
 static void rewrite_error(const char* msg, const char* file, int line) {
     wchar_t buff[512];
     swprintf_s(buff, _countof(buff), L"%S\n file: %S\n line: %d", msg, file, line);
-    ::MessageBoxW(nullptr, buff, L"cLayOut rewrite error", MB_OK | MB_ICONERROR);
+    ::MessageBoxW(nullptr, buff, L"Parasite rewrite error", MB_OK | MB_ICONERROR);
 }
 
 bool LayOutRewrite(const char* file, int line, const RECT& rect) {
@@ -1074,29 +734,37 @@ bool LayOutRewrite(const char* file, int line, const RECT& rect) {
     for (int n = 1; fgets(buff, sizeof(buff), src) != 0; n++) {
         if (n != line) { fputs(buff, dst); continue; }
 
-        // Find "LayOut(" and skip 2 leading commas (Type, parent) before the coords.
-        const char* tok = strstr(buff, "LayOut(");
-        const char* lp  = tok ? find_char('(', tok) : nullptr;
+        // Anchor on a member-call macro: `obj->Xxx(` or `obj.Xxx(` whose
+        // identifier starts uppercase (Add*/Open) and whose first argument is an
+        // integer literal. Coordinates are ALWAYS the first four arguments, so
+        // rewrite them in place and preserve the tail (init string or wnd ptr).
+        const char* lp = nullptr;
+        for (const char* p = buff; *p; p++) {
+            const char* id = (p[0] == '-' && p[1] == '>') ? p + 2
+                           : (p[0] == '.')                ? p + 1 : nullptr;
+            if (!id || !(*id >= 'A' && *id <= 'Z')) continue;
+            const char* q = id;
+            while ((*q >= 'A' && *q <= 'Z') || (*q >= 'a' && *q <= 'z') ||
+                   (*q >= '0' && *q <= '9') || *q == '_') q++;
+            while (*q == ' ' || *q == '\t') q++;
+            if (*q != '(') continue;
+            const char* a = q + 1;
+            while (*a == ' ' || *a == '\t') a++;
+            if (*a == '-' || (*a >= '0' && *a <= '9')) { lp = q; break; }
+        }
 
-        const char* sep = lp;
-        for (int k = 0; k < 2 && sep; k++)
-            sep = find_char(',', sep + 1);
-        const char* c_par = sep;   // comma right after the last skipped arg
+        // From '(', step past x0,y0,x1 (3 top-level commas); rp is the closing paren.
+        const char* c3 = lp ? find_char(',', lp + 1) : nullptr;
+        const char* c4 = c3 ? find_char(',', c3 + 1) : nullptr;
+        const char* c5 = c4 ? find_char(',', c4 + 1) : nullptr;
+        const char* c6 = c5 ? find_char(',', c5 + 1) : nullptr;   // comma before a 5th arg, if any
+        const char* rp = lp ? find_char(')', lp + 1) : nullptr;
+        const char* tail = (c6 && c6 < rp) ? c6 : rp;             // ", extra)" or just ")"
 
-        // Find 3 more commas to step past x0, y0, x1 (landing after x1 -> y1).
-        const char* c3 = c_par ? find_char(',', c_par + 1) : nullptr;
-        const char* c4 = c3   ? find_char(',', c3   + 1) : nullptr;
-        const char* c5 = c4   ? find_char(',', c4   + 1) : nullptr;
-        // Optional extra arg after y1 (e.g. init string).
-        const char* c6 = c5   ? find_char(',', c5   + 1) : nullptr;
-        const char* rp = lp   ? find_char(')', lp   + 1) : nullptr;
-        // tail: everything after y1's value (", extra)" or just ")").
-        const char* tail = (c6 && c6 < rp) ? c6 : rp;
-
-        if (tok && c_par && c5 && rp && c_par < c5 && c5 < rp) {
+        if (lp && c5 && rp && c5 < rp) {
             const char* s;
-            for (s = buff; s <= c_par; s++) putc(*s, dst);
-            fprintf(dst, " %d, %d, %d, %d",
+            for (s = buff; s <= lp; s++) putc(*s, dst);           // copy through '('
+            fprintf(dst, "%d, %d, %d, %d",
                     (int)rect.left, (int)rect.top, (int)rect.right, (int)rect.bottom);
             for (s = tail; *s != 0; s++) putc(*s, dst);
         }
@@ -1114,58 +782,307 @@ bool LayOutRewrite(const char* file, int line, const RECT& rect) {
 #endif // _DEBUG
 
 // ======================================================================
-// [HOST]   cModalFrame -- surveil/listen/report host implementation
+// [HOST]   FrameBox -- CWnd host: per-frame registry + surveil/listen/report
 // ======================================================================
 
-BEGIN_MESSAGE_MAP(cModalFrame, CFrameWnd)
+BEGIN_MESSAGE_MAP(FrameBox, CWnd)
 END_MESSAGE_MAP()
 
 static const UINT_PTR MODAL_TIMER_ID = 1;
 
-cModalFrame::cModalFrame() : waiting(false), timer_fired(false), event(nullptr), timer_id(0) {
+FrameBox::FrameBox()
+    : next_id(1001), app(nullptr), self_layout(nullptr),
+      waiting(false), timer_fired(false), event(nullptr), timer_id(0) {
 }
 
-// ESC and Enter are consumed in BOTH normal and edit mode (CDialog-like behaviour).
-// TRAP: the editing_hwnd() guard does NOT restrict this to edit mode -- it only yields
-// to the cLayOut subclass proc when a control is actively being repositioned (so Enter
-// commits and ESC cancels the drag). In normal mode both keys are still always consumed,
-// EXCEPT when the focused window returns DLGC_WANTALLKEYS (e.g. cConBox terminal widget).
-BOOL cModalFrame::PreTranslateMessage(MSG* pMsg) {
-    if (pMsg->message == WM_KEYDOWN) {
-        // Yield to cLayOut only when the message target is the editing window.
-        if (cLayOut::editing_hwnd() == pMsg->hwnd) return FALSE;
-        // If the focused window claims all keys (e.g. ConBox terminal), let it handle
-        // Esc/Enter directly instead of consuming them here.
-        CWnd* focus = GetFocus();
-        if (focus && (focus->SendMessage(WM_GETDLGCODE) & DLGC_WANTALLKEYS))
-            return CFrameWnd::PreTranslateMessage(pMsg);
-        if (pMsg->wParam == VK_ESCAPE) {
-            PostMessage(WM_CLOSE);
-            return TRUE;
-        }
-        if (pMsg->wParam == VK_RETURN) {
-            CWnd* focus = GetFocus();
-            if (focus) {
-                wchar_t cls[32] = {};
-                ::GetClassNameW(focus->m_hWnd, cls, _countof(cls));
-                // Only a multiline edit WITH ES_WANTRETURN claims Enter
-                // for itself (newline). Without it, Enter routes to the button.
-                if (_wcsicmp(cls, L"Edit") == 0 &&
-                    (focus->GetStyle() & ES_MULTILINE) &&
-                    (focus->GetStyle() & ES_WANTRETURN))
-                    return CFrameWnd::PreTranslateMessage(pMsg);
-                // Push button: simulate click.
-                DWORD btype = focus->GetStyle() & 0x0F;
-                if (btype == BS_PUSHBUTTON || btype == BS_DEFPUSHBUTTON)
-                    focus->SendMessage(BM_CLICK);
-            }
-            return TRUE;  // always consume Enter so it never becomes WM_CHAR '\r'
+FrameBox::~FrameBox() { close(); }
+
+// Bind as the app main window. Cleared in close() before any teardown so a
+// later CWnd destruction can never leave a dangling m_pMainWnd.
+void FrameBox::attach(CWinApp* a) {
+    app = a;
+    if (a) a->m_pMainWnd = this;
+}
+
+// Recursive teardown: children first (reverse registration order), then the
+// self-edit subclass, then this window. A child-frame entry's `delete e.wnd`
+// re-enters ~FrameBox to tear down grandchildren. Idempotent.
+void FrameBox::close() {
+    if (app) { app->m_pMainWnd = nullptr; app = nullptr; }
+    for (int i = static_cast<int>(registry.size()) - 1; i >= 0; i--) {
+        ChildEntry& e = registry[static_cast<size_t>(i)];
+        delete e.layout;                 // removes subclass (skips if HWND already gone)
+        if (e.wnd) {                     // owned: borrowed (add_asitis) entries have wnd==nullptr
+            if (e.wnd->m_hWnd && ::IsWindow(e.wnd->m_hWnd))
+                e.wnd->DestroyWindow();
+            delete e.wnd;
         }
     }
-    return CFrameWnd::PreTranslateMessage(pMsg);
+    registry.clear();
+    registry.shrink_to_fit();            // release buffer so the CRT leak checker stays silent
+    delete self_layout;
+    self_layout = nullptr;
+    if (::IsWindow(m_hWnd)) DestroyWindow();
 }
 
-int cModalFrame::timer(int period) {
+// Register the shared "FrameBox" window class once, then create the window via
+// the AfxHookWindowCreate path (full MFC message-map support, no SubclassWindow
+// side effects). Background is painted in WindowProc (WM_ERASEBKGND).
+bool FrameBox::create_window(DWORD exStyle, DWORD style, CWnd* parent, const CRect& rc) {
+    WNDCLASSEXW wc = {};
+    if (!::GetClassInfoExW(AfxGetInstanceHandle(), L"FrameBox", &wc)) {
+        wc.cbSize        = sizeof(wc);
+        wc.style         = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS; // DBLCLKS: edit-mode commit
+        wc.lpfnWndProc   = ::DefWindowProcW;
+        wc.hInstance     = AfxGetInstanceHandle();
+        wc.hCursor       = ::LoadCursorW(nullptr, (LPCWSTR)IDC_ARROW);
+        wc.lpszClassName = L"FrameBox";
+        ::RegisterClassExW(&wc);
+    }
+    AfxHookWindowCreate(this);
+    HWND hwnd = ::CreateWindowExW(exStyle, L"FrameBox", L"", style,
+        rc.left, rc.top, rc.Width(), rc.Height(),
+        parent ? parent->GetSafeHwnd() : nullptr, nullptr, AfxGetInstanceHandle(), nullptr);
+    if (!AfxUnhookWindowCreate())
+        PostNcDestroy();
+    return hwnd != nullptr;
+}
+
+// Root form: create a top-level window, position it, and attach a self-editing
+// Parasite so the frame's own rect is live-editable + source-rewritable.
+bool FrameBox::open(int x0, int y0, int x1, int y1, const char* file, int line) {
+    if (!::IsWindow(m_hWnd)) {
+        if (!create_window(0, WS_OVERLAPPEDWINDOW, nullptr, CRect(x0, y0, x1, y1)))
+            return false;
+    } else {
+        MoveWindow(x0, y0, x1 - x0, y1 - y0, TRUE);
+    }
+    if (!self_layout) {
+        self_layout = new Parasite;
+        self_layout->attach(this);
+        self_layout->layout(x0, y0, x1, y1, file, line);
+    }
+    ShowWindow(SW_SHOW);
+    return ::IsWindow(m_hWnd) != 0;
+}
+
+// ---- child-control factories ----------------------------------------------
+// finish_child: apply the UI font, attach a Parasite, register { wnd, Parasite }
+// in this frame's registry, then position + initialize. Mirrors the old
+// finish_new_window but targets the per-instance registry.
+template<class T>
+T* FrameBox::finish_child(T* wnd, BOOL ok, int x0, int y0, int x1, int y1,
+                          const char* f, int ln, const char* init) {
+    ASSERT(ok);
+    if (!ok) { delete wnd; return nullptr; }
+    ::SendMessageW(wnd->m_hWnd, WM_SETFONT,
+                   reinterpret_cast<WPARAM>(default_ui_font()), FALSE);
+    Parasite* p = new Parasite;
+    registry.push_back({ wnd, p });
+    p->attach(wnd);
+    p->layout(x0, y0, x1, y1, f, ln);
+    p->initialize(init);
+    return wnd;
+}
+
+CButton* FrameBox::add_button(int x0,int y0,int x1,int y1,const char* f,int ln,const char* init) {
+    CButton* w = new CButton;
+    BOOL ok = w->Create(nullptr, WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+                        CRect(x0,y0,x1,y1), this, alloc_id());
+    return finish_child(w, ok, x0,y0,x1,y1, f,ln, init);
+}
+
+CEdit* FrameBox::add_edit(int x0,int y0,int x1,int y1,const char* f,int ln,const char* init) {
+    CEdit* w = new CEdit;
+    // ES_MULTILINE: enables SetRect() for vertical alignment (EM_SETRECT is ignored
+    // on single-line edits). ES_WANTRETURN not set so Enter still routes to the button.
+    BOOL ok = w->Create(WS_CHILD | WS_VISIBLE | WS_BORDER | ES_MULTILINE | ES_AUTOVSCROLL | WS_TABSTOP,
+                        CRect(x0,y0,x1,y1), this, alloc_id());
+    return finish_child(w, ok, x0,y0,x1,y1, f,ln, init);
+}
+
+CStatic* FrameBox::add_static(int x0,int y0,int x1,int y1,const char* f,int ln,const char* init) {
+    CStatic* w = new CStatic;
+    BOOL ok = w->Create(nullptr, WS_CHILD | WS_VISIBLE | SS_LEFT | SS_CENTERIMAGE | SS_NOTIFY,
+                        CRect(x0,y0,x1,y1), this, alloc_id());
+    return finish_child(w, ok, x0,y0,x1,y1, f,ln, init);
+}
+
+CComboBox* FrameBox::add_combo(int x0,int y0,int x1,int y1,const char* f,int ln,const char* init) {
+    CComboBox* w = new CComboBox;
+    BOOL ok = w->Create(WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP,
+                        CRect(x0,y0,x1,y1), this, alloc_id());
+    return finish_child(w, ok, x0,y0,x1,y1, f,ln, init);
+}
+
+CListBox* FrameBox::add_list(int x0,int y0,int x1,int y1,const char* f,int ln,const char* init) {
+    CListBox* w = new CListBox;
+    BOOL ok = w->Create(WS_CHILD | WS_VISIBLE | WS_BORDER | LBS_NOTIFY | WS_VSCROLL | WS_TABSTOP,
+                        CRect(x0,y0,x1,y1), this, alloc_id());
+    return finish_child(w, ok, x0,y0,x1,y1, f,ln, init);
+}
+
+CRichEditCtrl* FrameBox::add_richedit(int x0,int y0,int x1,int y1,const char* f,int ln,const char* init) {
+    AfxInitRichEdit2();
+    CRichEditCtrl* w = new CRichEditCtrl;
+    BOOL ok = w->Create(WS_CHILD | WS_VISIBLE | WS_BORDER | ES_MULTILINE | ES_AUTOVSCROLL |
+                        ES_AUTOHSCROLL | WS_VSCROLL | WS_TABSTOP,
+                        CRect(x0,y0,x1,y1), this, alloc_id());
+    return finish_child(w, ok, x0,y0,x1,y1, f,ln, init);
+}
+
+CListCtrl* FrameBox::add_listctrl(int x0,int y0,int x1,int y1,const char* f,int ln,const char* init) {
+    CListCtrl* w = new CListCtrl;
+    BOOL ok = w->Create(WS_CHILD | WS_VISIBLE | WS_BORDER | LVS_REPORT | LVS_SINGLESEL | WS_TABSTOP,
+                        CRect(x0,y0,x1,y1), this, alloc_id());
+    return finish_child(w, ok, x0,y0,x1,y1, f,ln, init);
+}
+
+CTreeCtrl* FrameBox::add_treectrl(int x0,int y0,int x1,int y1,const char* f,int ln,const char* init) {
+    CTreeCtrl* w = new CTreeCtrl;
+    BOOL ok = w->Create(WS_CHILD | WS_VISIBLE | WS_BORDER | TVS_HASBUTTONS | TVS_HASLINES |
+                        TVS_LINESATROOT | WS_TABSTOP, CRect(x0,y0,x1,y1), this, alloc_id());
+    return finish_child(w, ok, x0,y0,x1,y1, f,ln, init);
+}
+
+CTabCtrl* FrameBox::add_tabctrl(int x0,int y0,int x1,int y1,const char* f,int ln,const char* init) {
+    CTabCtrl* w = new CTabCtrl;
+    BOOL ok = w->Create(WS_CHILD | WS_VISIBLE | TCS_TABS | WS_TABSTOP,
+                        CRect(x0,y0,x1,y1), this, alloc_id());
+    return finish_child(w, ok, x0,y0,x1,y1, f,ln, init);
+}
+
+CDateTimeCtrl* FrameBox::add_datetime(int x0,int y0,int x1,int y1,const char* f,int ln,const char* init) {
+    CDateTimeCtrl* w = new CDateTimeCtrl;
+    BOOL ok = w->Create(WS_CHILD | WS_VISIBLE | DTS_SHORTDATEFORMAT | WS_TABSTOP,
+                        CRect(x0,y0,x1,y1), this, alloc_id());
+    return finish_child(w, ok, x0,y0,x1,y1, f,ln, init);
+}
+
+CMonthCalCtrl* FrameBox::add_monthcal(int x0,int y0,int x1,int y1,const char* f,int ln,const char* init) {
+    CMonthCalCtrl* w = new CMonthCalCtrl;
+    BOOL ok = w->Create(WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP,
+                        CRect(x0,y0,x1,y1), this, alloc_id());
+    return finish_child(w, ok, x0,y0,x1,y1, f,ln, init);
+}
+
+CSpinButtonCtrl* FrameBox::add_spin(int x0,int y0,int x1,int y1,const char* f,int ln,const char* init) {
+    CSpinButtonCtrl* w = new CSpinButtonCtrl;
+    BOOL ok = w->Create(WS_CHILD | WS_VISIBLE | UDS_ARROWKEYS | UDS_SETBUDDYINT | WS_TABSTOP,
+                        CRect(x0,y0,x1,y1), this, alloc_id());
+    return finish_child(w, ok, x0,y0,x1,y1, f,ln, init);
+}
+
+CSliderCtrl* FrameBox::add_slider(int x0,int y0,int x1,int y1,const char* f,int ln,const char* init) {
+    CSliderCtrl* w = new CSliderCtrl;
+    BOOL ok = w->Create(WS_CHILD | WS_VISIBLE | TBS_AUTOTICKS | WS_TABSTOP,
+                        CRect(x0,y0,x1,y1), this, alloc_id());
+    return finish_child(w, ok, x0,y0,x1,y1, f,ln, init);
+}
+
+CScrollBar* FrameBox::add_scrollbar(int x0,int y0,int x1,int y1,const char* f,int ln,const char* init) {
+    CScrollBar* w = new CScrollBar;
+    BOOL ok = w->Create(WS_CHILD | WS_VISIBLE | SBS_HORZ, CRect(x0,y0,x1,y1), this, alloc_id());
+    return finish_child(w, ok, x0,y0,x1,y1, f,ln, init);
+}
+
+CIPAddressCtrl* FrameBox::add_ipaddress(int x0,int y0,int x1,int y1,const char* f,int ln,const char* init) {
+    CIPAddressCtrl* w = new CIPAddressCtrl;
+    BOOL ok = w->Create(WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP,
+                        CRect(x0,y0,x1,y1), this, alloc_id());
+    return finish_child(w, ok, x0,y0,x1,y1, f,ln, init);
+}
+
+CHotKeyCtrl* FrameBox::add_hotkey(int x0,int y0,int x1,int y1,const char* f,int ln,const char* init) {
+    CHotKeyCtrl* w = new CHotKeyCtrl;
+    BOOL ok = w->Create(WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP,
+                        CRect(x0,y0,x1,y1), this, alloc_id());
+    return finish_child(w, ok, x0,y0,x1,y1, f,ln, init);
+}
+
+CProgressCtrl* FrameBox::add_progress(int x0,int y0,int x1,int y1,const char* f,int ln,const char* init) {
+    CProgressCtrl* w = new CProgressCtrl;
+    BOOL ok = w->Create(WS_CHILD | WS_VISIBLE | PBS_SMOOTH, CRect(x0,y0,x1,y1), this, alloc_id());
+    return finish_child(w, ok, x0,y0,x1,y1, f,ln, init);
+}
+
+CStatusBarCtrl* FrameBox::add_status(int x0,int y0,int x1,int y1,const char* f,int ln,const char* init) {
+    CStatusBarCtrl* w = new CStatusBarCtrl;
+    BOOL ok = w->Create(WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP, CRect(x0,y0,x1,y1), this, alloc_id());
+    return finish_child(w, ok, x0,y0,x1,y1, f,ln, init);
+}
+
+CHeaderCtrl* FrameBox::add_header(int x0,int y0,int x1,int y1,const char* f,int ln,const char* init) {
+    CHeaderCtrl* w = new CHeaderCtrl;
+    BOOL ok = w->Create(WS_CHILD | WS_VISIBLE | HDS_BUTTONS | HDS_HORZ,
+                        CRect(x0,y0,x1,y1), this, alloc_id());
+    return finish_child(w, ok, x0,y0,x1,y1, f,ln, init);
+}
+
+// ---- container child frames ------------------------------------------------
+// Create a child FrameBox, attach a Parasite for live editing, and register
+// { child, layout } so close() destroys it recursively.
+FrameBox* FrameBox::make_child(DWORD exStyle, DWORD style,
+                               int x0,int y0,int x1,int y1,const char* f,int ln) {
+    FrameBox* child = new FrameBox;
+    if (!child->create_window(exStyle, style, this, CRect(x0,y0,x1,y1))) {
+        delete child;
+        return nullptr;
+    }
+    Parasite* p = new Parasite;
+    registry.push_back({ child, p });
+    p->attach(child);
+    p->layout(x0, y0, x1, y1, f, ln);
+    child->ShowWindow(SW_SHOW);
+    return child;
+}
+
+FrameBox* FrameBox::add_zone(int x0,int y0,int x1,int y1,const char* f,int ln) {
+    // WS_EX_CONTROLPARENT lets Tab navigate the zone's child controls.
+    return make_child(WS_EX_CONTROLPARENT,
+                      WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_CLIPCHILDREN,
+                      x0,y0,x1,y1, f,ln);
+}
+
+FrameBox* FrameBox::add_frame(int x0,int y0,int x1,int y1,const char* f,int ln) {
+    // Separate top-level-style window owned by this frame. For a true-modal use,
+    // the caller disables this frame (EnableWindow(this,FALSE)) around the child's listen().
+    return make_child(0,
+                      WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_CLIPSIBLINGS | WS_CLIPCHILDREN,
+                      x0,y0,x1,y1, f,ln);
+}
+
+// ---- external already-created window attach --------------------------------
+CWnd* FrameBox::attach_external(CWnd* wnd, bool owned,
+                                int x0,int y0,int x1,int y1,const char* f,int ln) {
+    Parasite* p = new Parasite;
+    registry.push_back({ owned ? wnd : nullptr, p });   // borrowed entries store wnd==nullptr
+    p->attach(wnd);
+    if (x0 == 0 && y0 == 0 && x1 == 0 && y1 == 0) {
+        // attach-only: read current rect so last_rect is valid for ESC restore.
+        CRect rc;
+        wnd->GetWindowRect(&rc);
+        CWnd* par = wnd->GetParent();
+        if (par) par->ScreenToClient(&rc);
+        p->layout(rc.left, rc.top, rc.right, rc.bottom, f, ln);
+    } else {
+        p->layout(x0, y0, x1, y1, f, ln);
+        wnd->MoveWindow(CRect(x0,y0,x1,y1));
+    }
+    wnd->ShowWindow(SW_SHOW);
+    return wnd;
+}
+
+CWnd* FrameBox::add_new(int x0,int y0,int x1,int y1,const char* f,int ln, CWnd* wnd) {
+    return attach_external(wnd, true, x0,y0,x1,y1, f,ln);
+}
+
+CWnd* FrameBox::add_asitis(int x0,int y0,int x1,int y1,const char* f,int ln, CWnd* wnd) {
+    return attach_external(wnd, false, x0,y0,x1,y1, f,ln);
+}
+
+// ---- listen / surveil / message routing ------------------------------------
+int FrameBox::timer(int period) {
     if (timer_id) { KillTimer(timer_id); timer_id = 0; }
     if (period <= 0) return 0;
     timer_id = SetTimer(MODAL_TIMER_ID, static_cast<UINT>(period), nullptr);
@@ -1173,34 +1090,7 @@ int cModalFrame::timer(int period) {
     return 0;
 }
 
-bool cModalFrame::open(CWnd* parent, int x0, int y0, int x1, int y1) {
-    if (!::IsWindow(m_hWnd)) {
-        // Pass nullptr for class/title to avoid wide literals in TCHAR parameters;
-        // set the title via SetWindowTextW immediately after creation.
-        // No subclassing here: LayOut(Modal,...) attaches a registry-owned
-        // cLayOut after this call, like every other factory.
-        Create(nullptr, nullptr, WS_OVERLAPPEDWINDOW, CRect(x0, y0, x1, y1), parent);
-        if (::IsWindow(m_hWnd))
-            ::SetWindowTextW(m_hWnd, L"cLayOut Demo");
-    }
-    else {
-        MoveWindow(x0, y0, x1 - x0, y1 - y0, TRUE);
-    }
-    ShowWindow(SW_SHOW);
-    return ::IsWindow(m_hWnd) != 0;
-}
-
-bool cModalFrame::open(CWnd* parent) {
-    // Create only, stay hidden: the caller positions, shows, and attaches the
-    // editor afterwards via LayOut(New, &wnd, x0,y0,x1,y1) (or LayOut(Modal,...)).
-    if (!::IsWindow(m_hWnd)) {
-        Create(nullptr, nullptr, WS_OVERLAPPEDWINDOW, CRect(0, 0, 0, 0), parent);
-        if (::IsWindow(m_hWnd)) ::SetWindowTextW(m_hWnd, L"cLayOut Demo");
-    }
-    return ::IsWindow(m_hWnd) != 0;
-}
-
-CWnd* cModalFrame::listen_core(int count, CWnd** list) {
+CWnd* FrameBox::listen_core(int count, CWnd** list) {
     if (!::IsWindow(m_hWnd)) return nullptr;
 
     event = nullptr;
@@ -1216,16 +1106,19 @@ CWnd* cModalFrame::listen_core(int count, CWnd** list) {
     return event;
 }
 
-void cModalFrame::surveil(int count, CWnd** list, bool on) {
+void FrameBox::surveil(int count, CWnd** list, bool on) {
+    // Token = this frame, regardless of where the control physically lives. A
+    // control reports to whoever surveilled it, so a parent can listen() controls
+    // that live inside a child zone with no relay.
     WPARAM token = on ? reinterpret_cast<WPARAM>(this) : 0;
     for (int i = 0; i < count; i++) {
         if (list[i] && ::IsWindow(list[i]->m_hWnd))
-            ::SendMessage(list[i]->m_hWnd, WM_EVOL_SURVEIL, token, 0);
+            ::SendMessage(list[i]->m_hWnd, WM_PARASITE_SURVEIL, token, 0);
     }
 }
 
-LRESULT cModalFrame::WindowProc(UINT msg, WPARAM wParam, LPARAM lParam) {
-    // Paint background with the dialog face color instead of the CFrameWnd default.
+LRESULT FrameBox::WindowProc(UINT msg, WPARAM wParam, LPARAM lParam) {
+    // Paint background with the dialog face color instead of the CWnd default.
     if (msg == WM_ERASEBKGND) {
         RECT rc;
         ::GetClientRect(m_hWnd, &rc);
@@ -1244,33 +1137,34 @@ LRESULT cModalFrame::WindowProc(UINT msg, WPARAM wParam, LPARAM lParam) {
     }
 
     // a surveilled control signaled: end the modal loop, remember which.
-    if (waiting && msg == WM_EVOL_REPORT) {
+    if (waiting && msg == WM_PARASITE_REPORT) {
         event = reinterpret_cast<CWnd*>(wParam);
         m_nFlags &= ~WF_CONTINUEMODAL;
         return 0;
     }
 
     // Reflect control notifications to the control HWND (HWND-based, so the
-    // proc subclass proc receives them). lParam carries the full signed
-    // code for WM_NOTIFY and the scroll request code for scrollbar/trackbar.
+    // subclass proc receives them). Runs regardless of listen() state, so a child
+    // frame reflects its own controls even while a parent frame is in listen().
+    // lParam carries the full signed code for WM_NOTIFY / scroll request code.
     if (msg == WM_COMMAND && lParam != 0) {
         HWND ctrl = reinterpret_cast<HWND>(lParam);
         if (::IsWindow(ctrl))
-            ::SendMessage(ctrl, WM_EVOL_CALLBACK, 0,
+            ::SendMessage(ctrl, WM_PARASITE_CALLBACK, 0,
                           static_cast<LPARAM>(static_cast<int>(HIWORD(wParam))));
         return 0;
     }
     if (msg == WM_NOTIFY) {
         NMHDR* nm = reinterpret_cast<NMHDR*>(lParam);
         if (nm && ::IsWindow(nm->hwndFrom))
-            ::SendMessage(nm->hwndFrom, WM_EVOL_CALLBACK, 0,
+            ::SendMessage(nm->hwndFrom, WM_PARASITE_CALLBACK, 0,
                           static_cast<LPARAM>(nm->code));
         return 0;
     }
     if ((msg == WM_HSCROLL || msg == WM_VSCROLL) && lParam != 0) {
         HWND ctrl = reinterpret_cast<HWND>(lParam);
         if (::IsWindow(ctrl))
-            ::SendMessage(ctrl, WM_EVOL_CALLBACK, 0,
+            ::SendMessage(ctrl, WM_PARASITE_CALLBACK, 0,
                           static_cast<LPARAM>(static_cast<int>(LOWORD(wParam))));
         return 0;
     }
@@ -1281,5 +1175,44 @@ LRESULT cModalFrame::WindowProc(UINT msg, WPARAM wParam, LPARAM lParam) {
         m_nFlags &= ~WF_CONTINUEMODAL;
     }
 
-    return CFrameWnd::WindowProc(msg, wParam, lParam);
+    return CWnd::WindowProc(msg, wParam, lParam);
+}
+
+// ESC and Enter are consumed in BOTH normal and edit mode (CDialog-like behaviour).
+// TRAP: the editing_hwnd() guard does NOT restrict this to edit mode -- it only yields
+// to the Parasite subclass proc when a control is actively being repositioned (so Enter
+// commits and ESC cancels the drag). In normal mode both keys are still always consumed,
+// EXCEPT when the focused window returns DLGC_WANTALLKEYS (e.g. cConBox terminal widget).
+BOOL FrameBox::PreTranslateMessage(MSG* pMsg) {
+    if (pMsg->message == WM_KEYDOWN) {
+        // Yield to Parasite only when the message target is the editing window.
+        if (Parasite::editing_hwnd() == pMsg->hwnd) return FALSE;
+        // If the focused window claims all keys (e.g. ConBox terminal), let it handle
+        // Esc/Enter directly instead of consuming them here.
+        CWnd* focus = GetFocus();
+        if (focus && (focus->SendMessage(WM_GETDLGCODE) & DLGC_WANTALLKEYS))
+            return CWnd::PreTranslateMessage(pMsg);
+        if (pMsg->wParam == VK_ESCAPE) {
+            PostMessage(WM_CLOSE);
+            return TRUE;
+        }
+        if (pMsg->wParam == VK_RETURN) {
+            if (focus) {
+                wchar_t cls[32] = {};
+                ::GetClassNameW(focus->m_hWnd, cls, _countof(cls));
+                // Only a multiline edit WITH ES_WANTRETURN claims Enter for itself
+                // (newline). Without it, Enter routes to the button.
+                if (_wcsicmp(cls, L"Edit") == 0 &&
+                    (focus->GetStyle() & ES_MULTILINE) &&
+                    (focus->GetStyle() & ES_WANTRETURN))
+                    return CWnd::PreTranslateMessage(pMsg);
+                // Push button: simulate click.
+                DWORD btype = focus->GetStyle() & 0x0F;
+                if (btype == BS_PUSHBUTTON || btype == BS_DEFPUSHBUTTON)
+                    focus->SendMessage(BM_CLICK);
+            }
+            return TRUE;  // always consume Enter so it never becomes WM_CHAR '\r'
+        }
+    }
+    return CWnd::PreTranslateMessage(pMsg);
 }

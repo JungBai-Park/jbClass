@@ -1,19 +1,19 @@
 ﻿# Software Requirements Specification (SRS)
 
-This document defines the module-level requirements for `cLayOut` and `cConBox`.
+This document defines the module-level requirements for `Parasite` and `cConBox`.
 Project-wide environment, encoding, folder, build, and coding rules are defined in `CLAUDE.md` and are intentionally not repeated here.
 
-## 1. LayOut
+## 1. FrameBox
 
 ### 1.1 Purpose
 
-- `cLayOut` attaches to existing controls through `SetWindowSubclass` and provides runtime layout editing, including moving and resizing controls.
-- When an edit is confirmed, `cLayOut` rewrites the coordinate literals at the source location recorded by `__FILE__` and `__LINE__`.
+- `Parasite` attaches to existing controls through `SetWindowSubclass` and provides runtime layout editing, including moving and resizing controls.
+- When an edit is confirmed, `Parasite` rewrites the coordinate literals at the source location recorded by `__FILE__` and `__LINE__`.
 - Debug-only behavior, including edit mode, source rewriting, and file/line tracking members, must be compiled out when `_DEBUG` is not defined. Release builds keep only signal interoperability behavior.
 
 ### 1.2 Supported Controls and Signal Detection
 
-- Supported controls include `CEdit`, `CStatic`, `CButton`, `CComboLayOut`, and common dialog controls through the default signal map and `LayOut*` factories.
+- Supported controls include `CEdit`, `CStatic`, `CButton`, `CComboBox`, and common dialog controls through the default signal map and `FrameBox::add_*` factories.
 - `Static` and `Progress` controls do not emit signals by default.
 - `SysLink` controls are excluded from support.
 - Control type detection is based on the window class name from `GetClassNameW`.
@@ -42,27 +42,32 @@ Project-wide environment, encoding, folder, build, and coding rules are defined 
 
 ### 1.4 Host Framework Interoperability
 
-- `cLayOut` handles `WM_EVOL_SURVEIL` to store the report target.
-- When a signal occurs, `cLayOut` sends `WM_EVOL_REPORT` to the stored report target.
+- `Parasite` handles `WM_PARASITE_SURVEIL` to store the report target.
+- When a signal occurs, `Parasite` sends `WM_PARASITE_REPORT` to the stored report target.
 - Host reflection messages include `WM_COMMAND`, `WM_NOTIFY`, `WM_HSCROLL`, and `WM_VSCROLL`.
-- `cLayOut` does not own the target control. It stores a borrowed `CWnd*`.
-- During destruction, `cLayOut` removes subclassing if the target `HWND` is still valid. It must not forcibly destroy the target control.
+- `Parasite` does not own the target control. It stores a borrowed `CWnd*`.
+- During destruction, `Parasite` removes subclassing if the target `HWND` is still valid. It must not forcibly destroy the target control.
 
-### 1.5 Factory Macro and Helper Classes
+### 1.5 FrameBox Host and Factory Macros
 
-- The `LayOut` macro performs `CWnd` creation, `cLayOut` creation and attachment, sizing, positioning, subclassing, system font propagation through `WM_SETFONT`, and `initialize()`.
-- `cModalFrame` creates a modal frame whose own size and position can be edited live. Its background color is `COLOR_BTNFACE`.
-- `cModalFrame::timer()` supports control of the `listen()` wait loop.
-- `cModalFrame::PreTranslateMessage` intercepts ESC (post `WM_CLOSE`) and Enter (click focused push button) in both normal and edit mode, matching `CDialog` keyboard behaviour. Exception: if the focused window returns `DLGC_WANTALLKEYS`, both keys pass through unmodified so terminal-style child windows (e.g. `cConBox`) can receive raw Enter and Esc.
-- `cLayOutZone` is a child container window with a `COLOR_BTNFACE` background and `WS_EX_CONTROLPARENT`. It acts as the parent layout region for child controls.
-- Default styles:
-  - `LayOutStatic`: `SS_LEFT | SS_CENTERIMAGE`.
-  - `LayOutButton`: `BS_PUSHBUTTON`.
-  - `LayOutEdit`: `ES_MULTILINE | ES_AUTOVSCROLL`.
+- `FrameBox` is a `CWnd`-derived host window that OWNS its child controls through a per-instance registry. It replaces the former `cModalFrame` (top-level host) and `cLayOutZone` (child container). Its background color is `COLOR_BTNFACE`.
+- `FrameBox` is `CWnd`-based, not `CFrameWnd`-based, so a child (`WS_CHILD`) zone form is natural and `CFrameWnd::OnDestroy` cannot post `WM_QUIT`. One shared `"FrameBox"` window class is registered once and created via `AfxHookWindowCreate` + `CreateWindowExW` (same pattern as `cConBox`); the style passed at creation selects top-level vs child vs popup.
+- The `Add*` member macros (`AddStatic`, `AddButton`, `AddEdit`, `AddCombo`, ..., `AddZone`, `AddFrame`, `AddNew`, `AddAsItIs`) and the `Open` macro inject `__FILE__`/`__LINE__` at the call site. Coordinates are ALWAYS the first four arguments (the source rewriter relies on this); the optional trailing argument is an init string (controls) or the window pointer (`AddNew`/`AddAsItIs`). In release builds the macros pass `nullptr,0` instead.
+- Each `Add*` control factory performs control creation, `Parasite` creation and attachment, sizing, positioning, system font propagation through `WM_SETFONT`, `initialize()`, and registration of `{ wnd, cLayOut }` in the frame's registry.
+- `FrameBox::open()` (via the `Open(x0,y0,x1,y1)` macro) creates the top-level window, positions it, and attaches a self-editing `Parasite` so the frame's own rect is live-editable and source-rewritable.
+- `FrameBox::attach(CWinApp*)` binds the frame as the app main window (`m_pMainWnd = this`) and clears it in `close()`/`~FrameBox`, so no `CFrameWnd`-style `WM_QUIT` posting can apply.
+- `FrameBox::~FrameBox()` (= `close()`) tears the registry down in reverse registration order (children first): delete `Parasite` (removes subclass) -> `DestroyWindow` -> delete `wnd`. A child-frame entry's `delete wnd` recurses into its own `~FrameBox`. This replaces the former global `DeleteLayOutWindows()`.
+- `FrameBox::timer()` supports control of the `listen()` wait loop.
+- `FrameBox::PreTranslateMessage` intercepts ESC (post `WM_CLOSE`) and Enter (click focused push button) in both normal and edit mode, matching `CDialog` keyboard behaviour. Exception: if the focused window returns `DLGC_WANTALLKEYS`, both keys pass through unmodified so terminal-style child windows (e.g. `cConBox`) can receive raw Enter and Esc.
+- `add_zone` (`AddZone`) creates a `WS_CHILD | WS_EX_CONTROLPARENT` child container frame drawn inside the parent (the former `cLayOutZone` role). `add_frame` (`AddFrame`) creates a `WS_POPUP` separate-window child frame. Both are owned by the parent's registry and destroyed recursively. A child's controls are reflected by the child (its `WindowProc` runs reflection regardless of `listen()` state), but the report target is whichever frame called `listen()`, so an ancestor frame can `listen()` controls living in a child zone with no relay. True-modal behaviour for `AddFrame` is the caller's responsibility (`EnableWindow(parent, FALSE)` around the child's `listen()`).
+- Default control styles:
+  - `add_static`: `SS_LEFT | SS_CENTERIMAGE`.
+  - `add_button`: `BS_PUSHBUTTON`.
+  - `add_edit`: `ES_MULTILINE | ES_AUTOVSCROLL`.
 - `AlignText` maps a keypad-style placement value from 1 to 9 to the text alignment behavior appropriate for the window class.
-- `LayOut(AsItIs, wnd, x0,y0,x1,y1)` attaches `cLayOut` to an already-created `CWnd` and moves it to the given rect (borrowed: the registry owns only the `cLayOut`, not the `CWnd`). When all four coordinates are `0`, it operates in attach-only mode: the window is not moved, and `last_rect` is populated from the current `GetWindowRect` result (parent-relative). Prefer `LayOut(New, ...)` for windows created for the UI; reserve `LayOut(AsItIs, ...)` for borrowed windows whose lifetime is owned elsewhere, and never for a global/static instance.
-- `LayOut(New, wnd, x0,y0,x1,y1)` behaves like `LayOut(AsItIs, ...)` but transfers ownership of the `new`'d `wnd` to the registry, so `DeleteLayOutWindows()` also `DestroyWindow`s and `delete`s it (`wnd` must therefore be heap-allocated with `new`). Externally-created `CWnd`-derived windows (e.g. `new cConBox`) must use this form rather than a global/static instance, so their heap members are released inside the host loop before the CRT exit leak snapshot.
-- The host `CWinApp` subclass must call `m_pMainWnd = nullptr` then `DeleteLayOutWindows()` in `InitInstance()` immediately after the modal loop function returns. Nulling `m_pMainWnd` first prevents `CFrameWnd::OnDestroy` from posting `WM_QUIT` when it destroys the main window.
+- `AddAsItIs(x0,y0,x1,y1, wnd)` attaches `Parasite` to an already-created `CWnd` and moves it to the given rect (borrowed: the registry stores `Parasite` only, not the `CWnd`). When all four coordinates are `0`, it operates in attach-only mode: the window is not moved, and `last_rect` is populated from the current `GetWindowRect` result (parent-relative). Prefer `AddNew` for windows created for the UI; reserve `AddAsItIs` for borrowed windows whose lifetime is owned elsewhere.
+- `AddNew(x0,y0,x1,y1, wnd)` behaves like `AddAsItIs` but transfers ownership of the `new`'d `wnd` to the registry, so `close()` also `DestroyWindow`s and `delete`s it (`wnd` must be heap-allocated with `new`). Externally-created `CWnd`-derived windows (e.g. `new cConBox`) use this form.
+- The root `FrameBox` is created with `new`, bound via `attach(theApp)`, and opened via `Open(...)`. The function that created it (e.g. the modal-loop driver called from `InitInstance`) `delete`s it before returning. Because the root and all its heap members (controls, attached `cConBox`, `Parasite`s) are released inside that function -- before the CRT exit leak snapshot -- no global cleanup call and no global/static window object are needed.
 
 ## 2. ConBox
 

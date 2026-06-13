@@ -23,7 +23,7 @@
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="..\Source\LayOut.cpp">
+    <ClCompile Include="..\Source\FrameBox.cpp">
       <Filter>소스 파일</Filter>
     </ClCompile>
     <ClCompile Include="DemoApp.cpp">

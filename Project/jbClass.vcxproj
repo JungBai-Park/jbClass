@@ -370,7 +370,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="..\Source\ConBox.cpp" />
-    <ClCompile Include="..\Source\LayOut.cpp" />
+    <ClCompile Include="..\Source\FrameBox.cpp" />
     <ClCompile Include="DemoApp.cpp" />
   </ItemGroup>
   <ItemGroup>
