@@ -45,17 +45,19 @@
 
     MINIMAL USAGE
     -------------
-        FrameBox* Top = new FrameBox;
-        Top->attach(&theApp);              // sets m_pMainWnd = Top
-        Top->Open(560,275, 1360,875);      // create top-level + self live-edit
-        CEdit*    e = Top->AddEdit  (10, 10,200, 30);
-        CButton*  b = Top->AddButton(10, 50,100, 30, "OK");
-        CComboBox*c = Top->AddCombo (10, 90,200, 60, "A,B,C");
-        while (::IsWindow(*Top)) {
-            CWnd* ev = Top->listen(e, b, c);
+        // Default-construct, then OpenFrame(app,...) to create + show. The frame is
+        // a stack local; ~FrameBox tears everything down at scope exit. Using a
+        // member call (not a ctor) lets a FrameBox SUBCLASS override WindowProc etc.
+        FrameBox  Top;  Top.OpenFrame(&theApp, 560,275, 1360,875);  // main + self live-edit
+        CEdit*    e = Top.AddEdit  (10, 10,200, 30);
+        CButton*  b = Top.AddButton(10, 50,100, 30, "OK");
+        CComboBox*c = Top.AddCombo (10, 90,200, 60, "A,B,C");
+        while (::IsWindow(Top)) {
+            CWnd* ev = Top.listen(e, b, c);
             if (ev == 0 || ev == b) break;
         }
-        delete Top;                        // recursive teardown; clears m_pMainWnd
+        // Modal sub-dialog: FrameBox Sub;  Sub.OpenFrame(&Top, ...); disables Top
+        // until Sub goes out of scope (close() re-enables Top).
 
     HOST CONTRACT (message protocol; constants below are shared with any host)
     -------------------------------------------------------------------------
@@ -217,9 +219,12 @@ bool LayOutRewrite(const char* file, int line, const RECT& rect);
 // WS_CHILD "zone" form). One window class "FrameBox" is shared by all forms;
 // the style passed to CreateWindowExW decides top-level vs child vs popup.
 //
-//   - open(): root form. Creates a top-level WS_OVERLAPPEDWINDOW, positions it,
-//     and attaches a self-editing Parasite so the frame's own rect is live-
-//     editable and source-rewritable. Use the Open(x0,y0,x1,y1) macro.
+//   - open(app/owner,...): creates the frame window, positions it, and attaches a
+//     self-editing Parasite so the frame's own rect is live-editable and source-
+//     rewritable. Two overloads selected by the first argument type:
+//     CWinApp* -> top-level main window (attach(app) first); CWnd* -> owned popup
+//     modal sub-dialog (disables the owner). Use the OpenFrame(p,...) macro so
+//     file/line are injected (see below / file header).
 //   - add_*(): child-control factories (AddStatic/AddButton/...). Each creates
 //     the control as a child of this frame, applies the system UI font, attaches
 //     a Parasite, and registers { wnd, Parasite } in this frame's registry.
@@ -246,22 +251,27 @@ bool LayOutRewrite(const char* file, int line, const RECT& rect);
 //     in normal mode they are ALWAYS consumed (except DLGC_WANTALLKEYS).
 //
 // USAGE  (see MINIMAL USAGE in the file header for a full loop)
-//     FrameBox* Top = new FrameBox;
-//     Top->attach(&theApp);
-//     Top->Open(560,275, 1360,875);
-//     CButton* b = Top->AddButton(10,10,100,30, "Close");
-//     CWnd* ev = Top->listen(b);
+//     FrameBox Top;  Top.OpenFrame(&theApp, 560,275, 1360,875);  // stack local
+//     CButton* b = Top.AddButton(10,10,100,30, "Close");
+//     CWnd* ev = Top.listen(b);
 //     ...
-//     delete Top;   // reverse order: remove subclass -> DestroyWindow -> delete
+//     // ~Top at scope exit: reverse order remove subclass -> DestroyWindow -> delete
 class FrameBox : public CWnd {
 public:
     FrameBox();
     ~FrameBox();
 
-    // Root form: create top-level window, position it, and attach a self-editing
-    // Parasite. Idempotent: a second call repositions. Use the Open(...) macro so
-    // __FILE__/__LINE__ are injected for the source rewriter.
-    bool open(int x0, int y0, int x1, int y1, const char* file, int line);
+    // Create the window, position it, and attach a self-editing Parasite. Two
+    // overloads selected by the first argument type (pass a concrete typed
+    // pointer, never a bare 0/nullptr -- the overloads would be ambiguous):
+    //  - CWinApp* form: main window. attach(app) + top-level WS_OVERLAPPEDWINDOW.
+    //  - CWnd*    form: modal sub-dialog. owned popup (WS_POPUP|WS_CAPTION|
+    //    WS_SYSMENU) then owner->EnableWindow(FALSE); close() re-enables it.
+    // Driving construction through a member call (not a ctor) lets a FrameBox
+    // subclass be used. Use the OpenFrame(...) macro so file/line are injected.
+    // Idempotent: a second call repositions.
+    bool open(CWinApp* app,   int x0, int y0, int x1, int y1, const char* file, int line);
+    bool open(CWnd*    owner, int x0, int y0, int x1, int y1, const char* file, int line);
 
     // Bind to the app as its main window (app->m_pMainWnd = this). Cleared in
     // close()/~FrameBox so CFrameWnd-style WM_QUIT posting can never apply.
@@ -329,6 +339,7 @@ private:
     struct ChildEntry { CWnd* wnd; Parasite* layout; };
 
     bool      create_window(DWORD exStyle, DWORD style, CWnd* parent, const CRect& rc);
+    bool      open_core(CWnd* owner, int x0, int y0, int x1, int y1, const char* file, int line);
     FrameBox* make_child(DWORD exStyle, DWORD style, int x0,int y0,int x1,int y1,const char* f,int ln);
     int       alloc_id() { return next_id++; }
     template<class T> T* finish_child(T* wnd, BOOL ok, int x0,int y0,int x1,int y1,
@@ -340,6 +351,7 @@ private:
     std::vector<ChildEntry> registry;     // children this frame owns
     int       next_id;                    // per-instance control id counter
     CWinApp*  app;                        // set by attach(); non-null only for the main window
+    CWnd*     parent;                     // owner to re-enable in close() (modal sub-frame only)
     Parasite*  self_layout;                // root self-edit subclass (null for child frames)
     bool      waiting;
     bool      timer_fired;                // set by WM_TIMER while waiting, consumed by listen_core
@@ -353,6 +365,8 @@ private:
 // and `this->AddStatic(...)` work identically. Coordinates are ALWAYS the first
 // four arguments (the source rewriter relies on this); the optional trailing
 // argument is an init string (controls) or the window pointer (AddNew/AddAsItIs).
+// EXCEPTION: OpenFrame(p, x0,y0,x1,y1) takes the pointer FIRST, so its coords
+// start at the 2nd argument (the rewriter special-cases the "OpenFrame" name).
 // _DEBUG: pass __FILE__/__LINE__ so live editing can rewrite the call site.
 // Release: pass nullptr/0 -- keeps source paths OUT of the binary (edit/rewrite
 // machinery is compiled out; only signal interop remains).
@@ -362,7 +376,6 @@ private:
 #define LAYOUT_SRC nullptr, 0
 #endif
 
-#define Open(x0,y0,x1,y1)           open((x0),(y0),(x1),(y1), LAYOUT_SRC)
 #define AddStatic(x0,y0,x1,y1,...)  add_static((x0),(y0),(x1),(y1), LAYOUT_SRC, ##__VA_ARGS__)
 #define AddButton(x0,y0,x1,y1,...)  add_button((x0),(y0),(x1),(y1), LAYOUT_SRC, ##__VA_ARGS__)
 #define AddEdit(x0,y0,x1,y1,...)    add_edit((x0),(y0),(x1),(y1), LAYOUT_SRC, ##__VA_ARGS__)
@@ -386,3 +399,10 @@ private:
 #define AddFrame(x0,y0,x1,y1)       add_frame((x0),(y0),(x1),(y1), LAYOUT_SRC)
 #define AddNew(x0,y0,x1,y1,wnd)     add_new((x0),(y0),(x1),(y1), LAYOUT_SRC, (wnd))
 #define AddAsItIs(x0,y0,x1,y1,wnd)  add_asitis((x0),(y0),(x1),(y1), LAYOUT_SRC, (wnd))
+
+// Frame open (member-call form). Pointer-first: p is &theApp (main window) or
+// &parentFrame (modal sub-dialog); coords follow. The source rewriter treats
+// OpenFrame coords as starting at the 2nd argument.
+//   FrameBox Top;  Top.OpenFrame(&theApp, 393, -955, 1168, -280);
+//   FrameBox Sub;  Sub.OpenFrame(&Top,    10, 10, 100, 100);
+#define OpenFrame(p,x0,y0,x1,y1)    open((p), (x0),(y0),(x1),(y1), LAYOUT_SRC)

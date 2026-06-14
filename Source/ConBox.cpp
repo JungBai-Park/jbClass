@@ -23,6 +23,7 @@
 //   IME (Korean)    : OnImeStart, OnImeComp, OnImeEnd, OnImeNotify
 //   input           : set_input_sink, set_resize_sink, send_input_bytes, send_input_wide,
 //                     terminal_keydown, paste_clipboard, finalize_composition, OnChar, OnKeyDown
+//   focus           : OnSetFocus, OnKillFocus
 //   mouse selection : hit_test, copy_selection, clear_selection, OnLButtonDown, OnLButtonDblClk,
 //                     OnLButtonUp, OnMouseMove, OnRButtonDown, OnDropFiles
 //   painting        : ensure_back_buffer, OnPaint
@@ -198,6 +199,8 @@ BEGIN_MESSAGE_MAP(cConBox, CWnd)
     ON_WM_MOUSELEAVE()
     ON_WM_RBUTTONDOWN()
     ON_WM_DROPFILES()
+    ON_WM_SETFOCUS()
+    ON_WM_KILLFOCUS()
     ON_MESSAGE(WM_IME_STARTCOMPOSITION, &cConBox::OnImeStart)
     ON_MESSAGE(WM_IME_COMPOSITION, &cConBox::OnImeComp)
     ON_MESSAGE(WM_IME_ENDCOMPOSITION, &cConBox::OnImeEnd)
@@ -543,6 +546,7 @@ cConBox::cConBox()
 
     // Cursor blink: start visible; interval follows the system caret rate. If GetCaretBlinkTime returns
     // INFINITE (blink disabled system-wide), use 0 = no blink, always on.
+    has_focus = false;
     cursor_on = true;
     UINT caret = ::GetCaretBlinkTime();
     cursor_blink_ms = (caret == INFINITE) ? 0 : (int)caret;
@@ -1145,6 +1149,16 @@ void cConBox::calc_cell_size()
     // render Korean double-size glyphs at the wrong (1x-looking) size.
     MakeDoubleFont(efont_double, efont);
     MakeDoubleFont(kfont_double, kfont);
+
+    // In match mode kfont_lf.lfHeight was 0 at set_kfont time, so the bold/italic variants built
+    // there also got lfHeight=0 (GDI default, too large). Sync kfont_lf from the now-finalized
+    // kfont GDI handle and rebuild the variants with the correct matched height.
+    if (kfont_match_efont) {
+        ::GetObjectW(kfont.GetSafeHandle(), sizeof(LOGFONTW), &kfont_lf);
+        MakeFontVariant(kfont_bold,        kfont_lf, true,  false);
+        MakeFontVariant(kfont_italic,      kfont_lf, false, true);
+        MakeFontVariant(kfont_bold_italic, kfont_lf, true,  true);
+    }
 }
 
 void cConBox::set_efont(const char* name, float size, const char* opts)
@@ -2574,6 +2588,25 @@ void cConBox::clear_selection()
     }
 }
 
+void cConBox::OnSetFocus(CWnd*)
+{
+    has_focus = true;
+    cursor_on = true;
+    if (cursor_blink_ms > 0 && (cursor_type & 1) == 1) {
+        KillTimer(CURSOR_TIMER);
+        SetTimer(CURSOR_TIMER, cursor_blink_ms, NULL);
+    }
+    CRect rc;
+    if (get_cursor_rect(rc)) InvalidateRect(&rc, FALSE);
+}
+
+void cConBox::OnKillFocus(CWnd*)
+{
+    has_focus = false;
+    CRect rc;
+    if (get_cursor_rect(rc)) InvalidateRect(&rc, FALSE);
+}
+
 void cConBox::OnLButtonDown(UINT flags, CPoint pt)
 {
     SetFocus();   // claim keyboard focus on click (CWnd does not auto-focus on click unlike standard controls)
@@ -3468,7 +3501,7 @@ void cConBox::OnPaint()
     // drawn off-screen. If the cursor cell already has a glyph, redraw it in fg over the block so it is
     // not hidden (including the 2nd cell a Korean-mode 2-cell block covers). Skipped while composing
     // (comp_str non-empty) since the composing glyph was drawn above.
-    else if (cursor_on && cursor_visible) {
+    else if (cursor_on && cursor_visible && has_focus) {
         CRect cur;
         if (get_cursor_rect(cur)) {
             // Check whether the child itself highlighted the cursor cell (reverse caret). Some TUIs

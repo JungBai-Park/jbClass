@@ -22,6 +22,7 @@
 //     underline/strike are drawn as 1px decoration lines, blink toggled by BLINK_TIMER (500ms).
 //     SGR 8/28 = double-size (CELL_DOUBLE): 2x glyph, always bold, bleeds up+right; cursor auto-
 //     advances 2x so no manual spaces needed between big chars. Stored in CharInfo::flags.
+//   - Text cursor is hidden when the window loses focus (WM_KILLFOCUS) and restored on WM_SETFOCUS.
 //
 // --- Usage (inside the host parent window) ---
 //     cConBox box;                            // usually held as a member
@@ -282,6 +283,8 @@ protected:
     // Drag-and-drop: sends dropped file paths to child stdin (quoted if the path contains spaces).
     afx_msg void OnDropFiles(HDROP hdrop);
     afx_msg void OnTimer(UINT_PTR id);
+    afx_msg void OnSetFocus(CWnd* old_wnd);
+    afx_msg void OnKillFocus(CWnd* new_wnd);
     // Korean IME. In terminal mode only committed text is sent to the child; the in-progress
     // composition is held in comp_str and drawn by ConBox in the cursor cell (system inline is
     // suppressed by OnImeComp returning 0).
@@ -472,6 +475,7 @@ private:
     int cursor_bg_weight;  // cursor blend bg weight (default 6)
     int cursor_fg_weight;  // cursor blend fg weight (default 4)
 
+    bool has_focus;        // window has keyboard focus; cursor is hidden when false
     bool cursor_on;        // blink visible state
     int cursor_blink_ms;   // blink toggle interval (ms); 0 = always on
     int cursor_type;       // shape: 1=blink block,2=fixed block,3=blink underline,4=fixed underline,

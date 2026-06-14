@@ -365,8 +365,9 @@
     </PreBuildEvent>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClInclude Include="..\Source\ConBox.h" />
+    <ClInclude Include="..\Source\FrameBox.h" />
     <ClInclude Include="Resource.h" />
-    <ClInclude Include="stdafx.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="..\Source\ConBox.cpp" />

@@ -26,6 +26,11 @@ This file records project-specific pitfalls and implementation details that are 
 - The project `Temp\` directory can be automatically reset at session boundaries.
 - Do not recursively delete `Temp\` during a live development session because harness outputs may still depend on files under it.
 
+### 1.4 Development Monitor Layout
+
+- The dev machine uses two stacked 1920x1080 monitors: PRIMARY at the bottom (origin, so screen `y: 0..1080`) and SECONDARY above it (screen `y: -1080..0`).
+- So negative Y coordinates (e.g. the demo main window / sub-frame) are ON the upper secondary monitor, not off-screen. Pick screen coords accordingly when placing top-level/popup frames (`OpenFrame` coords are screen-based).
+
 ## 2. Source Compatibility Pitfalls
 
 ### 2.1 Comment Encoding and Korean Literals
@@ -51,11 +56,16 @@ This file records project-specific pitfalls and implementation details that are 
 - Example: replacing `dc.TextOutW(` can damage `cdc.TextOutW(`.
 - Replace the longest and most specific patterns first, then manually inspect the result.
 
-### 2.4 Factory Macro Hazards (FrameBox Add*/Open)
+### 2.4 Factory Macro Hazards (FrameBox Add*/OpenFrame)
 
-- The `Add*`/`Open` factory macros are global, function-like, case-sensitive textual substitutions defined at the bottom of `FrameBox.h`.
-- `Open` collides with MFC's own `Open(...)` members (e.g. `CFile::Open` in `afxpriv.h`): a function-like `Open` macro rewrites those declarations and breaks the header with cascading parse errors. Include any MFC header that declares an `Open(...)` member (notably `afxpriv.h`, needed for `AfxHookWindowCreate`) BEFORE `FrameBox.h`, so it is parsed before the macro exists. Consumers that pull no such header after `FrameBox.h` are unaffected.
-- Do NOT write `Add*/Open` (or any `...*/...`) inside a `/* */` block comment: the `*/` closes the comment early and everything after it compiles as code. Use `Add... / Open` or a `//` line comment instead. (Hit this in both `FrameBox.h` and `FrameBox.cpp` headers this session.)
+- The `Add*`/`OpenFrame` factory macros are global, function-like, case-sensitive textual substitutions defined at the bottom of `FrameBox.h`.
+- `OpenFrame` takes 5 arguments and does NOT collide with MFC `Open(...)` members, so `afxpriv.h` no longer needs to precede `FrameBox.h`. Always include `"FrameBox.h"` first in `.cpp` files so `_WIN32_WINNT` is defined before `<afxwin.h>` is parsed (avoids the `_WIN32_WINNT not defined` warning).
+- Do NOT write `Add*` (or any `...*/...`) inside a `/* */` block comment: the `*/` closes the comment early and everything after it compiles as code. Use `Add...` or a `//` line comment instead.
+
+### 2.5 C++ Standard Version Check on MSVC
+
+- MSVC pins `__cplusplus` at `199711L` unless `/Zc:__cplusplus` is passed, so a `#if __cplusplus >= 201703L` guard misfires even with `/std:c++17`.
+- Use `_MSVC_LANG` (always reflects `/std`) when defined, else `__cplusplus`. (The `FrameBox.h` C++17 `#error` guard was removed when `NewFrame` copy-elision dependency was eliminated; this pitfall still applies to any new guards added.)
 
 ## 3. FrameBox
 
@@ -73,8 +83,11 @@ This file records project-specific pitfalls and implementation details that are 
 
 ### 3.2 Source Rewriter Limits
 
-- The `Add*`/`Open` macros inject `__FILE__` and `__LINE__`; coordinates are ALWAYS the first four arguments.
-- The rewriter anchors on a member-call on the target line: `.`/`->` followed by an uppercase-initial identifier and `(` whose first argument is an integer literal (covers `AddStatic`/`AddNew`/`Open`/...). It then rewrites the first four comma/paren-delimited integer literals, with NO leading-argument skip (the old `"LayOut("` + skip-2 logic is gone).
+- The `Add*`/`OpenFrame` macros inject `__FILE__` and `__LINE__`.
+- The rewriter is FORM-BASED (not heuristic): the call form on the target line fixes where the coordinates start. Both accepted forms are member calls (`.Xxx` or `->Xxx` where `Xxx` starts uppercase):
+  - `obj.OpenFrame(p, x0,y0,x1,y1)`: identifier is exactly `OpenFrame`. Coordinates start at the 2nd argument (skip the pointer arg) -- `coord_anchor` is the 1st top-level comma after `(`.
+  - `obj.AddXxx(x0,y0,x1,y1[, extra])`: any other uppercase-initial member call whose 1st arg is an integer literal. Coordinates start at the 1st argument -- `coord_anchor` is `(`.
+  - From `coord_anchor`, three top-level commas delimit x0,y0,x1,y1; text before the first coord and after the fourth (init string / window pointer trailing arg) is preserved verbatim. Reuses `find_char` (paren/bracket/string-aware).
 - The trailing argument (init string for controls, window pointer for `AddNew`/`AddAsItIs`) must be preserved; it is.
 - The rewriter supports only single-line calls with integer literals.
 - UTF-16 BOM source files are not supported. ANSI and UTF-8 files are supported.
@@ -85,7 +98,8 @@ This file records project-specific pitfalls and implementation details that are 
 - `Parasite` stores a borrowed reference and does not own the target control.
 - Each `FrameBox` OWNS its children through a per-instance registry (the global `new_window_registry()` / `DeleteLayOutWindows()` are gone). `~FrameBox()` (= `close()`) processes the registry in reverse-registration order: `delete Parasite` (removes subclass) -> `DestroyWindow` -> `delete wnd`. A child-frame entry's `delete wnd` recurses into that child's `~FrameBox`, tearing down grandchildren. Do NOT call `DestroyWindow()` separately on registered controls -- it is redundant.
 - `AddAsItIs(..., wnd)` registers `{ nullptr, Parasite }` (borrowed): teardown removes the subclass only. `AddNew(..., wnd)` registers `{ wnd, Parasite }` (owned): teardown also `DestroyWindow`s + `delete`s wnd, so wnd must be a heap (`new`) object. Both attach the editing subclass, so the window stays live-editable.
-- The root `FrameBox` is created with `new`, bound via `attach(theApp)`, opened via `Open(...)`, and `delete`d by the function that created it (the modal-loop driver) before `InitInstance` returns. `attach()` sets `m_pMainWnd = this`; `close()` clears it FIRST so destruction never leaves a dangling main window.
+- The root `FrameBox` is a STACK LOCAL in the modal-loop driver (`DemoMain`): `FrameBox Top; Top.OpenFrame(&theApp, ...);`. `~FrameBox` runs at scope exit. `attach()` (called by the `CWinApp*` overload of `open()`) sets `m_pMainWnd = this`; `close()` clears it FIRST so destruction never leaves a dangling main window.
+- `OpenFrame` is a MEMBER-CALL macro (not a ctor macro), so `FrameBox` subclasses can override `WindowProc` etc. and still use `OpenFrame` for setup. No C++17 copy-elision dependency; no `#error` guard in `FrameBox.h`.
 - Because `FrameBox` is `CWnd`-based (not `CFrameWnd`), `OnDestroy` does not post `WM_QUIT`; the old `m_pMainWnd = nullptr` + `DeleteLayOutWindows()` dance in `InitInstance` is no longer needed.
 - A child frame (`AddZone`/`AddFrame`) closing tears down only its OWN registry, so the former footgun -- a child calling the global `DeleteLayOutWindows()` and wiping the main window -- cannot happen anymore.
 - If the parent window is destroyed first (`WM_NCDESTROY`), `~Parasite` skips `RemoveWindowSubclass` (HWND already gone) and never deletes the target, so teardown is safe in either order.
@@ -106,6 +120,25 @@ This file records project-specific pitfalls and implementation details that are 
 - When calling `SetRect()`, first call `GetRect()` and change only the Y-axis top offset. This avoids corrupting horizontal inset margins and border rendering.
 - If `PreTranslateMessage` intercepts Enter, always return `TRUE` after handling it. Otherwise an unintended `'\r'` can enter the edit view.
 
+### 3.6 Popup Frame Coordinate System (WS_CHILD vs GetParent)
+
+- A `WS_POPUP` frame's `GetParent()` returns its OWNER, not a real parent. Deciding "child vs top-level" by `GetParent() != NULL` therefore misclassifies an owned popup as a child.
+- Symptom (popup self-edit): entering edit then pressing an arrow made the window jump off-screen; committing a small mouse move rewrote the source with off-screen coords (e.g. owner-client-relative values) so the next run created the popup outside the visible area.
+- Root cause: `Parasite::get_rect` mapped screen coords to owner-client coords (because `GetParent` was non-NULL), and `leave_edit`/`on_key` then moved the popup with those wrong-space coords (a non-child `MoveWindow`/`SetWindowPos` expects SCREEN coords).
+- Fix: decide the coordinate space by the `WS_CHILD` style bit (as `on_drag` already did), not by `GetParent`. Only real children (`WS_CHILD`) use parent-client coords; top-level and popup frames stay in screen coords throughout (create/move/capture/rewrite).
+
+### 3.7 Modal Sub-Dialog Close: Z-Order and Owner Reactivation
+
+- `EnableWindow(owner, TRUE)` only restores input; it does NOT change activation/Z-order.
+- Symptom: closing the modal sub-dialog dropped the owner one step down in Z-order (the system handed activation to whatever sat below the destroyed, still-active popup).
+- Fix: in `close()`, BEFORE `DestroyWindow()` of the owned popup, call `owner->EnableWindow(TRUE)` then `owner->SetActiveWindow()` so the owner is already the active window when the popup is destroyed. Order matters (re-enable + reactivate, then destroy).
+
+### 3.8 Frame Self-Edit: Child Input Isolation
+
+- A `FrameBox` self-edit subclasses the FRAME's HWND, but the frame's child controls are separate HWNDs. The frame's `Parasite::dispatch` eats input only for the frame window, so children still hover-highlighted and stole focus, and arrow keys went to the focused child instead of moving the frame.
+- `editing_hwnd() == pMsg->hwnd` is false when a child holds focus (target is the child), so the old `PreTranslateMessage` guard did not catch this case.
+- Fix (in `FrameBox::PreTranslateMessage`, only while `editing_hwnd()` is non-NULL): route edit keys (arrows/Enter/Esc) to the editing window via `SendMessageW(edit, WM_KEYDOWN, ...)` regardless of focus and consume them; swallow non-editing controls' mouse messages (`WM_MOUSEFIRST..WM_MOUSELAST`) so they stay inert. Let `WM_MBUTTONDOWN` pass so edit can still be toggled on another control. When the editing window itself is focused (`pMsg->hwnd == edit`), return FALSE to let its own subclass proc handle the key.
+
 ## 4. ConBox
 
 ### 4.1 Font Measurement and Korean Matching
@@ -113,6 +146,7 @@ This file records project-specific pitfalls and implementation details that are 
 - The final measured height for the Korean matching font must be handled at the end of `calc_cell_size`.
 - Do not build the Korean matching font early in `set_kfont`.
 - If it is built before font match information is available, the GDI object is created with a default height of 0 and Korean glyphs render too small compared with English 2x output.
+- In match mode (`set_kfont` size <= 0), `kfont_lf.lfHeight` is 0 at `set_kfont` call time, so the bold/italic/bold_italic variants built there also have `lfHeight=0` (GDI default = too large, overlaps adjacent lines). `calc_cell_size` corrects `kfont` but does NOT propagate the matched height back to the variants. Fix: at the end of `calc_cell_size`, after all font rebuilds, if `kfont_match_efont`, call `GetObjectW(kfont, &kfont_lf)` then rebuild the three variants via `MakeFontVariant`. The double variant (`kfont_double`) already uses `GetObjectW` internally via `MakeDoubleFont` so it was never affected.
 
 ### 4.2 SGR Double-Size Rendering
 

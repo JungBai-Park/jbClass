@@ -23,7 +23,7 @@ Project-wide environment, encoding, folder, build, and coding rules are defined 
 ### 1.3 Layout Editing Gestures
 
 - Clicking the middle mouse button toggles edit mode.
-- While edit mode is active, the target control's native mouse and keyboard input is suppressed.
+- While edit mode is active, the target control's native mouse and keyboard input is suppressed. When the edited target is a `FrameBox` itself (self-edit), its child controls are also kept inert: `PreTranslateMessage` swallows their mouse input (no hover/focus steal, except `WM_MBUTTONDOWN` so edit can be toggled elsewhere) and routes edit keys (arrows/Enter/Esc) to the editing window regardless of which child holds focus.
 - Keyboard movement rules:
   - Arrow key: move by 5 px.
   - Ctrl + Arrow key: move by 1 px.
@@ -52,14 +52,14 @@ Project-wide environment, encoding, folder, build, and coding rules are defined 
 
 - `FrameBox` is a `CWnd`-derived host window that OWNS its child controls through a per-instance registry. It replaces the former `cModalFrame` (top-level host) and `cLayOutZone` (child container). Its background color is `COLOR_BTNFACE`.
 - `FrameBox` is `CWnd`-based, not `CFrameWnd`-based, so a child (`WS_CHILD`) zone form is natural and `CFrameWnd::OnDestroy` cannot post `WM_QUIT`. One shared `"FrameBox"` window class is registered once and created via `AfxHookWindowCreate` + `CreateWindowExW` (same pattern as `cConBox`); the style passed at creation selects top-level vs child vs popup.
-- The `Add*` member macros (`AddStatic`, `AddButton`, `AddEdit`, `AddCombo`, ..., `AddZone`, `AddFrame`, `AddNew`, `AddAsItIs`) and the `Open` macro inject `__FILE__`/`__LINE__` at the call site. Coordinates are ALWAYS the first four arguments (the source rewriter relies on this); the optional trailing argument is an init string (controls) or the window pointer (`AddNew`/`AddAsItIs`). In release builds the macros pass `nullptr,0` instead.
+- The `Add*` member macros (`AddStatic`, `AddButton`, `AddEdit`, `AddCombo`, ..., `AddZone`, `AddFrame`, `AddNew`, `AddAsItIs`) and the `OpenFrame` macro inject `__FILE__`/`__LINE__` at the call site. For `Add*` macros, coordinates are ALWAYS the first four arguments. For `OpenFrame(p, x0,y0,x1,y1)`, the pointer comes first and coordinates start at the 2nd argument (the source rewriter special-cases the `OpenFrame` name). In release builds the macros pass `nullptr,0` instead.
 - Each `Add*` control factory performs control creation, `Parasite` creation and attachment, sizing, positioning, system font propagation through `WM_SETFONT`, `initialize()`, and registration of `{ wnd, cLayOut }` in the frame's registry.
-- `FrameBox::open()` (via the `Open(x0,y0,x1,y1)` macro) creates the top-level window, positions it, and attaches a self-editing `Parasite` so the frame's own rect is live-editable and source-rewritable.
+- `FrameBox::open()` has two overloads selected by the first argument type. `open(CWinApp* app, x0,y0,x1,y1, ...)` calls `attach(app)` then creates a top-level `WS_OVERLAPPEDWINDOW`; `open(CWnd* owner, x0,y0,x1,y1, ...)` creates an owned popup (`WS_POPUP | WS_CAPTION | WS_SYSMENU`) then calls `owner->EnableWindow(FALSE)`. Both attach a self-editing `Parasite`. Coordinates are SCREEN coordinates. A bare `0`/`nullptr` must not be passed (overloads would be ambiguous). Use the `OpenFrame(p, x0,y0,x1,y1)` macro so file/line are injected. Driving construction as a member call (not a constructor) allows `FrameBox` subclasses to override `WindowProc` etc.
 - `FrameBox::attach(CWinApp*)` binds the frame as the app main window (`m_pMainWnd = this`) and clears it in `close()`/`~FrameBox`, so no `CFrameWnd`-style `WM_QUIT` posting can apply.
 - `FrameBox::~FrameBox()` (= `close()`) tears the registry down in reverse registration order (children first): delete `Parasite` (removes subclass) -> `DestroyWindow` -> delete `wnd`. A child-frame entry's `delete wnd` recurses into its own `~FrameBox`. This replaces the former global `DeleteLayOutWindows()`.
 - `FrameBox::timer()` supports control of the `listen()` wait loop.
 - `FrameBox::PreTranslateMessage` intercepts ESC (post `WM_CLOSE`) and Enter (click focused push button) in both normal and edit mode, matching `CDialog` keyboard behaviour. Exception: if the focused window returns `DLGC_WANTALLKEYS`, both keys pass through unmodified so terminal-style child windows (e.g. `cConBox`) can receive raw Enter and Esc.
-- `add_zone` (`AddZone`) creates a `WS_CHILD | WS_EX_CONTROLPARENT` child container frame drawn inside the parent (the former `cLayOutZone` role). `add_frame` (`AddFrame`) creates a `WS_POPUP` separate-window child frame. Both are owned by the parent's registry and destroyed recursively. A child's controls are reflected by the child (its `WindowProc` runs reflection regardless of `listen()` state), but the report target is whichever frame called `listen()`, so an ancestor frame can `listen()` controls living in a child zone with no relay. True-modal behaviour for `AddFrame` is the caller's responsibility (`EnableWindow(parent, FALSE)` around the child's `listen()`).
+- `add_zone` (`AddZone`) creates a `WS_CHILD | WS_EX_CONTROLPARENT` child container frame drawn inside the parent (the former `cLayOutZone` role). `add_frame` (`AddFrame`) creates a `WS_POPUP` separate-window child frame. Both are owned by the parent's registry and destroyed recursively. A child's controls are reflected by the child (its `WindowProc` runs reflection regardless of `listen()` state), but the report target is whichever frame called `listen()`, so an ancestor frame can `listen()` controls living in a child zone with no relay. True-modal behaviour for `AddFrame` is the caller's responsibility (`EnableWindow(parent, FALSE)` around the child's `listen()`); alternatively `Sub.OpenFrame(parentFrame, ...)` (the `CWnd*` overload) builds a modal owned-popup sub-dialog that disables its owner automatically and re-enables + reactivates it in `close()`.
 - Default control styles:
   - `add_static`: `SS_LEFT | SS_CENTERIMAGE`.
   - `add_button`: `BS_PUSHBUTTON`.
@@ -67,7 +67,7 @@ Project-wide environment, encoding, folder, build, and coding rules are defined 
 - `AlignText` maps a keypad-style placement value from 1 to 9 to the text alignment behavior appropriate for the window class.
 - `AddAsItIs(x0,y0,x1,y1, wnd)` attaches `Parasite` to an already-created `CWnd` and moves it to the given rect (borrowed: the registry stores `Parasite` only, not the `CWnd`). When all four coordinates are `0`, it operates in attach-only mode: the window is not moved, and `last_rect` is populated from the current `GetWindowRect` result (parent-relative). Prefer `AddNew` for windows created for the UI; reserve `AddAsItIs` for borrowed windows whose lifetime is owned elsewhere.
 - `AddNew(x0,y0,x1,y1, wnd)` behaves like `AddAsItIs` but transfers ownership of the `new`'d `wnd` to the registry, so `close()` also `DestroyWindow`s and `delete`s it (`wnd` must be heap-allocated with `new`). Externally-created `CWnd`-derived windows (e.g. `new cConBox`) use this form.
-- The root `FrameBox` is created with `new`, bound via `attach(theApp)`, and opened via `Open(...)`. The function that created it (e.g. the modal-loop driver called from `InitInstance`) `delete`s it before returning. Because the root and all its heap members (controls, attached `cConBox`, `Parasite`s) are released inside that function -- before the CRT exit leak snapshot -- no global cleanup call and no global/static window object are needed.
+- The root `FrameBox` is a STACK LOCAL inside the modal-loop driver (e.g. `DemoMain()`): `FrameBox Top; Top.OpenFrame(&theApp, ...);`. `~FrameBox` runs at scope exit, releasing the root and all its heap members (controls, attached `cConBox`, `Parasite`s) before the CRT exit leak snapshot, so no global cleanup call and no global/static window object are needed.
 
 ## 2. ConBox
 
@@ -106,6 +106,7 @@ Project-wide environment, encoding, folder, build, and coding rules are defined 
 - Instead of the default `WS_VSCROLL`, which consumes client pixels, `cConBox` renders a custom rounded overlay scrollbar at the edge of the view.
 - The overlay scrollbar fades out during normal idle state.
 - The mouse cursor remains `IDC_ARROW`, matching Windows Terminal behavior.
+- The text cursor (block/underline/I-beam) is hidden when the window does not have keyboard focus (`WM_KILLFOCUS`). It reappears immediately on `WM_SETFOCUS` with the blink timer restarted.
 
 ### 2.5 Output and VT Escape Parsing
 

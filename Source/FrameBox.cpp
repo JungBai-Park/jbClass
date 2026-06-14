@@ -13,7 +13,7 @@
     [PROC]       proc (static) -> dispatch (instance message router)
     [EDIT]       toggle/enter/leave edit, on_key, on_drag, paint_frame, get_rect
     [SIGNAL]     signal()  (post WM_PARASITE_REPORT)
-    [REWRITE]    find_char + LayOutRewrite  (rewrite Add.../Open(...) literals)
+    [REWRITE]    find_char + LayOutRewrite  (rewrite OpenFrame/Add... literals)
     [HOST]       FrameBox: ctor/dtor/close, create_window, open, attach, timer,
                  add_* member factories + finish_child, WindowProc,
                  PreTranslateMessage (ESC/Enter), surveil, listen_core
@@ -41,13 +41,12 @@
       WM_NCLBUTTONDOWN; for child windows SetCapture + WM_MOUSEMOVE is used.
 */
 
-#include <afxwin.h>
+#include "FrameBox.h"  // must come first: defines _WIN32_WINNT before pulling in afxwin.h
 #include <afxpriv.h>   // AfxHookWindowCreate / AfxUnhookWindowCreate (MFC window creation hook).
-                       // MUST precede FrameBox.h: the Open()/Add* factory macros would otherwise
-                       // expand MFC's own Open(...) members (e.g. CFile::Open) in afxpriv.h.
+                       // The Add*/OpenFrame factory macros are function-like with >=4 args, so
+                       // they do NOT collide with MFC's own Open(...) members; order is free now.
 #include <vector>
 #include <string>
-#include "FrameBox.h"
 
 // ======================================================================
 // [LIFETIME]
@@ -539,9 +538,12 @@ void Parasite::leave_edit(HWND h, bool commit) {
     if (active() == this) active() = nullptr;
 
     if (!commit) {
-        // Restore to last committed rect (parent-client coords).
-        HWND parent = ::GetParent(h);
-        if (parent)
+        // Restore to last committed rect. Children use parent-client coords
+        // (MoveWindow); top-level and popup frames use screen coords
+        // (SetWindowPos). Decide by WS_CHILD, not GetParent (a popup's parent is
+        // its owner) so last_rect's coordinate space matches the restore call.
+        bool is_child = (::GetWindowLongW(h, GWL_STYLE) & WS_CHILD) != 0;
+        if (is_child)
             ::MoveWindow(h, last_rect.left, last_rect.top,
                          last_rect.Width(), last_rect.Height(), TRUE);
         else
@@ -647,8 +649,13 @@ void Parasite::paint_frame(HWND h) {
 
 void Parasite::get_rect(HWND h, CRect& out) {
     ::GetWindowRect(h, &out);                  // screen coords
+    // Convert to parent-client coords ONLY for real children (WS_CHILD). A
+    // WS_POPUP frame's GetParent() returns its OWNER, so testing GetParent here
+    // would wrongly map it to owner-client coords; top-level and popup frames
+    // must stay in screen coords (that is how they are created/moved).
+    bool is_child = (::GetWindowLongW(h, GWL_STYLE) & WS_CHILD) != 0;
     HWND parent = ::GetParent(h);
-    if (parent)                                // -> parent client coords
+    if (is_child && parent)
         ::MapWindowPoints(HWND_DESKTOP, parent, reinterpret_cast<POINT*>(&out), 2);
 }
 
@@ -734,11 +741,18 @@ bool LayOutRewrite(const char* file, int line, const RECT& rect) {
     for (int n = 1; fgets(buff, sizeof(buff), src) != 0; n++) {
         if (n != line) { fputs(buff, dst); continue; }
 
-        // Anchor on a member-call macro: `obj->Xxx(` or `obj.Xxx(` whose
-        // identifier starts uppercase (Add*/Open) and whose first argument is an
-        // integer literal. Coordinates are ALWAYS the first four arguments, so
-        // rewrite them in place and preserve the tail (init string or wnd ptr).
+        // Determine the layout-call form on this line; the form fixes where the
+        // coordinates start. Both accepted forms are member calls (.Xxx / ->Xxx
+        // where Xxx starts uppercase):
+        //   obj.OpenFrame(p, x0,y0,x1,y1)   -> coords start at the 2nd argument
+        //                                      (1st arg is the app/owner pointer)
+        //   obj.AddXxx(x0,y0,x1,y1[, extra]) -> coords start at the 1st argument
+        //                                      (arg1 is an integer literal)
+        // lp = the call's '(' ; coord_anchor = the separator just BEFORE x0
+        // (lp for AddXxx, or the 1st top-level comma for OpenFrame).
         const char* lp = nullptr;
+        const char* coord_anchor = nullptr;
+
         for (const char* p = buff; *p; p++) {
             const char* id = (p[0] == '-' && p[1] == '>') ? p + 2
                            : (p[0] == '.')                ? p + 1 : nullptr;
@@ -746,24 +760,31 @@ bool LayOutRewrite(const char* file, int line, const RECT& rect) {
             const char* q = id;
             while ((*q >= 'A' && *q <= 'Z') || (*q >= 'a' && *q <= 'z') ||
                    (*q >= '0' && *q <= '9') || *q == '_') q++;
+            bool is_open = (q - id == 9) && strncmp(id, "OpenFrame", 9) == 0;
             while (*q == ' ' || *q == '\t') q++;
             if (*q != '(') continue;
+            if (is_open) {                                         // skip the pointer arg
+                lp = q; coord_anchor = find_char(',', lp + 1); break;
+            }
             const char* a = q + 1;
             while (*a == ' ' || *a == '\t') a++;
-            if (*a == '-' || (*a >= '0' && *a <= '9')) { lp = q; break; }
+            if (*a == '-' || (*a >= '0' && *a <= '9')) { lp = q; coord_anchor = q; break; }
         }
 
-        // From '(', step past x0,y0,x1 (3 top-level commas); rp is the closing paren.
-        const char* c3 = lp ? find_char(',', lp + 1) : nullptr;
-        const char* c4 = c3 ? find_char(',', c3 + 1) : nullptr;
-        const char* c5 = c4 ? find_char(',', c4 + 1) : nullptr;
-        const char* c6 = c5 ? find_char(',', c5 + 1) : nullptr;   // comma before a 5th arg, if any
+        // From coord_anchor, step past x0,y0,x1 (3 top-level commas); rp is the
+        // closing paren. e4 is the comma before any trailing arg (init / wnd).
+        const char* e1 = coord_anchor ? find_char(',', coord_anchor + 1) : nullptr;
+        const char* e2 = e1 ? find_char(',', e1 + 1) : nullptr;
+        const char* e3 = e2 ? find_char(',', e2 + 1) : nullptr;   // comma after x1
+        const char* e4 = e3 ? find_char(',', e3 + 1) : nullptr;   // comma before a trailing arg
         const char* rp = lp ? find_char(')', lp + 1) : nullptr;
-        const char* tail = (c6 && c6 < rp) ? c6 : rp;             // ", extra)" or just ")"
+        const char* tail = (e4 && rp && e4 < rp) ? e4 : rp;       // ", extra)" or just ")"
 
-        if (lp && c5 && rp && c5 < rp) {
+        if (coord_anchor && e3 && rp && e3 < rp) {
+            const char* pre = coord_anchor + 1;
+            while (*pre == ' ' || *pre == '\t') pre++;            // first coord char
             const char* s;
-            for (s = buff; s <= lp; s++) putc(*s, dst);           // copy through '('
+            for (s = buff; s < pre; s++) putc(*s, dst);           // copy leading text verbatim
             fprintf(dst, "%d, %d, %d, %d",
                     (int)rect.left, (int)rect.top, (int)rect.right, (int)rect.bottom);
             for (s = tail; *s != 0; s++) putc(*s, dst);
@@ -791,7 +812,7 @@ END_MESSAGE_MAP()
 static const UINT_PTR MODAL_TIMER_ID = 1;
 
 FrameBox::FrameBox()
-    : next_id(1001), app(nullptr), self_layout(nullptr),
+    : next_id(1001), app(nullptr), parent(nullptr), self_layout(nullptr),
       waiting(false), timer_fired(false), event(nullptr), timer_id(0) {
 }
 
@@ -822,6 +843,19 @@ void FrameBox::close() {
     registry.shrink_to_fit();            // release buffer so the CRT leak checker stays silent
     delete self_layout;
     self_layout = nullptr;
+    // Re-enable AND reactivate the owner BEFORE destroying this window (modal
+    // sub-dialog case). EnableWindow(TRUE) alone only restores input -- it does
+    // not change activation/Z-order, so destroying the still-active owned popup
+    // would let the system hand activation to whatever sits below it, dropping
+    // the owner one step down. SetActiveWindow() makes the owner active first so
+    // its Z-order is preserved. nullptr for main window / zone frames.
+    if (parent) {
+        if (::IsWindow(parent->m_hWnd)) {
+            parent->EnableWindow(TRUE);
+            parent->SetActiveWindow();
+        }
+        parent = nullptr;
+    }
     if (::IsWindow(m_hWnd)) DestroyWindow();
 }
 
@@ -848,11 +882,30 @@ bool FrameBox::create_window(DWORD exStyle, DWORD style, CWnd* parent, const CRe
     return hwnd != nullptr;
 }
 
-// Root form: create a top-level window, position it, and attach a self-editing
-// Parasite so the frame's own rect is live-editable + source-rewritable.
-bool FrameBox::open(int x0, int y0, int x1, int y1, const char* file, int line) {
+// open() public overloads -- selected by the first argument type. OpenFrame
+// injects file/line at the call site. Both delegate to open_core() for the
+// shared create/position/self-edit work; the type-specific extras (app binding
+// vs owner-disable) wrap it.
+bool FrameBox::open(CWinApp* a, int x0, int y0, int x1, int y1, const char* file, int line) {
+    attach(a);                                    // main window: bind as m_pMainWnd
+    return open_core(nullptr, x0, y0, x1, y1, file, line);   // top-level
+}
+
+bool FrameBox::open(CWnd* p, int x0, int y0, int x1, int y1, const char* file, int line) {
+    bool ok = open_core(p, x0, y0, x1, y1, file, line);      // owned popup
+    if (p && ::IsWindow(m_hWnd)) p->EnableWindow(FALSE);     // modal: disable owner
+    return ok;
+}
+
+// Shared core: create the window, position it, and attach a self-editing Parasite
+// so the frame's own rect is live-editable + source-rewritable. owner==nullptr ->
+// a top-level window; owner!=nullptr -> an owned popup (modal sub-dialog), stored
+// for close() to re-enable.
+bool FrameBox::open_core(CWnd* p, int x0, int y0, int x1, int y1, const char* file, int line) {
+    parent = p;
+    DWORD style = p ? (WS_POPUP | WS_CAPTION | WS_SYSMENU) : WS_OVERLAPPEDWINDOW;
     if (!::IsWindow(m_hWnd)) {
-        if (!create_window(0, WS_OVERLAPPEDWINDOW, nullptr, CRect(x0, y0, x1, y1)))
+        if (!create_window(0, style, p, CRect(x0, y0, x1, y1)))
             return false;
     } else {
         MoveWindow(x0, y0, x1 - x0, y1 - y0, TRUE);
@@ -1184,9 +1237,34 @@ LRESULT FrameBox::WindowProc(UINT msg, WPARAM wParam, LPARAM lParam) {
 // commits and ESC cancels the drag). In normal mode both keys are still always consumed,
 // EXCEPT when the focused window returns DLGC_WANTALLKEYS (e.g. cConBox terminal widget).
 BOOL FrameBox::PreTranslateMessage(MSG* pMsg) {
+    // While a window is in layout-edit mode, the edit gestures must stay with the
+    // editing window and the OTHER controls must be inert. Messages destined for a
+    // child walk up to this frame's PreTranslateMessage, so handle them here.
+    HWND edit = Parasite::editing_hwnd();        // NULL in release builds
+    if (edit) {
+        UINT m = pMsg->message;
+        // The editing window's own keydowns: yield to its subclass proc (it does
+        // the move/resize and eats the rest; commit on Enter, cancel on Esc).
+        if (m == WM_KEYDOWN && pMsg->hwnd == edit) return FALSE;
+        // Edit keys while a different control holds focus: route to the editor and
+        // consume, so the focused child does not move its caret / change selection.
+        if (m == WM_KEYDOWN) {
+            UINT vk = static_cast<UINT>(pMsg->wParam);
+            if (vk == VK_LEFT || vk == VK_RIGHT || vk == VK_UP || vk == VK_DOWN ||
+                vk == VK_RETURN || vk == VK_ESCAPE) {
+                ::SendMessageW(edit, WM_KEYDOWN, vk, pMsg->lParam);
+                return TRUE;
+            }
+        }
+        // Keep non-editing controls inert: swallow their mouse input so they do
+        // not hover-highlight or steal focus. WM_MBUTTONDOWN passes through so the
+        // user can still toggle edit on another control (or off).
+        if (m >= WM_MOUSEFIRST && m <= WM_MOUSELAST &&
+            m != WM_MBUTTONDOWN && pMsg->hwnd != edit)
+            return TRUE;
+    }
+
     if (pMsg->message == WM_KEYDOWN) {
-        // Yield to Parasite only when the message target is the editing window.
-        if (Parasite::editing_hwnd() == pMsg->hwnd) return FALSE;
         // If the focused window claims all keys (e.g. ConBox terminal), let it handle
         // Esc/Enter directly instead of consuming them here.
         CWnd* focus = GetFocus();
