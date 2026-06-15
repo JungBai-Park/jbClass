@@ -364,6 +364,13 @@
       </Command>
     </PreBuildEvent>
   </ItemDefinitionGroup>
+  <!-- Merge PerMonitorV2 DPI manifest into all configurations. -->
+  <ItemDefinitionGroup>
+    <Manifest>
+      <AdditionalManifestFiles>jbClass.manifest</AdditionalManifestFiles>
+    </Manifest>
+  </ItemDefinitionGroup>
+
   <ItemGroup>
     <ClInclude Include="..\Source\ConBox.h" />
     <ClInclude Include="..\Source\FrameBox.h" />

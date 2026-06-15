@@ -26,9 +26,32 @@ This file records project-specific pitfalls and implementation details that are 
 - The project `Temp\` directory can be automatically reset at session boundaries.
 - Do not recursively delete `Temp\` during a live development session because harness outputs may still depend on files under it.
 
-### 1.4 Development Monitor Layout
+### 1.4 Per-Monitor V2 DPI Activation in MFC Static-Link Builds
 
-- The dev machine uses two stacked 1920x1080 monitors: PRIMARY at the bottom (origin, so screen `y: 0..1080`) and SECONDARY above it (screen `y: -1080..0`).
+- `SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)` called from
+  `InitInstance()` or even a global object constructor **always fails with LastError=5** when
+  `UseOfMfc=Static` (MFC statically linked).
+- Root cause: the MFC static CRT initializer calls `SetProcessDPIAware()` (System-aware) before
+  any user code, including global constructors. The system rejects any downgrade or change attempt.
+- Only solution: embed a manifest declaring `PerMonitorV2` so the OS loader sets awareness
+  before the process starts. Use `AdditionalManifestFiles` in vcxproj:
+  ```xml
+  <ItemDefinitionGroup>
+    <Manifest>
+      <AdditionalManifestFiles>jbClass.manifest</AdditionalManifestFiles>
+    </Manifest>
+  </ItemDefinitionGroup>
+  ```
+  The `.manifest` file is merged and embedded into the EXE at link time (`RT_MANIFEST`, type 24, ID 1).
+  No separate file is needed at runtime.
+- The manifest file itself only contains the DPI awareness declaration. Common Controls 6.0
+  dependency stays in source code via `#pragma comment(linker, "/manifestdependency:...")`.
+- Diagnostic: log `GetThreadDpiAwarenessContext()` result at startup; `SYS=1` confirms the
+  CRT initializer already set System-aware before the code-based API call.
+
+### 1.5 Development Monitor Layout
+
+- The dev machine uses two stacked 1920x1080 monitors: PRIMARY at the bottom (origin, so screen `y: 0..1080`, 125% scale = 120 DPI) and SECONDARY above it (screen `y: -1080..0`, 100% scale = 96 DPI).
 - So negative Y coordinates (e.g. the demo main window / sub-frame) are ON the upper secondary monitor, not off-screen. Pick screen coords accordingly when placing top-level/popup frames (`OpenFrame` coords are screen-based).
 
 ## 2. Source Compatibility Pitfalls
@@ -132,6 +155,18 @@ This file records project-specific pitfalls and implementation details that are 
 - `EnableWindow(owner, TRUE)` only restores input; it does NOT change activation/Z-order.
 - Symptom: closing the modal sub-dialog dropped the owner one step down in Z-order (the system handed activation to whatever sat below the destroyed, still-active popup).
 - Fix: in `close()`, BEFORE `DestroyWindow()` of the owned popup, call `owner->EnableWindow(TRUE)` then `owner->SetActiveWindow()` so the owner is already the active window when the popup is destroyed. Order matters (re-enable + reactivate, then destroy).
+
+### 3.9 GetDpiForWindow Returns Owner's DPI for Owned Popup Windows
+
+- For a `WS_POPUP` window whose owner is on a different-DPI monitor, `GetDpiForWindow` called
+  immediately after `CreateWindowExW` can return the **owner's** DPI, not the DPI of the monitor
+  where the popup rect was actually placed.
+- Symptom: a popup at `(929, -628)` on the 96 DPI secondary monitor appeared 25% too large and
+  the font was too large, because the owner (main window) was on the 120 DPI primary monitor.
+- Fix: determine the target DPI **before** creating the window via `MonitorFromPoint` (center of
+  the intended rect) + `GetDpiForMonitor(MDT_EFFECTIVE_DPI)`. This is correct regardless of
+  ownership. Requires `<shellscalingapi.h>` and `Shcore.lib` (added to FrameBox.cpp).
+- `FrameBox::open_core` now uses this approach for all window creation paths.
 
 ### 3.8 Frame Self-Edit: Child Input Isolation
 

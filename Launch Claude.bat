@@ -9,7 +9,7 @@ if not exist "%TEMP%"   mkdir "%TEMP%"
 if /i "%~1" == "up" goto :upgrade
 
 :claude
-    sudo "D:\ETC\Programs\Node.js\node_modules\@anthropic-ai\claude-code\bin\claude.exe" --allow-dangerously-skip-permissions %*
+    sudo "D:\ETC\Programs\Node.js\node_modules\@anthropic-ai\claude-code\bin\claude.exe" --remote-control --allow-dangerously-skip-permissions %*
     goto quit
 
 :upgrade

@@ -184,12 +184,13 @@ private:
     int         signal_codes[MAX_SIGNAL_CODES];
     int         signal_count;
     CWnd*       report;       // host registered via WM_PARASITE_SURVEIL
+    CRect       last_rect;    // 96 DPI logical rect; set at layout()/enter_edit(), updated on commit;
+                              // used for ESC restore, no-op rewrite skip, and DPI reposition (Step 3+)
 
 #if defined(_DEBUG)
     const char* file;
     int         line;
     bool        editing;     // layout edit mode on/off
-    CRect       last_rect;    // rect at open() time, updated on each commit; used for ESC restore and no-op rewrite skip
     // Manual drag state (child controls only; top-level uses OS WM_NCLBUTTONDOWN loop)
     CPoint      drag_start;     // cursor screen pos at WM_LBUTTONDOWN
     CRect       drag_rect;      // window screen rect at WM_LBUTTONDOWN
@@ -226,8 +227,9 @@ bool LayOutRewrite(const char* file, int line, const RECT& rect);
 //     modal sub-dialog (disables the owner). Use the OpenFrame(p,...) macro so
 //     file/line are injected (see below / file header).
 //   - add_*(): child-control factories (AddStatic/AddButton/...). Each creates
-//     the control as a child of this frame, applies the system UI font, attaches
-//     a Parasite, and registers { wnd, Parasite } in this frame's registry.
+//     the control as a child of this frame, sends the DPI-correct system font,
+//     attaches a Parasite, registers { wnd, Parasite }, and scales the control
+//     from 96 DPI logical source coords to physical pixels at the frame's DPI.
 //   - add_zone(): WS_CHILD|WS_EX_CONTROLPARENT container frame drawn inside this
 //     frame (replaces the old ParasiteZone). add_frame(): WS_POPUP separate-window
 //     child frame. Both are owned by this frame's registry (destroyed recursively).
@@ -357,6 +359,8 @@ private:
     bool      timer_fired;                // set by WM_TIMER while waiting, consumed by listen_core
     CWnd*     event;
     UINT_PTR  timer_id;                   // 0 = no active timer
+    int       dpi;                        // DPI at window creation; updated on WM_DPICHANGED (Step 3)
+    HFONT     sys_font;                   // DPI-correct message font; created in open()/make_child(), freed in close()
 };
 
 // ---- Factory macros: member-call form that injects __FILE__/__LINE__ ----

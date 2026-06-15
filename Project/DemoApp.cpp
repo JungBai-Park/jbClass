@@ -2,13 +2,24 @@
     DemoApp.cpp - CWinApp entry + DemoMain() exercising FrameBox.
 
     A listen() modal loop dispatching on the returned pointer. The root window is
-    a FrameBox (stack local, opened via OpenFrame) that OWNS its controls (Add*
+    a cDemoBox (FrameBox subclass, stack local) that OWNS its controls (Add*
     member factories) and a cConBox attached via AddNew. InitInstance runs
     DemoMain() then returns FALSE; DemoMain drives everything through listen() and
     ~FrameBox tears down all children + clears m_pMainWnd at scope exit.
 
+    cDemoBox overrides WindowProc to:
+      - WM_DPICHANGED: update title bar with current DPI + received count (verification).
+      - WM_SYSCOMMAND: handle custom system menu items (Save EMF/Text/PDF, Log).
+
+    cDemoSub (FrameBox subclass for the modal sub-dialog) overrides WindowProc to:
+      - WM_DPICHANGED: update title bar with current DPI + received count (verification).
+
     DemoSub() shows a modal sub-dialog: Sub.OpenFrame(owner,...) disables owner
     until the sub-frame goes out of scope (close() re-enables owner).
+
+    DPI awareness: PerMonitorV2 is declared in jbClass.manifest (embedded in EXE
+    at link time via AdditionalManifestFiles). Code-based SetProcessDpiAwarenessContext
+    does NOT work with UseOfMfc=Static -- see Learned.md section 1.4.
 
     The OpenFrame()/Add* call sites below are the live-edit / source-rewrite
     targets: middle-click a control (or the frame), move/resize it, press Enter,
@@ -53,6 +64,14 @@ public:
 class cDemoBox : public FrameBox {
 public:
     cConBox* con_box = nullptr;
+    int dpi_changed_count = 0;
+
+    void update_title() {
+        wchar_t buf[80];
+        swprintf_s(buf, _countof(buf), L"cParasite Demo [DPI: %d, DPICHANGED: %d]",
+                   ::GetDpiForWindow(m_hWnd), dpi_changed_count);
+        ::SetWindowTextW(m_hWnd, buf);
+    }
 
     void setup_sysmenu() {
         HMENU hSys = ::GetSystemMenu(m_hWnd, FALSE);
@@ -66,6 +85,13 @@ public:
     }
 
     LRESULT WindowProc(UINT msg, WPARAM wp, LPARAM lp) override {
+        if (msg == WM_DPICHANGED) {
+            TRACE(L"[cDemoBox] WM_DPICHANGED received: DPI=%d\n", (int)LOWORD(wp));
+            ++dpi_changed_count;
+            LRESULT r = FrameBox::WindowProc(msg, wp, lp);
+            update_title();
+            return r;
+        }
         if (msg == WM_SYSCOMMAND && con_box) {
             UINT id = (UINT)(wp & 0xFFF0);
             if (id == ID_SAVE_EMF) {
@@ -168,14 +194,36 @@ public:
     }
 };
 
+class cDemoSub : public FrameBox {
+public:
+    int dpi_changed_count = 0;
+
+    void update_title() {
+        wchar_t buf[80];
+        swprintf_s(buf, _countof(buf), L"Modal Sub [DPI: %d, DPICHANGED: %d]",
+                   ::GetDpiForWindow(m_hWnd), dpi_changed_count);
+        ::SetWindowTextW(m_hWnd, buf);
+    }
+
+    LRESULT WindowProc(UINT msg, WPARAM wp, LPARAM lp) override {
+        if (msg == WM_DPICHANGED) {
+            TRACE(L"[cDemoSub] WM_DPICHANGED received: DPI=%d\n", (int)LOWORD(wp));
+            ++dpi_changed_count;
+            LRESULT r = FrameBox::WindowProc(msg, wp, lp);
+            update_title();
+            return r;
+        }
+        return FrameBox::WindowProc(msg, wp, lp);
+    }
+};
+
 cDemoApp theApp;
 
 void DemoMain() {
     cDemoBox Top;
-    Top.OpenFrame(&theApp, 322, -897, 1418, -222);   // main + self live-edit
-    ::SetWindowTextW(Top.m_hWnd, L"cParasite Demo");
+    Top.OpenFrame(&theApp, 100, 100, 1000, 800);   // main + self live-edit
     Top.CenterWindow();
-    Top.timer(500);                       // 0.5s repeating timer
+    Top.update_title();   // show initial DPI (count=0)
 
     cConBox* conBox = new cConBox;
     conBox->setup_from_ini("..\\..\\Documents\\ConBox.ini");
@@ -185,6 +233,7 @@ void DemoMain() {
     Top.setup_sysmenu();
 
     CEdit*     edit   = Top.AddEdit  (25, 430, 410, 490);
+
     CButton*   button = Top.AddButton(25, 579, 129, 611, "Close");
     CButton*   subBtn = Top.AddButton(140, 579, 244, 611, "Sub");
     CStatic*   label  = Top.AddStatic(29, 508, 279, 532, "강누리 만세");
@@ -193,26 +242,20 @@ void DemoMain() {
     AlignText(edit, 5);
     AlignText(label, 3);
 
-    int tick = 0;
     while (::IsWindow(Top)) {
         CWnd* ev = Top.listen(edit, button, subBtn, label, combo);
         if (ev == 0)      break;          // window closed
         if (ev == button) break;          // Close button -> quit
         if (ev == subBtn) DemoSub(&Top);  // open the modal sub-dialog
-        if (ev == &Top) {                 // timer fired
-            wchar_t title[64];
-            swprintf_s(title, _countof(title), L"cParasite Demo - %d", ++tick);
-            ::SetWindowTextW(Top.m_hWnd, title);
-        }
     }
 }
 
 // Modal sub-dialog: Sub.OpenFrame(owner,...) opens an owned popup and disables
 // owner (CWnd* overload); ~Sub at scope exit re-enables owner via close().
 void DemoSub(CWnd* owner) {
-    FrameBox Sub;
+    cDemoSub Sub;
     Sub.OpenFrame(owner, 929, -628, 1229, -408);   // centered on the top (secondary) monitor
-    ::SetWindowTextW(Sub.m_hWnd, L"Modal Sub");
+    Sub.update_title();   // show initial DPI (count=0)
     CStatic* msg = Sub.AddStatic(22, 124, 262, 148, "모달 서브 프레임");
     CButton* ok  = Sub.AddButton(40, 70, 160, 102, "OK");
     AlignText(msg, 5);

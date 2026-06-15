@@ -45,6 +45,8 @@
 #include <afxpriv.h>   // AfxHookWindowCreate / AfxUnhookWindowCreate (MFC window creation hook).
                        // The Add*/OpenFrame factory macros are function-like with >=4 args, so
                        // they do NOT collide with MFC's own Open(...) members; order is free now.
+#include <shellscalingapi.h>  // GetDpiForMonitor
+#pragma comment(lib, "Shcore.lib")
 #include <vector>
 #include <string>
 
@@ -58,9 +60,7 @@ Parasite::Parasite()
     , file(nullptr), line(0), editing(false), drag_edge(0)
 #endif
 {
-#if defined(_DEBUG)
-    last_rect.SetRectEmpty();
-#endif
+    last_rect.SetRectEmpty();  // needed in release builds for DPI reposition (D4)
 }
 
 Parasite::~Parasite() {
@@ -89,14 +89,12 @@ HWND Parasite::editing_hwnd() {
 #endif
 
 // ======================================================================
-// [HELPERS]  process-wide UI font shared by FrameBox child factories
+// [HELPERS]  DPI font helpers; process-wide UI font fallback
 // ======================================================================
 
 namespace {
-    // Returns the process-wide UI font (Segoe UI 9pt on Vista+).
-    // Controls created via Create() default to the legacy SYSTEM_FONT bitmap font;
-    // sending WM_SETFONT here makes them match dialog/Explorer appearance.
-    // The HFONT is intentionally leaked -- it must outlive all controls.
+    // Fallback: process-wide 96 DPI UI font (Segoe UI 9pt). Used when sys_font
+    // is not yet set (e.g. before open() is called). Intentionally leaked.
     HFONT default_ui_font() {
         static HFONT font = nullptr;
         if (!font) {
@@ -105,6 +103,17 @@ namespace {
             font = ::CreateFontIndirectW(&ncm.lfMessageFont);
         }
         return font;
+    }
+
+    // Create a DPI-correct message font. Caller owns the returned HFONT.
+    // Falls back to non-DPI SystemParametersInfoW if the DPI variant fails.
+    HFONT make_dpi_font(int font_dpi) {
+        NONCLIENTMETRICSW ncm = { sizeof(ncm) };
+        bool ok = (::SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS,
+                   sizeof(ncm), &ncm, 0, (UINT)font_dpi) != FALSE);
+        if (!ok)
+            ::SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0);
+        return ::CreateFontIndirectW(&ncm.lfMessageFont);
     }
 }
 
@@ -353,10 +362,10 @@ bool Parasite::layout(int x0, int y0, int x1, int y1,
                         const char* f, int ln) {
     if (!target || !::IsWindow(target->m_hWnd)) return false;
 
+    last_rect.SetRect(x0, y0, x1, y1);  // 96 DPI logical coords from the Add*/OpenFrame macro
 #if defined(_DEBUG)
     file = f;
     line = ln;
-    last_rect.SetRect(x0, y0, x1, y1);
 #else
     UNREFERENCED_PARAMETER(f);
     UNREFERENCED_PARAMETER(ln);
@@ -527,6 +536,15 @@ void Parasite::enter_edit(HWND h) {
         Parasite* prev = active();
         if (prev->target) prev->leave_edit(prev->target->m_hWnd, false);
     }
+    // Capture current physical position as logical coords for ESC restore.
+    CRect phys;
+    get_rect(h, phys);
+    int tdpi = ::GetDpiForWindow(h);
+    if (tdpi <= 0) tdpi = 96;
+    last_rect.SetRect(MulDiv(phys.left,   96, tdpi),
+                      MulDiv(phys.top,    96, tdpi),
+                      MulDiv(phys.right,  96, tdpi),
+                      MulDiv(phys.bottom, 96, tdpi));
     editing = true;
     active() = this;
     ::SetFocus(h);
@@ -538,26 +556,37 @@ void Parasite::leave_edit(HWND h, bool commit) {
     if (active() == this) active() = nullptr;
 
     if (!commit) {
-        // Restore to last committed rect. Children use parent-client coords
-        // (MoveWindow); top-level and popup frames use screen coords
-        // (SetWindowPos). Decide by WS_CHILD, not GetParent (a popup's parent is
-        // its owner) so last_rect's coordinate space matches the restore call.
+        // Restore pre-edit position: last_rect holds 96 DPI logical coords,
+        // convert to physical at current DPI. WS_CHILD vs popup: same rule as get_rect.
+        int tdpi = ::GetDpiForWindow(h);
+        if (tdpi <= 0) tdpi = 96;
+        CRect phys(MulDiv(last_rect.left,   tdpi, 96),
+                   MulDiv(last_rect.top,    tdpi, 96),
+                   MulDiv(last_rect.right,  tdpi, 96),
+                   MulDiv(last_rect.bottom, tdpi, 96));
         bool is_child = (::GetWindowLongW(h, GWL_STYLE) & WS_CHILD) != 0;
         if (is_child)
-            ::MoveWindow(h, last_rect.left, last_rect.top,
-                         last_rect.Width(), last_rect.Height(), TRUE);
+            ::MoveWindow(h, phys.left, phys.top, phys.Width(), phys.Height(), TRUE);
         else
-            ::SetWindowPos(h, NULL, last_rect.left, last_rect.top,
-                           last_rect.Width(), last_rect.Height(),
+            ::SetWindowPos(h, NULL, phys.left, phys.top, phys.Width(), phys.Height(),
                            SWP_NOZORDER | SWP_NOACTIVATE);
     }
 
     if (commit && file) {
-        CRect rc;
-        get_rect(h, rc);
-        if (rc != last_rect) {
-            LayOutRewrite(file, line, rc);
-            last_rect = rc;
+        CRect phys;
+        get_rect(h, phys);
+        int tdpi = ::GetDpiForWindow(h);
+        if (tdpi <= 0) tdpi = 96;
+        // Convert physical to logical for comparison and storage.
+        // NOTE: LayOutRewrite still receives physical coords here; Step 4 will
+        // change it to pass logical coords so the source file stores 96 DPI values.
+        CRect logical(MulDiv(phys.left,   96, tdpi),
+                      MulDiv(phys.top,    96, tdpi),
+                      MulDiv(phys.right,  96, tdpi),
+                      MulDiv(phys.bottom, 96, tdpi));
+        if (logical != last_rect) {
+            LayOutRewrite(file, line, phys);
+            last_rect = logical;
         }
     }
 
@@ -813,7 +842,8 @@ static const UINT_PTR MODAL_TIMER_ID = 1;
 
 FrameBox::FrameBox()
     : next_id(1001), app(nullptr), parent(nullptr), self_layout(nullptr),
-      waiting(false), timer_fired(false), event(nullptr), timer_id(0) {
+      waiting(false), timer_fired(false), event(nullptr), timer_id(0),
+      dpi(96), sys_font(nullptr) {
 }
 
 FrameBox::~FrameBox() { close(); }
@@ -841,6 +871,7 @@ void FrameBox::close() {
     }
     registry.clear();
     registry.shrink_to_fit();            // release buffer so the CRT leak checker stays silent
+    if (sys_font) { ::DeleteObject(sys_font); sys_font = nullptr; }
     delete self_layout;
     self_layout = nullptr;
     // Re-enable AND reactivate the owner BEFORE destroying this window (modal
@@ -905,15 +936,40 @@ bool FrameBox::open_core(CWnd* p, int x0, int y0, int x1, int y1, const char* fi
     parent = p;
     DWORD style = p ? (WS_POPUP | WS_CAPTION | WS_SYSMENU) : WS_OVERLAPPEDWINDOW;
     if (!::IsWindow(m_hWnd)) {
+        // Create at logical coords (source-code 96 DPI values), then query actual
+        // DPI and scale to physical pixels before ShowWindow.
+        // Determine target-monitor DPI from the center of the intended rect BEFORE
+        // creating the window. GetDpiForWindow right after creation can return the
+        // owner's DPI for a popup whose owner is on a different-DPI monitor;
+        // MonitorFromPoint is always correct regardless of ownership.
+        {
+            POINT center = { (x0 + x1) / 2, (y0 + y1) / 2 };
+            HMONITOR mon = ::MonitorFromPoint(center, MONITOR_DEFAULTTONEAREST);
+            UINT mdpi = 96, dummy = 0;
+            ::GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &mdpi, &dummy);
+            dpi = (int)mdpi;
+        }
         if (!create_window(0, style, p, CRect(x0, y0, x1, y1)))
             return false;
+        if (dpi != 96) {
+            ::SetWindowPos(m_hWnd, nullptr,
+                MulDiv(x0, dpi, 96), MulDiv(y0, dpi, 96),
+                MulDiv(x1 - x0, dpi, 96), MulDiv(y1 - y0, dpi, 96),
+                SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        if (sys_font) { ::DeleteObject(sys_font); }
+        sys_font = make_dpi_font(dpi);
     } else {
-        MoveWindow(x0, y0, x1 - x0, y1 - y0, TRUE);
+        // Idempotent second call: reposition using current dpi.
+        ::SetWindowPos(m_hWnd, nullptr,
+            MulDiv(x0, dpi, 96), MulDiv(y0, dpi, 96),
+            MulDiv(x1 - x0, dpi, 96), MulDiv(y1 - y0, dpi, 96),
+            SWP_NOZORDER | SWP_NOACTIVATE);
     }
     if (!self_layout) {
         self_layout = new Parasite;
         self_layout->attach(this);
-        self_layout->layout(x0, y0, x1, y1, file, line);
+        self_layout->layout(x0, y0, x1, y1, file, line);  // stores logical last_rect
     }
     ShowWindow(SW_SHOW);
     return ::IsWindow(m_hWnd) != 0;
@@ -928,13 +984,18 @@ T* FrameBox::finish_child(T* wnd, BOOL ok, int x0, int y0, int x1, int y1,
                           const char* f, int ln, const char* init) {
     ASSERT(ok);
     if (!ok) { delete wnd; return nullptr; }
-    ::SendMessageW(wnd->m_hWnd, WM_SETFONT,
-                   reinterpret_cast<WPARAM>(default_ui_font()), FALSE);
+    HFONT font = sys_font ? sys_font : default_ui_font();
+    ::SendMessageW(wnd->m_hWnd, WM_SETFONT, reinterpret_cast<WPARAM>(font), FALSE);
     Parasite* p = new Parasite;
     registry.push_back({ wnd, p });
     p->attach(wnd);
-    p->layout(x0, y0, x1, y1, f, ln);
+    p->layout(x0, y0, x1, y1, f, ln);  // stores logical last_rect
     p->initialize(init);
+    // Scale from logical (96 DPI source coords) to physical pixels.
+    if (dpi != 96) {
+        wnd->MoveWindow(MulDiv(x0, dpi, 96), MulDiv(y0, dpi, 96),
+                        MulDiv(x1 - x0, dpi, 96), MulDiv(y1 - y0, dpi, 96), FALSE);
+    }
     return wnd;
 }
 
@@ -1078,14 +1139,19 @@ CHeaderCtrl* FrameBox::add_header(int x0,int y0,int x1,int y1,const char* f,int 
 FrameBox* FrameBox::make_child(DWORD exStyle, DWORD style,
                                int x0,int y0,int x1,int y1,const char* f,int ln) {
     FrameBox* child = new FrameBox;
-    if (!child->create_window(exStyle, style, this, CRect(x0,y0,x1,y1))) {
+    // Create at physical pixels (parent DPI; child zones are on the same monitor).
+    CRect phys(MulDiv(x0,dpi,96), MulDiv(y0,dpi,96),
+               MulDiv(x1,dpi,96), MulDiv(y1,dpi,96));
+    if (!child->create_window(exStyle, style, this, phys)) {
         delete child;
         return nullptr;
     }
+    child->dpi = dpi;
+    child->sys_font = make_dpi_font(dpi);
     Parasite* p = new Parasite;
     registry.push_back({ child, p });
     p->attach(child);
-    p->layout(x0, y0, x1, y1, f, ln);
+    p->layout(x0, y0, x1, y1, f, ln);  // stores logical last_rect
     child->ShowWindow(SW_SHOW);
     return child;
 }
@@ -1109,18 +1175,22 @@ FrameBox* FrameBox::add_frame(int x0,int y0,int x1,int y1,const char* f,int ln) 
 CWnd* FrameBox::attach_external(CWnd* wnd, bool owned,
                                 int x0,int y0,int x1,int y1,const char* f,int ln) {
     Parasite* p = new Parasite;
-    registry.push_back({ owned ? wnd : nullptr, p });   // borrowed entries store wnd==nullptr
+    registry.push_back({ owned ? wnd : nullptr, p });
     p->attach(wnd);
     if (x0 == 0 && y0 == 0 && x1 == 0 && y1 == 0) {
-        // attach-only: read current rect so last_rect is valid for ESC restore.
+        // Attach-only: read current physical rect and convert to logical for last_rect.
         CRect rc;
         wnd->GetWindowRect(&rc);
         CWnd* par = wnd->GetParent();
         if (par) par->ScreenToClient(&rc);
-        p->layout(rc.left, rc.top, rc.right, rc.bottom, f, ln);
+        p->layout(MulDiv(rc.left,   96, dpi),
+                  MulDiv(rc.top,    96, dpi),
+                  MulDiv(rc.right,  96, dpi),
+                  MulDiv(rc.bottom, 96, dpi), f, ln);
     } else {
-        p->layout(x0, y0, x1, y1, f, ln);
-        wnd->MoveWindow(CRect(x0,y0,x1,y1));
+        p->layout(x0, y0, x1, y1, f, ln);  // stores logical last_rect
+        wnd->MoveWindow(MulDiv(x0, dpi, 96), MulDiv(y0, dpi, 96),
+                        MulDiv(x1 - x0, dpi, 96), MulDiv(y1 - y0, dpi, 96));
     }
     wnd->ShowWindow(SW_SHOW);
     return wnd;
