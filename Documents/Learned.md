@@ -323,20 +323,19 @@ This file records project-specific pitfalls and implementation details that are 
 
 ### 5.4 In-Place Editing: SetFocus() Must Not Be Called From Inside the WM_KILLFOCUS Path
 
-- `TableEditBox`/`TableComboPopup` are private nested-by-coupling classes (not literal C++
-  nested classes) that need to call back into `TableBox`'s private `end_text_edit`/
-  `end_combo_edit` and read `ending_edit` -- granted via `friend class TableEditBox;` /
-  `friend class TableComboPopup;` in `TableBox.h`, since they are tightly-coupled
-  implementation details, not part of the public API.
+- The plain-text editor is a raw Unicode EDIT driven by the static `TableBox::EditSubclassProc`
+  (dwRefData = the `TableBox*`), NOT a `CEdit` subclass -- see 5.9 for why. `TableComboPopup` is
+  still a private coupled class needing `TableBox`'s private `end_combo_edit`/`ending_edit`,
+  granted via `friend class TableComboPopup;`. (The former `friend class TableEditBox;` is gone.)
 - `end_text_edit`/`end_combo_edit` deliberately do NOT call `SetFocus()` themselves. Calling
   `SetFocus()` from code that can be reached while a `WM_KILLFOCUS` is being processed (Win32
   warns against this) is ambiguous: when a click elsewhere triggers `TableBox::OnLButtonDown`'s
   existing `SetFocus()` call, that synchronously raises `WM_KILLFOCUS` on the edit box, which
   commits -- calling `SetFocus()` again from inside that commit would be a reentrant call into
-  an in-progress focus change. Instead, the CALLER decides: `TableEditBox::PreTranslateMessage`
-  (Enter/Esc/Tab, box still focused, no `WM_KILLFOCUS` involved) calls `owner->SetFocus()`
-  itself right after committing/cancelling; `OnKillFocus` does not call it at all (focus is
-  already headed wherever the click/Tab-out sent it). Same split for the combo popup: mouse
+  an in-progress focus change. Instead, the CALLER decides: the EDIT subclass proc's `WM_KEYDOWN`
+  handler (Enter/Esc/Tab, box still focused, no `WM_KILLFOCUS` involved) calls `self->SetFocus()`
+  itself right after committing/cancelling; the `WM_KILLFOCUS` case does not call it at all (focus
+  is already headed wherever the click/Tab-out sent it). Same split for the combo popup: mouse
   pick / Enter / Esc call `owner->SetFocus()` afterward, but `WM_ACTIVATE(WA_INACTIVE)` (the
   user activated something else) never does -- that would steal focus back from whatever the
   user actually clicked.
@@ -346,28 +345,31 @@ This file records project-specific pitfalls and implementation details that are 
   `OnLButtonDown`/`OnLButtonDblClk` -- it falls out for free. Same for the combo popup via
   `WM_ACTIVATE`: clicking elsewhere deactivates the popup before the new click's own handler runs.
 
-### 5.5 A Single-Line CEdit Already Vertically Centers Its Text
+### 5.5 Single-Line EDIT: Text Is Top-Aligned, EM_SETRECT Has No Effect
 
-- `TableEditBox` is created WITHOUT `ES_MULTILINE`. A plain single-line `CEdit` vertically
-  centers its text inside the control's height by itself, regardless of how much taller the
-  control is than the font -- no `EM_SETRECT` workaround needed. That workaround (section 3.5,
-  "CEdit Vertical Alignment") only applies to `ES_MULTILINE` edits, which default to top-aligned
-  text. Adding `ES_MULTILINE` here to chase the design doc's literal "use SetRect to center"
-  wording would have reintroduced that exact problem for no benefit.
-- `OnGetDlgCode` returning `DLGC_WANTALLKEYS` on both `TableEditBox` and `TableComboPopup` is
-  required so `FrameBox::PreTranslateMessage`'s `CDialog`-like Enter/Esc interception
-  (Requirements.md 1.3 / Learned.md 4.7) yields to them; `PreTranslateMessage` catching
-  Enter/Esc/Tab before `TranslateMessage` runs is the primary defense, `DLGC_WANTALLKEYS` is the
-  safety net in case the pretranslate walk does not reach them first.
+- The in-place EDIT is created WITHOUT `ES_MULTILINE`. A single-line EDIT always top-aligns its
+  text regardless of the control's height, and `EM_SETRECT`/`EM_SETRECTNP` have no effect on it.
+  `EM_SETRECT` only works on `ES_MULTILINE` edits (section 3.5). The editor does not apply
+  vertical centering; `set_edit_adjust(dx0,dy0,dx1,dy1)` lets the host nudge the box rect (use
+  `dy0`/`dy1`) to place the text vertically.
+- `WM_GETDLGCODE` returning `DLGC_WANTALLKEYS` (from `EditSubclassProc` for the EDIT and
+  `OnGetDlgCode` for `TableComboPopup`) is required so `FrameBox::PreTranslateMessage`'s
+  `CDialog`-like Enter/Esc interception (Requirements.md 1.3 / Learned.md 4.7) yields to them.
+  For the EDIT, the subclass proc catches Enter/Esc/Tab in `WM_KEYDOWN` and swallows the trailing
+  `WM_CHAR` (`\r`/`\x1b`/`\t`) `TranslateMessage` posts (Learned.md 3.4); `DLGC_WANTALLKEYS` is the
+  safety net.
 
-### 5.6 Combo-Cell Spec String Must Not Leak Into Autofit Measurement
+### 5.6 Combo Cell Type Comes From edit_cb, Not From text_cb
 
-- After `cell_text` started returning the raw `"\x1Bindex, item0, item1, ..."` encoding for
-  combo cells, `autofit_col`/`autofit_row` (Stage 4) would measure that raw spec string instead
-  of the rendered label, sizing the column/row wrong. Fixed by routing both through a shared
-  `ComboDisplayLabel(raw)` helper that returns the selected item's label for a combo cell, the
-  text unchanged otherwise -- any future code that measures or displays `cell_text` needs the
-  same indirection, not the raw return value.
+- Combo cells are identified by the dual-purpose `edit_cb(row,col,nullptr)` QUERY return (a
+  comma-separated item list), NOT by a `"\x1B"`-prefixed `text_cb` value (that old encoding is
+  gone). `text_cb` for a combo cell returns just the selected index string (`"0"`, `"1"`, ...).
+  Static helpers: `ParseComboItems(str, items)` (splits the list, trims spaces, `'\b'` -> literal
+  comma) and `ComboIndex(idx_text, max)` (clamped 0-based index from `text_cb`).
+- Any code that DISPLAYS or MEASURES a combo cell (`draw_cell`, `autofit_col`/`autofit_row`) must
+  resolve the label as `items[ComboIndex(cell_text(...), items.size())]`, never the raw text.
+  The old `ComboDisplayLabel(raw)` helper (which decoded the `\x1B` spec) is gone; the logic is
+  now inline in each of those sites guarded by an `edit_cb != nullptr` + `ParseComboItems` check.
 
 ### 5.7 Combo Popup Window Size: WS_BORDER Shrinks Client Area
 
@@ -399,3 +401,49 @@ This file records project-specific pitfalls and implementation details that are 
   `DestroyWindow`, so any re-entrant `OnActivate` call sees the guard and returns immediately.
   `OnActivate` checks `owner->ending_edit` and skips its body when true. Reset `ending_edit`
   after `DestroyWindow` returns.
+
+### 5.9 Combo Popup Self-Commit: A `closing` Flag Stops WA_INACTIVE From Eating the Commit
+
+- A combo pick commits via the popup's own handler (`OnLButtonUp`/`OnKeyDown`): it calls
+  `DestroyWindow()` and THEN `owner->end_combo_edit(true, chosen)`. But `DestroyWindow()`
+  synchronously raises `WM_ACTIVATE(WA_INACTIVE)`, whose `OnActivate` ran the CANCEL path FIRST
+  (`end_combo_edit(false,-1)`), clearing `owner->combo_popup`; the real commit that followed then
+  hit the `combo_popup == nullptr` guard and was silently dropped (selected value never stored).
+  `ending_edit` did NOT cover this -- it is false during a normal self-commit.
+- Fix: a `bool closing` member on `TableComboPopup`, set true at the top of EVERY self-close path
+  (`OnLButtonUp`, `OnKeyDown` Enter/Esc) before `DestroyWindow()`. `OnActivate` skips its CANCEL
+  body when `closing` (or `owner->ending_edit`) is set, so the re-entrant WA_INACTIVE is a no-op
+  and the pending commit lands. Order within a self-close: `closing = true;` -> `DestroyWindow()`
+  -> `end_combo_edit(...)`.
+
+### 5.10 Hangul IME In-Place Edit: Use a Raw Unicode EDIT + Win32 Subclass, Not an MFC CEdit
+
+- Symptom path (each step a separately-debugged failure): typing Hangul to start editing a CEdit
+  cell showed the lead jamo as `?`, then later as a different wrong glyph per jamo, then the leading
+  jamo simply did not appear until the syllable completed. Root causes, in order:
+- (a) ANSI EDIT window. `CEdit::Create` -- and even `AfxHookWindowCreate` + `CreateWindowExW` --
+  bind the window to MFC's ANSI `AfxWndProc` in an MBCS build, so `IsWindowUnicode == 0`. An ANSI
+  EDIT renders `WM_IME_COMPOSITION` text through CP949; an incomplete jamo (e.g. lead `U+3131`,
+  not a precomposed syllable) has no CP949 form and paints as `?`. FIX: create the editor as a
+  RAW Unicode EDIT with a plain `::CreateWindowExW(0, L"EDIT", ...)` (NO MFC hook) + a Win32
+  `SetWindowSubclass(eh, EditSubclassProc, ...)`; that keeps `IsWindowUnicode == 1`. The subclass
+  proc replaces the former `TableEditBox` (Enter/Esc/Tab commit, `WM_CHAR` swallow, `WM_KILLFOCUS`
+  commit, `DLGC_WANTALLKEYS`, `WM_NCDESTROY` -> `RemoveWindowSubclass`). `edit_box` is now an `HWND`.
+- (b) The IME starts composition while the CELL (TableBox) still has focus, so the FIRST
+  `WM_IME_COMPOSITION` is delivered to TableBox even though `start_text_edit` already `SetFocus`-ed
+  the EDIT; every later composition message goes straight to the EDIT. That one stray first message
+  must be relayed to the EDIT (`SendMessageW`), else the lead jamo never paints (it lives in the
+  HIMC, so it only shows once the syllable completes).
+- (c) But TableBox is an ANSI window in an MBCS build, so that relayed `wParam` is an ANSI (CP949)
+  code (e.g. `0xA4A1`, carried because `lParam` has `CS_INSERTCHAR`). Forwarding it verbatim makes
+  the Unicode EDIT read `0xA4A1` as `U+A4A1` (a wrong glyph; the HIMC still holds the real jamo, so
+  a later repaint corrects it). FIX: convert `wParam` from `CP_ACP` to UTF-16 (`MultiByteToWideChar`,
+  `0xA4A1 -> U+3131`) before relaying.
+- (d) TRAP: do NOT gate the conversion on `IsWindowUnicode(m_hWnd)`. TableBox registers its class
+  with `RegisterClassExW` + `DefWindowProcW`, so `IsWindowUnicode(m_hWnd)` is TRUE even in an MBCS
+  build, while the ANSI `AfxWndProc` is still what delivered the CP949 `wParam` -- the gate skipped
+  the needed conversion and the `?`/wrong-glyph regressed. Always convert; in a Unicode build the
+  IME routes the first message straight to the EDIT (this relay branch is not reached), so it never
+  runs on an already-UTF-16 `wParam`. Verified working in BOTH MBCS and Unicode `Debug|x64` builds.
+- Do NOT re-post `WM_IME_STARTCOMPOSITION` to the EDIT: `SetFocus` already connected the IME, and an
+  empty (0,0) re-start corrupts the composition (first jamo paints as `?`).

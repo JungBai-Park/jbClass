@@ -5,16 +5,16 @@
 //
 // === File layout ===
 //   helpers (static) : ParseFontOpts, SbarColors, DrawAA, DrawRoundedThumb, DrawTriangle,
-//                       FillTranslucent, ParseComboSpec, BuildComboSpec
+//                       FillTranslucent, ParseComboItems, ComboIndex
 //   message map       : BEGIN_MESSAGE_MAP ... END_MESSAGE_MAP
 //   ctor/dtor         : TableBox, ~TableBox
 //   window/font       : open, build_font
-//   grid definition   : set_cols x2, set_rows x2, set_fixed, set_callback, set_font,
-//                        set_edit_callback
+//   grid definition   : set_cols x2, set_rows x2, set_fixed, set_text_callback, set_font,
+//                        set_align, set_pad, set_edit_callback, set_edit_adjust
 //   layout            : to_px, corner_w, corner_h, last_visible_row/col, max_scroll_row/col,
 //                        clamp_scroll
-//   painting          : ensure_back_buffer, draw_block, draw_grid_lines, draw_cell, cell_text,
-//                        combo_arrow_rect, OnPaint
+//   painting          : ensure_back_buffer, draw_text_aligned, draw_block, draw_grid_lines,
+//                        draw_cell, cell_text, combo_arrow_rect, OnPaint
 //   overlay scrollbar : vsbar_geometry, hsbar_geometry, resolve_sbar_corner, show_sbar,
 //                        draw_sbar_axis, draw_overlay_scrollbars
 //   selection         : hit_test, last_row_index/col_index, select_range, move_current,
@@ -22,16 +22,18 @@
 //                        draw_focus_border
 //   resize (Stage 4)  : hit_col_border, hit_row_border, col_selection_span, row_selection_span,
 //                        autofit_col, autofit_row
-//   editing (Stage 5) : TableEditBox class, TableComboPopup class, edit_cell, start_text_edit,
+//   editing (Stage 5) : TableComboPopup class, edit_cell, start_text_edit, EditSubclassProc,
 //                        end_text_edit, start_combo_edit, end_combo_edit, cancel_edit
 //   input             : OnSetFocus, OnKillFocus, OnGetDlgCode, OnKeyDown, OnChar, OnMouseWheel,
 //                        OnLButtonDown, OnMouseMove, OnLButtonUp, OnLButtonDblClk, OnSetCursor,
-//                        OnMouseLeave, OnTimer
+//                        OnMouseLeave, OnTimer, WindowProc (IME)
 //   window messages   : OnSize, OnEraseBkgnd
 //
 #include "TableBox.h"
 #include <afxpriv.h>   // AfxHookWindowCreate / AfxUnhookWindowCreate (MFC window creation hook)
 #include <cmath>
+#include <commctrl.h>  // SetWindowSubclass / DefSubclassProc (edit_box Win32 subclass)
+#pragma comment(lib, "comctl32.lib")
 
 // Convert a font name/size + option string to a LOGFONTW. Duplicated from ConBox.cpp's
 // ParseFontOpts (self-contained module -- see TableBox.h), trimmed to the options TableBox
@@ -226,71 +228,41 @@ static void FillTranslucent(CDC& dc, const CRect& rc, COLORREF color, BYTE alpha
     src.SelectObject(old);
 }
 
-// Combo-cell spec sentinel (Stage 5): a cell whose text starts with this byte is a dropdown
-// (combo) cell, not plain text. ESC (0x1B) is a non-printable control byte that can never
-// collide with real cell data, unlike a printable marker.
-static const char COMBO_SENTINEL = '\x1B';
-
-// Parses "\x1Bindex, item0, item1, ..." (selected index then comma-separated items, each
-// trimmed of surrounding spaces). Returns false if text does not start with the sentinel (plain
-// text cell). On success, sel_index is clamped into [0, items.size()-1], or -1 if items is empty.
-static bool ParseComboSpec(const char* text, int& sel_index, std::vector<std::string>& items)
+// Parse the comma-separated item list returned by edit_cb in query mode (text==nullptr). Each
+// item is trimmed of surrounding spaces; '\b' (0x08) in an item is replaced with a literal comma
+// so callers can embed commas in item labels. Returns true when str is a valid, non-empty list.
+// str must not be nullptr or the (const char*)(-1) sentinel -- callers guard those cases first.
+static bool ParseComboItems(const char* str, std::vector<std::string>& items)
 {
     items.clear();
-    sel_index = -1;
-    if (text == nullptr || text[0] != COMBO_SENTINEL)
+    if (str == nullptr || str == (const char*)(intptr_t)-1 || *str == '\0')
         return false;
-
-    const char* p = text + 1;
-    while (*p == ' ') p++;
-    int idx = 0;
-    bool has_digit = false;
-    while (*p >= '0' && *p <= '9') { idx = idx * 10 + (*p - '0'); has_digit = true; p++; }
-    while (*p == ' ') p++;
-    if (*p == ',') p++;
-
+    const char* p = str;
     while (*p != '\0') {
         while (*p == ' ') p++;
         std::string item;
-        while (*p != '\0' && *p != ',') item += *p++;
+        while (*p != '\0' && *p != ',') {
+            item += (*p == '\b') ? ',' : *p;
+            ++p;
+        }
         while (!item.empty() && item.back() == ' ') item.pop_back();
-        items.push_back(item);
+        if (!item.empty()) items.push_back(item);
         if (*p == ',') p++;
     }
-
-    if (!items.empty()) {
-        if (!has_digit || idx < 0) idx = 0;
-        if (idx >= (int)items.size()) idx = (int)items.size() - 1;
-        sel_index = idx;
-    }
-    return true;
+    return !items.empty();
 }
 
-// Re-encodes a combo spec after the user picks a new item, so the host's data shape (as fed
-// back through set_edit_callback) stays identical to what set_callback originally returned.
-static std::string BuildComboSpec(int sel_index, const std::vector<std::string>& items)
+// Interpret idx_text (from text_cb) as a 0-based index, clamped into [0, max-1].
+// Returns 0 on null, empty, or non-numeric input.
+static int ComboIndex(const char* idx_text, int max)
 {
-    std::string s(1, COMBO_SENTINEL);
-    char buf[16];
-    sprintf_s(buf, sizeof(buf), "%d", sel_index);
-    s += buf;
-    for (size_t i = 0; i < items.size(); ++i) {
-        s += ", ";
-        s += items[i];
-    }
-    return s;
-}
-
-// The visible label for a cell -- the selected item for a combo cell, the text itself
-// otherwise. Used by autofit_col/autofit_row so they measure what is actually rendered, not
-// the raw "\x1Bindex, items..." encoding.
-static std::string ComboDisplayLabel(const char* raw)
-{
-    int sel;
-    std::vector<std::string> items;
-    if (ParseComboSpec(raw, sel, items))
-        return (sel >= 0) ? items[sel] : std::string();
-    return raw ? std::string(raw) : std::string();
+    if (max <= 0) return 0;
+    if (idx_text == nullptr || *idx_text == '\0') return 0;
+    int idx = 0;
+    bool ok = false;
+    for (const char* p = idx_text; *p >= '0' && *p <= '9'; ++p) { idx = idx * 10 + (*p - '0'); ok = true; }
+    if (!ok || idx < 0) return 0;
+    return idx < max ? idx : max - 1;
 }
 
 BEGIN_MESSAGE_MAP(TableBox, CWnd)
@@ -348,12 +320,15 @@ TableBox::TableBox()
     edit_row = -1;
     edit_col = -1;
     ending_edit = false;
+    edit_adj_x0 = 1; edit_adj_y0 = 1; edit_adj_x1 = 0; edit_adj_y1 = 0;
 
     font_name = "Malgun Gothic";
     font_size = 9.0f;
     font_opt.clear();
     ZeroMemory(&font_tm, sizeof(font_tm));
 
+    cell_align = 4;   // mid-left (matches the historical TextOutW default)
+    cell_pad   = 4;   // 96 DPI logical px
     box_dpi = 0;
 
     back_bmp_saved = nullptr;
@@ -469,14 +444,14 @@ void TableBox::set_fixed(int rows, int cols)
     if (::IsWindow(m_hWnd)) { clamp_scroll(); Invalidate(); }
 }
 
-void TableBox::set_callback(const char* (*cb)(int row, int col, void* user), void* user)
+void TableBox::set_text_callback(const char* (*cb)(int row, int col, void* user), void* user)
 {
     text_cb = cb;
     text_cb_user = user;
     if (::IsWindow(m_hWnd)) Invalidate();
 }
 
-void TableBox::set_edit_callback(void (*cb)(int row, int col, const char* text, void* user), void* user)
+void TableBox::set_edit_callback(const char* (*cb)(int row, int col, const char* text, void* user), void* user)
 {
     edit_cb = cb;
     edit_cb_user = user;
@@ -488,6 +463,28 @@ void TableBox::set_font(const char* name, float size, const char* option)
     font_size = size;
     font_opt  = option ? option : "";
     if (::IsWindow(m_hWnd)) { build_font(); Invalidate(); }
+}
+
+void TableBox::set_align(int num)
+{
+    if (num < 1 || num > 9) num = 4;
+    cell_align = num;
+    if (::IsWindow(m_hWnd)) Invalidate();
+}
+
+void TableBox::set_pad(int logical_px)
+{
+    if (logical_px < 0) logical_px = 0;
+    cell_pad = logical_px;
+    if (::IsWindow(m_hWnd)) Invalidate();
+}
+
+void TableBox::set_edit_adjust(int dx0, int dy0, int dx1, int dy1)
+{
+    edit_adj_x0 = dx0;
+    edit_adj_y0 = dy0;
+    edit_adj_x1 = dx1;
+    edit_adj_y1 = dy1;
 }
 
 int TableBox::to_px(int logical96) const
@@ -852,7 +849,19 @@ void TableBox::autofit_col(int idx)
         int r0 = pass == 0 ? 0 : scroll_row;
         int rN = pass == 0 ? fr1 : r1;
         for (int r = r0; r < rN; ++r) {
-            std::string disp = ComboDisplayLabel(cell_text(r, idx));
+            std::string disp;
+            if (edit_cb != nullptr) {
+                std::vector<std::string> items;
+                if (ParseComboItems(edit_cb(r, idx, nullptr, edit_cb_user), items))
+                    disp = items[ComboIndex(cell_text(r, idx), (int)items.size())];
+                else {
+                    const char* raw = cell_text(r, idx);
+                    disp = raw ? raw : "";
+                }
+            } else {
+                const char* raw = cell_text(r, idx);
+                disp = raw ? raw : "";
+            }
             if (disp.empty()) continue;
             wchar_t wbuf[256];
             int n = ::MultiByteToWideChar(CP_UTF8, 0, disp.c_str(), -1, wbuf, 256);
@@ -896,7 +905,19 @@ void TableBox::autofit_row(int idx)
         int c0 = pass == 0 ? 0 : scroll_col;
         int cN = pass == 0 ? fc1 : c1;
         for (int c = c0; c < cN; ++c) {
-            std::string disp = ComboDisplayLabel(cell_text(idx, c));
+            std::string disp;
+            if (edit_cb != nullptr) {
+                std::vector<std::string> items;
+                if (ParseComboItems(edit_cb(idx, c, nullptr, edit_cb_user), items))
+                    disp = items[ComboIndex(cell_text(idx, c), (int)items.size())];
+                else {
+                    const char* raw = cell_text(idx, c);
+                    disp = raw ? raw : "";
+                }
+            } else {
+                const char* raw = cell_text(idx, c);
+                disp = raw ? raw : "";
+            }
             if (disp.empty()) continue;
             wchar_t wbuf[256];
             int n = ::MultiByteToWideChar(CP_UTF8, 0, disp.c_str(), -1, wbuf, 256);
@@ -945,54 +966,6 @@ void TableBox::draw_focus_border(CDC& dc)
 
 // ===== In-place cell editing (Stage 5) =====
 
-// Borderless CEdit positioned exactly over a body cell, single-line (no ES_MULTILINE) so Win32
-// vertically centers its text by itself -- no EM_SETRECT trick needed (that trick only applies
-// to multiline edits, see Learned.md 3.5; a plain single-line CEdit already centers). CEdit has
-// no virtual hook for Enter/Esc/Tab, so PreTranslateMessage is overridden to catch them BEFORE
-// TranslateMessage would post a WM_CHAR for them (Learned.md 3.4) and to notify the owner.
-// OnGetDlgCode returns DLGC_WANTALLKEYS so FrameBox's CDialog-like Enter/Esc interception
-// (Requirements.md 1.3) yields to this box instead.
-class TableEditBox : public CEdit
-{
-public:
-    TableBox* owner;
-
-    TableEditBox() : owner(nullptr) {}
-
-    BOOL PreTranslateMessage(MSG* pMsg) override
-    {
-        if (pMsg->message == WM_KEYDOWN) {
-            // The box still has focus at this point (no WM_KILLFOCUS involved), so an explicit
-            // SetFocus() back to the grid is needed here -- end_text_edit itself does not call
-            // it (see its own comment: ambiguous to call SetFocus from inside WM_KILLFOCUS).
-            TableBox* o = owner;
-            if (pMsg->wParam == VK_RETURN) { o->end_text_edit(true, 1, 0);  o->SetFocus(); return TRUE; }
-            if (pMsg->wParam == VK_ESCAPE) { o->end_text_edit(false, 0, 0); o->SetFocus(); return TRUE; }
-            if (pMsg->wParam == VK_TAB)    { o->end_text_edit(true, 0, 1);  o->SetFocus(); return TRUE; }
-        }
-        return CEdit::PreTranslateMessage(pMsg);
-    }
-
-protected:
-    afx_msg UINT OnGetDlgCode() { return DLGC_WANTALLKEYS; }
-    afx_msg void OnKillFocus(CWnd* pNewWnd)
-    {
-        CEdit::OnKillFocus(pNewWnd);
-        // DestroyWindow() (called by end_text_edit itself while tearing down) also raises
-        // WM_KILLFOCUS synchronously; owner->ending_edit guards against committing twice. No
-        // SetFocus() here -- focus is already moving to wherever the click/Tab-out sent it
-        // (commonly TableBox itself via its own OnLButtonDown, which already calls SetFocus()).
-        if (!owner->ending_edit)
-            owner->end_text_edit(true, 0, 0);
-    }
-    DECLARE_MESSAGE_MAP()
-};
-
-BEGIN_MESSAGE_MAP(TableEditBox, CEdit)
-    ON_WM_GETDLGCODE()
-    ON_WM_KILLFOCUS()
-END_MESSAGE_MAP()
-
 // Owner-draw dropdown for a combo cell. A genuine WS_POPUP (not a TableBox child) positioned in
 // SCREEN coordinates directly below the focused cell, so it can extend past TableBox's own
 // client area like a real combo box dropdown (Requirements.md 3.x). Width = the cell's width;
@@ -1006,8 +979,13 @@ public:
     std::vector<std::string> items;
     int hover;
     HFONT box_font;
+    // True once a self-close (commit/cancel) has begun. DestroyWindow() synchronously raises
+    // WM_ACTIVATE(WA_INACTIVE); without this guard that handler would run the CANCEL path and
+    // clear owner->combo_popup BEFORE the in-progress commit's end_combo_edit() runs, so the
+    // real commit would then hit the combo_popup==nullptr guard and be silently dropped.
+    bool closing;
 
-    TableComboPopup() : owner(nullptr), hover(0), box_font(NULL) {}
+    TableComboPopup() : owner(nullptr), hover(0), box_font(NULL), closing(false) {}
 
     void open(TableBox* o, CRect screen_rc, const std::vector<std::string>& list, int sel, HFONT f)
     {
@@ -1103,6 +1081,7 @@ protected:
             hover = idx;
         TableBox* o = owner;
         int chosen = hover;
+        closing = true;   // suppress the re-entrant WA_INACTIVE cancel that DestroyWindow raises
         DestroyWindow();
         o->end_combo_edit(true, chosen);
         o->SetFocus();   // mouse pick: nothing else claims focus, so reclaim it for the grid
@@ -1117,6 +1096,7 @@ protected:
         if (nChar == VK_RETURN) {
             TableBox* o = owner;
             int chosen = hover;
+            closing = true;
             DestroyWindow();
             o->end_combo_edit(true, chosen);
             o->SetFocus();
@@ -1124,6 +1104,7 @@ protected:
         }
         if (nChar == VK_ESCAPE) {
             TableBox* o = owner;
+            closing = true;
             DestroyWindow();
             o->end_combo_edit(false, -1);
             o->SetFocus();
@@ -1135,9 +1116,12 @@ protected:
     {
         // WA_INACTIVE means the user activated some OTHER window (could be TableBox, could be
         // something else entirely) -- never SetFocus() back here, that would steal it away.
-        // Skip if owner->ending_edit: cancel_edit() is already destroying us and setting the
-        // flag; re-entering DestroyWindow() here would be a double-destroy.
-        if (state == WA_INACTIVE && !owner->ending_edit) {
+        // Skip if closing: a self-close (commit/cancel) is already tearing us down via
+        // DestroyWindow(), which raised this very message; running the cancel path here would
+        // wipe owner->combo_popup before the in-progress commit lands (and double-destroy).
+        // Skip if owner->ending_edit: cancel_edit() is destroying us from outside.
+        if (state == WA_INACTIVE && !closing && !owner->ending_edit) {
+            closing = true;
             TableBox* o = owner;
             DestroyWindow();
             o->end_combo_edit(false, -1);
@@ -1165,13 +1149,13 @@ void TableBox::edit_cell(int row, int col)
     if (edit_box != nullptr || combo_popup != nullptr)
         return;
 
-    const char* text = cell_text(row, col);
-    int sel_idx;
+    const char* type = edit_cb(row, col, nullptr, edit_cb_user);
     std::vector<std::string> combo_items;
-    if (ParseComboSpec(text, sel_idx, combo_items))
+    if (ParseComboItems(type, combo_items))
         start_combo_edit(row, col);
-    else
+    else if (type == (const char*)(intptr_t)-1)
         start_text_edit(row, col, 0);
+    // else: nullptr -> read-only, no-op
 }
 
 void TableBox::start_text_edit(int row, int col, wchar_t initial_char)
@@ -1182,28 +1166,82 @@ void TableBox::start_text_edit(int row, int col, wchar_t initial_char)
     CRect rc;
     if (!cell_rect(row, col, rc))
         return;
+    rc.left   += to_px(edit_adj_x0); rc.top    += to_px(edit_adj_y0);
+    rc.right  -= to_px(edit_adj_x1); rc.bottom -= to_px(edit_adj_y1);
 
-    TableEditBox* box = new TableEditBox;
-    box->owner = this;
-    box->Create(WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, rc, this, 0);
-    box->SetFont(&font);
+    static const DWORD h_style[] = { ES_LEFT, ES_CENTER, ES_RIGHT };
+    DWORD align_style = h_style[(cell_align - 1) % 3];
+
+    // Create the EDIT control as a RAW Unicode window driven by a Win32 subclass proc, NOT an MFC
+    // CEdit. In an MBCS MFC build, ANY MFC creation/subclass path (CEdit::Create, or even
+    // AfxHookWindowCreate + CreateWindowExW) re-binds the window to the ANSI AfxWndProc, so
+    // IsWindowUnicode becomes 0; an ANSI EDIT renders WM_IME_COMPOSITION through CP949, and an
+    // incomplete Hangul jamo (e.g. the lead 'ㄱ', U+3131, not a precomposed syllable) cannot be
+    // converted and shows as '?'. A plain CreateWindowExW with no MFC hook keeps the EDIT Unicode,
+    // so IME composition (including mid-composition jamo) renders correctly. EditSubclassProc
+    // (dwRefData = this) replaces the former TableEditBox message handlers.
+    HWND eh = ::CreateWindowExW(0, L"EDIT", L"",
+        WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | align_style,
+        rc.left, rc.top, rc.Width(), rc.Height(),
+        m_hWnd, nullptr, AfxGetInstanceHandle(), nullptr);
+    if (eh == nullptr)
+        return;
+    ::SetWindowSubclass(eh, EditSubclassProc, 1, (DWORD_PTR)this);
+    ::SendMessageW(eh, WM_SETFONT, (WPARAM)font.GetSafeHandle(), TRUE);
 
     const char* text = cell_text(row, col);
     wchar_t wbuf[1024] = L"";
     if (text != nullptr && *text != '\0')
         ::MultiByteToWideChar(CP_UTF8, 0, text, -1, wbuf, _countof(wbuf));
-    ::SetWindowTextW(box->GetSafeHwnd(), wbuf);
-    box->SetSel(0, -1);
+    ::SetWindowTextW(eh, wbuf);
+    ::SendMessageW(eh, EM_SETSEL, 0, -1);   // select all
 
-    edit_box = box;
+    edit_box = eh;
     edit_row = row;
     edit_col = col;
-    box->SetFocus();
+    ::SetFocus(eh);
 
     if (initial_char != 0)
-        ::SendMessageW(box->GetSafeHwnd(), WM_CHAR, (WPARAM)initial_char, 1);
+        ::SendMessageW(eh, WM_CHAR, (WPARAM)initial_char, 1);
 
     Invalidate();
+}
+
+// Win32 subclass proc for the raw Unicode EDIT (see start_text_edit). Replaces the former
+// TableEditBox: handles Enter/Esc/Tab commit (and an explicit SetFocus back to the grid, since
+// end_text_edit deliberately does not touch focus), swallows the trailing WM_CHAR those keys post
+// (Learned.md 3.4), reports DLGC_WANTALLKEYS so FrameBox's Enter/Esc interception yields, and
+// commits on focus loss (guarded by ending_edit against the teardown-triggered WM_KILLFOCUS).
+LRESULT CALLBACK TableBox::EditSubclassProc(HWND h, UINT msg, WPARAM wp, LPARAM lp,
+                                            UINT_PTR id, DWORD_PTR ref)
+{
+    TableBox* self = (TableBox*)ref;
+    switch (msg) {
+    case WM_GETDLGCODE:
+        return DLGC_WANTALLKEYS;
+    case WM_KEYDOWN:
+        if (wp == VK_RETURN) { self->end_text_edit(true, 1, 0);  self->SetFocus(); return 0; }
+        if (wp == VK_ESCAPE) { self->end_text_edit(false, 0, 0); self->SetFocus(); return 0; }
+        if (wp == VK_TAB)    { self->end_text_edit(true, 0, 1);  self->SetFocus(); return 0; }
+        break;
+    case WM_CHAR:
+        // TranslateMessage (in the pump, before this dispatch) already posted a WM_CHAR for the
+        // Enter/Esc/Tab handled above; swallow it so it never reaches the EDIT or the grid.
+        if (wp == '\r' || wp == '\x1b' || wp == '\t')
+            return 0;
+        break;
+    case WM_KILLFOCUS:
+        // DestroyWindow() (from end_text_edit while tearing down) also raises WM_KILLFOCUS
+        // synchronously; ending_edit guards against committing twice. No SetFocus() here -- focus
+        // is already moving to wherever the click/Tab-out sent it.
+        if (!self->ending_edit)
+            self->end_text_edit(true, 0, 0);
+        break;
+    case WM_NCDESTROY:
+        ::RemoveWindowSubclass(h, EditSubclassProc, id);
+        break;
+    }
+    return ::DefSubclassProc(h, msg, wp, lp);
 }
 
 void TableBox::end_text_edit(bool commit, int move_dr, int move_dc)
@@ -1214,20 +1252,19 @@ void TableBox::end_text_edit(bool commit, int move_dr, int move_dc)
 
     if (commit && edit_cb) {
         wchar_t wbuf[1024];
-        ::GetWindowTextW(edit_box->GetSafeHwnd(), wbuf, _countof(wbuf));
+        ::GetWindowTextW(edit_box, wbuf, _countof(wbuf));
         char utf8[1024 * 3];
         ::WideCharToMultiByte(CP_UTF8, 0, wbuf, -1, utf8, sizeof(utf8), NULL, NULL);
         edit_cb(edit_row, edit_col, utf8, edit_cb_user);
     }
 
-    TableEditBox* box = edit_box;
+    HWND eh = edit_box;
     edit_box = nullptr;
-    box->DestroyWindow();
-    delete box;
+    ::DestroyWindow(eh);   // WM_NCDESTROY -> RemoveWindowSubclass
 
     ending_edit = false;
-    // No SetFocus() here -- see TableEditBox::PreTranslateMessage / OnKillFocus for why the
-    // caller, not end_text_edit itself, is responsible for moving focus back to the grid.
+    // No SetFocus() here -- the caller (EditSubclassProc key handlers / the click that stole focus)
+    // is responsible for moving focus back to the grid.
 
     if (commit && (move_dr != 0 || move_dc != 0))
         move_current(cur_row + move_dr, cur_col + move_dc, false);
@@ -1244,11 +1281,11 @@ void TableBox::start_combo_edit(int row, int col)
     if (!cell_rect(row, col, rc))
         return;
 
-    const char* text = cell_text(row, col);
-    int sel_idx;
     std::vector<std::string> items;
-    if (!ParseComboSpec(text, sel_idx, items))
+    const char* combo_str = edit_cb(row, col, nullptr, edit_cb_user);
+    if (!ParseComboItems(combo_str, items))
         return;
+    int sel_idx = ComboIndex(cell_text(row, col), (int)items.size());
 
     // Compute window size so the CLIENT area is exactly cell_h * N pixels tall.
     // WS_BORDER subtracts its frame from the client area; AdjustWindowRectEx adds it back.
@@ -1275,15 +1312,9 @@ void TableBox::end_combo_edit(bool commit, int new_index)
     ending_edit = true;
 
     if (commit && edit_cb) {
-        const char* text = cell_text(edit_row, edit_col);
-        int sel_idx;
-        std::vector<std::string> items;
-        if (ParseComboSpec(text, sel_idx, items) && !items.empty()) {
-            if (new_index < 0) new_index = 0;
-            if (new_index >= (int)items.size()) new_index = (int)items.size() - 1;
-            std::string spec = BuildComboSpec(new_index, items);
-            edit_cb(edit_row, edit_col, spec.c_str(), edit_cb_user);
-        }
+        char idx_buf[16];
+        sprintf_s(idx_buf, sizeof(idx_buf), "%d", new_index >= 0 ? new_index : 0);
+        edit_cb(edit_row, edit_col, idx_buf, edit_cb_user);
     }
 
     combo_popup = nullptr;
@@ -1387,6 +1418,21 @@ CRect TableBox::combo_arrow_rect(const CRect& cell_rc) const
     return CRect(cell_rc.right - side, cell_rc.top, cell_rc.right, cell_rc.bottom);
 }
 
+void TableBox::draw_text_aligned(CDC& dc, const char* utf8, int x0, int y0, int x1, int y1)
+{
+    if (!utf8 || !*utf8) return;
+    wchar_t wbuf[256];
+    int n = ::MultiByteToWideChar(CP_UTF8, 0, utf8, -1, wbuf, 256);
+    if (n <= 1) return;
+    n--;
+    static const UINT h_flags[] = { DT_LEFT, DT_CENTER, DT_RIGHT };
+    static const UINT v_flags[] = { DT_TOP,  DT_VCENTER, DT_BOTTOM };
+    UINT dt = DT_SINGLELINE | h_flags[(cell_align - 1) % 3] | v_flags[(cell_align - 1) / 3];
+    int pad = to_px(cell_pad);
+    RECT rc = { x0 + pad, y0, x1 - pad, y1 };
+    ::DrawTextW(dc.GetSafeHdc(), wbuf, n, &rc, dt);
+}
+
 void TableBox::draw_cell(CDC& dc, int row, int col, int x0, int y0, int x1, int y1)
 {
     CRect rc(x0, y0, x1, y1);
@@ -1430,60 +1476,35 @@ void TableBox::draw_cell(CDC& dc, int row, int col, int x0, int y0, int x1, int 
         dc.FillSolidRect(&rc, RGB(255, 255, 255));
     }
 
-    const char* raw_text = cell_text(row, col);
-
-    int sel_index;
+    // Check if this is a combo cell via edit_cb query (text==nullptr -> query mode).
     std::vector<std::string> combo_items;
-    if (ParseComboSpec(raw_text, sel_index, combo_items)) {
-        // Combo (dropdown) cell: label clipped to the area left of the arrow column, then "▼"
-        // (U+25BC) centered in arrow_rc using the same cell font. arrow_rc is kept full-size
-        // as the hit-test zone (OnLButtonDown) regardless of the glyph's rendered width.
-        CRect arrow_rc = combo_arrow_rect(rc);
-        CFont* old_font = dc.SelectObject(&font);
-        dc.SetBkMode(TRANSPARENT);
-        dc.SetTextColor(RGB(0, 0, 0));
-
-        const std::string& label = (sel_index >= 0) ? combo_items[sel_index] : std::string();
-        if (!label.empty()) {
-            wchar_t wbuf[256];
-            int n = ::MultiByteToWideChar(CP_UTF8, 0, label.c_str(), -1, wbuf, 256);
-            if (n > 0) {
-                n--;
-                dc.SaveDC();
-                dc.IntersectClipRect(rc.left, rc.top, arrow_rc.left, rc.bottom);
-                int pad = to_px(4);
-                int ty = y0 + ((y1 - y0) - font_tm.tmHeight) / 2;
-                ::TextOutW(dc.GetSafeHdc(), x0 + pad, ty, wbuf, n);
-                dc.RestoreDC(-1);
-            }
-        }
-
-        {
-            const wchar_t tri[] = L"\x25BC";
-            RECT ar = arrow_rc;
-            ::DrawTextW(dc.GetSafeHdc(), tri, 1, &ar, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        }
-
-        dc.SelectObject(old_font);
-        return;
-    }
-
-    if (raw_text != nullptr && *raw_text != '\0') {
-        wchar_t wbuf[256];
-        int n = ::MultiByteToWideChar(CP_UTF8, 0, raw_text, -1, wbuf, 256);
-        if (n > 0) {
-            n--;   // exclude the null terminator MultiByteToWideChar counted
-
+    if (edit_cb != nullptr) {
+        const char* combo_str = edit_cb(row, col, nullptr, edit_cb_user);
+        if (ParseComboItems(combo_str, combo_items)) {
+            // Combo cell: display the currently selected item label, then draw "▼" on top.
+            int idx = ComboIndex(cell_text(row, col), (int)combo_items.size());
+            CRect arrow_rc = combo_arrow_rect(rc);
             CFont* old_font = dc.SelectObject(&font);
             dc.SetBkMode(TRANSPARENT);
             dc.SetTextColor(RGB(0, 0, 0));
-
-            int pad = to_px(4);
-            int ty = y0 + ((y1 - y0) - font_tm.tmHeight) / 2;
-            ::TextOutW(dc.GetSafeHdc(), x0 + pad, ty, wbuf, n);
-
+            draw_text_aligned(dc, combo_items[idx].c_str(), x0, y0, x1, y1);
+            {
+                const wchar_t tri[] = L"\x25BC";
+                RECT ar = arrow_rc;
+                ::DrawTextW(dc.GetSafeHdc(), tri, 1, &ar, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            }
             dc.SelectObject(old_font);
+            return;
         }
+    }
+
+    const char* raw_text = cell_text(row, col);
+    if (raw_text != nullptr && *raw_text != '\0') {
+        CFont* old_font = dc.SelectObject(&font);
+        dc.SetBkMode(TRANSPARENT);
+        dc.SetTextColor(RGB(0, 0, 0));
+        draw_text_aligned(dc, raw_text, x0, y0, x1, y1);
+        dc.SelectObject(old_font);
     }
 }
 
@@ -1751,9 +1772,9 @@ void TableBox::OnChar(UINT nChar, UINT nRepCnt, UINT nFlags)
     if (nChar >= 0x20 && nChar != 0x7F &&
         cur_row >= fixed_rows && cur_col >= fixed_cols &&
         edit_cb != nullptr && edit_box == nullptr && combo_popup == nullptr) {
-        int sel_idx;
-        std::vector<std::string> combo_items;
-        if (!ParseComboSpec(cell_text(cur_row, cur_col), sel_idx, combo_items)) {
+        // Only CEdit-type cells accept a typed character as a text-overwrite trigger.
+        const char* type = edit_cb(cur_row, cur_col, nullptr, edit_cb_user);
+        if (type == (const char*)(intptr_t)-1) {
             start_text_edit(cur_row, cur_col, (wchar_t)nChar);
             return;
         }
@@ -1898,13 +1919,13 @@ void TableBox::OnLButtonDown(UINT flags, CPoint pt)
             // start a drag-extendable range selection as before.
             move_current(row, col, extend);
             CRect cell_rc;
-            int sel_idx;
-            std::vector<std::string> combo_items;
-            if (!extend && cell_rect(row, col, cell_rc) &&
-                ParseComboSpec(cell_text(row, col), sel_idx, combo_items) &&
-                combo_arrow_rect(cell_rc).PtInRect(pt)) {
-                edit_cell(row, col);
-                return;
+            if (!extend && edit_cb != nullptr && cell_rect(row, col, cell_rc)) {
+                std::vector<std::string> combo_items;
+                if (ParseComboItems(edit_cb(row, col, nullptr, edit_cb_user), combo_items) &&
+                    combo_arrow_rect(cell_rc).PtInRect(pt)) {
+                    edit_cell(row, col);
+                    return;
+                }
             }
             selecting = true;
             SetCapture();
@@ -2055,6 +2076,31 @@ BOOL TableBox::OnSetCursor(CWnd* pWnd, UINT nHitTest, UINT message)
             ::SetCursor(::LoadCursorW(nullptr, (LPCWSTR)IDC_SIZENS));
             return TRUE;
         }
+        // Show IDC_HAND over editable cells unless a scrollbar is in its hold phase (active but
+        // not yet fading -- the user says "무조건 기본 커서, 단 천천히 사라지고 있을 때는 예외").
+        if (edit_cb != nullptr) {
+            bool sbar_blocking =
+                (vsbar.alpha > 0 && (int)(::GetTickCount() - vsbar.hold_until) < 0) ||
+                (hsbar.alpha > 0 && (int)(::GetTickCount() - hsbar.hold_until) < 0);
+            if (!sbar_blocking) {
+                int row, col;
+                if (hit_test(pt, row, col) && row >= fixed_rows && col >= fixed_cols) {
+                    const char* type = edit_cb(row, col, nullptr, edit_cb_user);
+                    std::vector<std::string> combo_items;
+                    if (ParseComboItems(type, combo_items)) {
+                        // Hand cursor only over the dropdown arrow icon.
+                        CRect cell_rc;
+                        if (cell_rect(row, col, cell_rc) && combo_arrow_rect(cell_rc).PtInRect(pt)) {
+                            ::SetCursor(::LoadCursorW(nullptr, (LPCWSTR)IDC_HAND));
+                            return TRUE;
+                        }
+                    } else if (type == (const char*)(intptr_t)-1) {
+                        ::SetCursor(::LoadCursorW(nullptr, (LPCWSTR)IDC_HAND));
+                        return TRUE;
+                    }
+                }
+            }
+        }
     }
     return CWnd::OnSetCursor(pWnd, nHitTest, message);
 }
@@ -2092,6 +2138,62 @@ void TableBox::OnTimer(UINT_PTR id)
         return;
     }
     CWnd::OnTimer(id);
+}
+
+// Hangul (and other IME-composed text) does not arrive as WM_CHAR -- it arrives as IME
+// composition messages, the first being WM_IME_STARTCOMPOSITION. Since TableBox (a CWnd) is not
+// a text widget, that composition would otherwise leak to the desktop until the first syllable
+// completes. Mirror of the Reference 06-table.c++ patch: on WM_IME_STARTCOMPOSITION, if the
+// focused cell is an editable (CEdit-type) cell and no edit is in progress, open the edit box now.
+// start_text_edit() calls SetFocus() on the raw Unicode EDIT, which re-binds the IME to it.
+//
+// One subtlety, confirmed by tracing: the composition begins while the CELL (TableBox) still has
+// focus, so the IME routes the FIRST WM_IME_COMPOSITION to TableBox (not the EDIT) even though the
+// SetFocus to the EDIT has already run; every subsequent composition message goes straight to the
+// EDIT. We must relay that one stray first message to the EDIT, else its leading jamo never shows
+// (the syllable still lives in the IME engine, so it appears only once the syllable completes).
+// In an MBCS build TableBox's message pump is ANSI (AfxWndProc), so wParam arrives as an ANSI
+// (CP949) code (e.g. lead 'ㄱ' = 0xA4A1, carried because lParam has CS_INSERTCHAR). Forwarding it
+// verbatim to the Unicode EDIT makes the EDIT's first paint read 0xA4A1 as U+A4A1 (a wrong glyph);
+// the syllable still lives in the HIMC as real Unicode, so a later repaint corrects it -- but to
+// paint right the first time we convert wParam from the ANSI codepage to UTF-16 (0xA4A1 -> U+3131)
+// before relaying. We always convert: in a Unicode build the IME routes this first message
+// straight to the EDIT instead (this branch is not reached), so an ANSI-side conversion never runs
+// on an already-UTF-16 wParam. NOTE: do NOT gate this on IsWindowUnicode(m_hWnd) -- TableBox
+// registers its class with RegisterClassExW + DefWindowProcW, so IsWindowUnicode is TRUE even in
+// an MBCS build, while the ANSI AfxWndProc is still what delivers the CP949 wParam.
+// We do NOT re-post WM_IME_STARTCOMPOSITION (SetFocus already connected the IME; an empty re-start
+// corrupted state). English/ASCII input never raises these messages (handled by OnChar).
+LRESULT TableBox::WindowProc(UINT message, WPARAM wParam, LPARAM lParam)
+{
+    if (message == WM_IME_STARTCOMPOSITION &&
+        edit_cb != nullptr && edit_box == nullptr && combo_popup == nullptr &&
+        cur_row >= fixed_rows && cur_col >= fixed_cols) {
+        const char* type = edit_cb(cur_row, cur_col, nullptr, edit_cb_user);
+        if (type == (const char*)(intptr_t)-1) {
+            start_text_edit(cur_row, cur_col, 0);   // empty seed; the IME text fills it
+            if (edit_box != nullptr)
+                return 0;   // consumed; box now owns the IME composition via SetFocus()
+        }
+    }
+    else if (message == WM_IME_COMPOSITION && edit_box != nullptr) {
+        // The stray first composition message (see header). Convert the ANSI-codepage wParam to
+        // UTF-16 so the Unicode EDIT renders the real jamo instead of a same-value wrong glyph.
+        WPARAM wp = wParam;
+        if (wParam > 0xFF) {
+            char mb[2] = { (char)(wParam >> 8), (char)(wParam & 0xFF) };
+            wchar_t wc = 0;
+            if (::MultiByteToWideChar(CP_ACP, 0, mb, 2, &wc, 1) == 1)
+                wp = wc;
+        } else if (wParam >= 0x80) {
+            char mb = (char)wParam;
+            wchar_t wc = 0;
+            if (::MultiByteToWideChar(CP_ACP, 0, &mb, 1, &wc, 1) == 1)
+                wp = wc;
+        }
+        return ::SendMessageW(edit_box, message, wp, lParam);
+    }
+    return CWnd::WindowProc(message, wParam, lParam);
 }
 
 void TableBox::OnSize(UINT type, int cx, int cy)

@@ -70,19 +70,22 @@ exercised by the AI (screenshot-review territory) -- worth a user pass before St
 
 ## Stage 5 - In-place editing (CORE) -- DONE
 
-Implemented per the final design agreed in a grill session (see Requirements.md 3.8 for the
-confirmed spec; supersedes this stage's original draft plan -- notably: no F2 trigger, Esc
-explicitly cancels, combo cells use a `"\x1Bindex, item0, item1, ..."` spec parsed from
-`text_cb`, and a single click on a combo cell's arrow opens it immediately).
-`set_edit_callback`, `virtual edit_cell(row,col)`, the private nested `TableEditBox : public
-CEdit` (plain-text edit, catches Enter/Esc/Tab in `PreTranslateMessage` before `TranslateMessage`
-posts a `WM_CHAR`) and `TableComboPopup : public CWnd` (owner-draw dropdown, genuine `WS_POPUP`)
-are all in `TableBox.cpp`; `DemoApp.cpp` wires `set_edit_callback` back into `table_text` and
-seeds a combo demo cell at `table_text[2][2]`.
-User tuning round completed. Refinements applied: combo arrow rendered as U+25BC via cell font;
-popup window sized with AdjustWindowRectEx (client = cell_h*N exact); two-pass item paint +
-separator at (i+1)*rh-1; CS_DROPSHADOW; cancel_edit() called from OnMouseWheel/OnLButtonDown/
-OnSize to discard floating editor before layout changes; double-destroy guard in OnActivate.
+Implemented; see Requirements.md 3.8 for the confirmed spec. `set_edit_callback`,
+`virtual edit_cell(row,col)`, the plain-text editor and `TableComboPopup` (owner-draw dropdown,
+genuine `WS_POPUP`) are all in `TableBox.cpp`; `DemoApp.cpp` wires `set_edit_callback` back into
+`table_text` and seeds a combo demo cell.
+Final design (after several user tuning + redesign rounds): combo arrow U+25BC via cell font;
+popup sized with AdjustWindowRectEx (client = cell_h*N exact); two-pass item paint; CS_DROPSHADOW;
+`cancel_edit()` from OnMouseWheel/OnLButtonDown/OnSize; `set_align`/`set_pad`/`set_edit_adjust`;
+mouse-over hand cursor on editable cells.
+Two later reworks (this stage's spec was redesigned mid-development):
+- `set_callback` -> `set_text_callback`; combo cells now identified by the dual-purpose
+  `edit_cb(row,col,nullptr)` QUERY (item list) instead of a `"\x1B"`-prefixed `text_cb`; combo
+  `text_cb` returns just the index string; `edit_cb` return type is `const char*`
+  (query=type / commit=store). See Learned.md 5.6, 5.8.
+- Hangul IME: the plain-text editor is now a raw Unicode EDIT + Win32 `EditSubclassProc` (not an
+  MFC CEdit), with the first stray `WM_IME_COMPOSITION` relayed CP949->UTF-16. Verified in BOTH
+  MBCS and Unicode Debug|x64. See Learned.md 5.5, 5.9, 5.10.
 
 ## Stage 6 - Clipboard (OPTIONAL)
 

@@ -232,13 +232,24 @@ static const char* DefaultTableText(int row, int col, void* user) {
     return table_text[row][col].c_str();
 }
 
-// TableBox demo edit callback (Stage 5): writes the user's in-place edit back into table_text,
-// the same backing store DefaultTableText reads from. text already carries the re-encoded
-// "\x1Bindex, items..." form for a combo cell, so no special-casing is needed here.
-static void DefaultTableEdit(int row, int col, const char* text, void* user) {
-    if (row < 0 || row >= (int)table_text.size() || col < 0 || col >= (int)table_text[row].size())
-        return;
-    table_text[row][col] = text;
+// TableBox edit callback: dual-purpose (query and commit).
+// Query (text == nullptr): return cell type.
+//   [6][2]               -> combo "하나, 둘, 셋, 넷, 다섯, 여섯"
+//   even col (except 0)  -> (const char*)(-1) = CEdit-editable
+//   otherwise            -> nullptr = read-only
+// Commit (text != nullptr): store the new value into table_text.
+//   For combo cells, text is the selected index string ("0","1",...).
+//   For CEdit cells, text is the user-typed UTF-8 string.
+static const char* DefaultTableEdit(int row, int col, const char* text, void* user) {
+    if (text == nullptr) {
+        if (row == 6 && col == 2) return "하나, 둘, 셋, 넷, 다섯, 여섯";
+        if (col > 0 && col % 2 == 0) return (const char*)(-1);
+        return nullptr;
+    }
+    if (row >= 0 && row < (int)table_text.size() &&
+        col >= 0 && col < (int)table_text[row].size())
+        table_text[row][col] = text;
+    return nullptr;
 }
 
 void DemoMain() {
@@ -268,15 +279,17 @@ void DemoMain() {
         }
     }
 
-    table_text[6][2] = "\x1B 2, 하나, 둘, 셋, 넷, 다섯";   // Stage 5 combo-cell demo
+    table_text[6][2] = "2";   // Stage 5 combo-cell demo
 
     TableBox* table = new TableBox;
     table->set_cols(col_widths);
     table->set_rows(row_heights);
     table->set_fixed(1, 1);
-    table->set_callback(DefaultTableText, nullptr);
+    table->set_text_callback(DefaultTableText, nullptr);
     table->set_edit_callback(DefaultTableEdit, nullptr);
     table->set_font("Malgun Gothic", 10);
+    table->set_align(5);
+    table->set_edit_adjust(1, 4, 0, 0);
     table->open(&Top, 5, 5, 10, 8);
     Top.AddNew(0, 0, 0, 0, table);    // attach-only; keep the size/position open() computed
 

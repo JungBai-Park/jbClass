@@ -17,13 +17,13 @@
 //     table->set_cols(100, 15);                 // uniform width 100 (96 DPI), 15 columns total
 //     table->set_rows(25, 60);                   // uniform height 25 (96 DPI), 60 rows total
 //     table->set_fixed(1, 1);                     // frozen header row/col (default)
-//     table->set_callback(MyText, nullptr);       // text source for every cell
+//     table->set_text_callback(MyText, nullptr);  // text source for every cell
 //     table->set_font("Malgun Gothic", 10);       // single font (ConBox name/size/option grammar)
-//     table->set_edit_callback(MyEdit, nullptr);  // OPTIONAL write-back path, see edit_cell below
+//     table->set_edit_callback(MyEdit, nullptr);  // OPTIONAL, see set_edit_callback below
 //     table->open(parent, x0, y0, rows, cols);
 //     // rows/cols = initial VISIBLE cell count (NOT the grid's total row/col count -- that is
 //     // set_rows()/set_cols()'s "limit"/vector size). Clamped to the grid's row/col count.
-//     // Call set_cols/set_rows/set_fixed/set_callback/set_font BEFORE open() so the first paint
+//     // Call set_cols/set_rows/set_fixed/set_text_callback/set_font BEFORE open() so the first paint
 //     // already has metrics ready (same convention as ConBox::setup_from_ini -> open).
 //     // A FrameBox host may then attach it like any CWnd*, e.g. Top.AddNew(0,0,0,0, table).
 //
@@ -42,17 +42,17 @@
 #include <vector>
 #include <string>
 
-// Implementation detail of in-place cell editing (Stage 5): a private nested CEdit and an
-// owner-draw dropdown popup, both defined inside TableBox.cpp. Forward-declared here only so
-// TableBox can hold a pointer to each; callers never see their definitions.
-class TableEditBox;
+// Implementation detail of in-place cell editing (Stage 5): an owner-draw dropdown popup defined
+// inside TableBox.cpp. Forward-declared here only so TableBox can hold a pointer to it; callers
+// never see its definition. (The plain-text editor is a raw Unicode EDIT window driven by a Win32
+// subclass proc -- see start_text_edit / EditSubclassProc in TableBox.cpp -- not an MFC class,
+// because an MBCS MFC build would make CEdit an ANSI window and break IME composition rendering.)
 class TableComboPopup;
 
 class TableBox : public CWnd
 {
-    // Tightly-coupled implementation details of in-place editing (Stage 5): they need to call
-    // back into TableBox's private end_text_edit/end_combo_edit and read/set ending_edit.
-    friend class TableEditBox;
+    // Tightly-coupled implementation detail of in-place editing (Stage 5): it needs to call back
+    // into TableBox's private end_combo_edit and read/set ending_edit.
     friend class TableComboPopup;
 
 public:
@@ -80,16 +80,27 @@ public:
     // Text source for ALL cells (fixed and normal alike). row/col are 0-based. The returned
     // const char* is UTF-8 and is consumed (copied) immediately during drawing, never stored,
     // so a reused static buffer is allowed. user is an opaque context passed back on every call.
-    void set_callback(const char* (*cb)(int row, int col, void* user), void* user = nullptr);
+    void set_text_callback(const char* (*cb)(int row, int col, void* user), void* user = nullptr);
 
-    // Write-back path for in-place editing (Stage 5), separate from the read-only set_callback.
-    // text is UTF-8 and valid only for the duration of the call. For a combo-type cell (see
-    // edit_cell) text is re-encoded as "\x1B newindex, item0, item1, ..." so the host's data
-    // shape stays identical to what set_callback returns -- TableBox does not cache edited text
-    // itself; the host's cell_text/set_callback source is expected to reflect the new value on
-    // the next call. Optional: editing is simply unavailable (Enter/double-click no-op on a body
-    // cell) if this is never called.
-    void set_edit_callback(void (*cb)(int row, int col, const char* text, void* user), void* user = nullptr);
+    // Dual-purpose write-back path (Stage 5). Optional: editing is unavailable if never called.
+    // text == nullptr : QUERY mode -- TableBox asks "what kind of cell is this?". Return:
+    //   nullptr (0)            : read-only; no editing.
+    //   (const char*)(-1)     : CEdit-editable plain-text cell.
+    //   "item0, item1, ..."   : combo (dropdown) cell; comma-separated list of item labels.
+    //                           Use '\b' (0x08) in an item to represent a literal comma.
+    // text != nullptr : COMMIT mode -- user has finished editing; store the new value.
+    //   For a combo cell, text is the selected index as a decimal string ("0", "1", ...).
+    //   For a CEdit cell, text is the raw UTF-8 string the user typed.
+    //   The return value in commit mode is ignored by TableBox.
+    // For combo cells, set_text_callback must return just the current index string ("0","1",...);
+    // TableBox reads this in query/draw to know which item to display.
+    void set_edit_callback(const char* (*cb)(int row, int col, const char* text, void* user), void* user = nullptr);
+
+    // Inset offsets (96 DPI logical px, scaled to physical at the window DPI) for the in-place CEdit:
+    //   CEdit rect = (x0+dx0, y0+dy0, x1-dx1, y1-dy1)
+    // Use dy0/dy1 to vertically position the edit box (single-line CEdit cannot center
+    // text programmatically). Horizontal alignment follows set_align(). Default: (1,1,0,0).
+    void set_edit_adjust(int dx0, int dy0, int dx1, int dy1);
 
     // Single font. Borrows ONLY ConBox's set_efont/set_kfont argument grammar (name / size in
     // points / option attribute string: B/I/U/S/Q -- see ConBox.cpp ParseFontOpts). No English/
@@ -97,9 +108,20 @@ public:
     // monospace cell-width logic does not apply, and the width ratio ('W') option is not used.
     void set_font(const char* name, float size, const char* option = nullptr);
 
+    // Body-cell text alignment, numpad layout (does not affect fixed/header cells):
+    //   1=top-left  2=top-center  3=top-right
+    //   4=mid-left  5=mid-center  6=mid-right
+    //   7=bot-left  8=bot-center  9=bot-right
+    // Default is 4 (mid-left). Can be called before or after open().
+    void set_align(int num);
+
+    // Inner padding (96 DPI logical px) applied to both left and right of the text rect inside
+    // each cell. Also used as the gap between the combo label and the arrow button. Default is 4.
+    void set_pad(int logical_px);
+
 protected:
-    // Default rendering: normal cell white + left-aligned/vertically-centered text; fixed cell
-    // an Excel-like raised/button look. Coordinates are client-area PHYSICAL px (DPI already
+    // Default rendering: normal body-cell white + text aligned per set_align(); fixed cell an
+    // Excel-like raised/button look. Coordinates are client-area PHYSICAL px (DPI already
     // applied); x1/y1 exclusive. The caller (OnPaint) has already clipped the DC to [x0,y0,x1,y1),
     // so an override needs no extra clipping. Grid lines are drawn by the paint loop afterward,
     // not here -- an override need not redraw borders.
@@ -147,10 +169,17 @@ protected:
     afx_msg BOOL OnSetCursor(CWnd* pWnd, UINT nHitTest, UINT message);
     afx_msg void OnMouseLeave();
     afx_msg void OnTimer(UINT_PTR id);
+
+    // Intercepts WM_IME_STARTCOMPOSITION so Hangul (which arrives as IME composition, not WM_CHAR)
+    // opens the CEdit and continues there instead of leaking to the desktop -- see TableBox.cpp.
+    virtual LRESULT WindowProc(UINT message, WPARAM wParam, LPARAM lParam) override;
     DECLARE_MESSAGE_MAP()
 
 private:
     void ensure_back_buffer(CDC* ref, int w, int h);
+
+    // Draw UTF-8 text aligned per cell_align/cell_pad. Caller must set up font/bkmode/textcolor.
+    void draw_text_aligned(CDC& dc, const char* utf8, int x0, int y0, int x1, int y1);
 
     // (Re)build `font`/`font_tm` from font_name/font_size/font_opt at the current box_dpi.
     // Called by open(), set_font() (if the window already exists), and a DPI change in OnSize.
@@ -235,15 +264,23 @@ private:
     // floating editor before the table layout changes beneath it.
     void cancel_edit();
 
-    // Stage 5: in-place cell editing. Starts the CEdit session over (row,col) with its current
-    // text selected. If initial_char != 0 it is forwarded to the new box right after creation
-    // (typed-key trigger: replaces the selection, Excel-style overwrite-on-type).
+    // Stage 5: in-place cell editing. Starts the text-edit session over (row,col) with its current
+    // text selected. The editor is a raw Unicode EDIT window (CreateWindowExW + SetWindowSubclass,
+    // NOT an MFC CEdit) so IME composition renders correctly even in an MBCS build. If initial_char
+    // != 0 it is forwarded to the new box right after creation (typed-key trigger: replaces the
+    // selection, Excel-style overwrite-on-type).
     void start_text_edit(int row, int col, wchar_t initial_char = 0);
 
-    // Ends the active CEdit session: commit=true reads the box's text and calls edit_cb; both
+    // Ends the active text-edit session: commit=true reads the box's text and calls edit_cb; both
     // cases destroy the box and refocus the grid. move_dr/move_dc shift cur_row/cur_col after a
     // committed edit (Enter -> +1 row, Tab -> +1 col); ignored when commit is false.
     void end_text_edit(bool commit, int move_dr, int move_dc);
+
+    // Win32 subclass proc for the edit_box EDIT window (dwRefData = this). Replaces the old
+    // TableEditBox::PreTranslateMessage/OnKillFocus/OnGetDlgCode: handles Enter/Esc/Tab commit,
+    // swallows the trailing WM_CHAR they post, reports DLGC_WANTALLKEYS, and commits on focus loss.
+    static LRESULT CALLBACK EditSubclassProc(HWND h, UINT msg, WPARAM wp, LPARAM lp,
+                                             UINT_PTR id, DWORD_PTR ref);
 
     // Starts/ends the combo dropdown session over (row,col). end_combo_edit's new_index is the
     // item the user picked (ignored when commit is false); the resulting text handed to edit_cb
@@ -359,18 +396,20 @@ private:
     const char* (*text_cb)(int row, int col, void* user);
     void* text_cb_user;
 
-    void (*edit_cb)(int row, int col, const char* text, void* user);
+    const char* (*edit_cb)(int row, int col, const char* text, void* user);
     void* edit_cb_user;
 
-    // Stage 5 edit session state. edit_box/combo_popup are mutually exclusive and non-null only
-    // while their respective session is open. ending_edit guards against a re-entrant commit
-    // when WM_KILLFOCUS fires as a side effect of our own DestroyWindow()/SetFocus() during
-    // commit/cancel (the box's real "lost focus to another control" case is the one we DO want
-    // to commit on; the teardown-triggered one must be ignored).
-    TableEditBox*    edit_box;
+    // Stage 5 edit session state. edit_box (a raw Unicode EDIT HWND, see start_text_edit) and
+    // combo_popup are mutually exclusive and non-null only while their respective session is open.
+    // ending_edit guards against a re-entrant commit when WM_KILLFOCUS fires as a side effect of
+    // our own DestroyWindow()/SetFocus() during commit/cancel (the box's real "lost focus to
+    // another control" case is the one we DO want to commit on; the teardown-triggered one must
+    // be ignored).
+    HWND             edit_box;
     TableComboPopup* combo_popup;
     int  edit_row, edit_col;
     bool ending_edit;
+    int  edit_adj_x0, edit_adj_y0, edit_adj_x1, edit_adj_y1;  // set by set_edit_adjust()
 
     // Font spec (96 DPI logical / DPI-independent), stored by set_font (and the ctor default) so
     // the font can be rebuilt at a new DPI without the host re-calling. build_font() does the GDI work.
@@ -380,7 +419,9 @@ private:
     CFont       font;
     TEXTMETRICW font_tm;
 
-    int box_dpi;   // control's current DPI; set in open() and updated in OnSize on a DPI change
+    int cell_align; // numpad-style text alignment (1-9); set by set_align(), default 4 (mid-left)
+    int cell_pad;   // inner left/right text padding (96 DPI logical px); set by set_pad(), default 4
+    int box_dpi;    // control's current DPI; set in open() and updated in OnSize on a DPI change
 
     CDC      back_dc;          // persistent memory DC (double-buffered paint)
     CBitmap  back_bmp;         // back buffer bitmap (matches client size)
