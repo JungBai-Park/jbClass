@@ -374,11 +374,13 @@
   <ItemGroup>
     <ClInclude Include="..\Source\ConBox.h" />
     <ClInclude Include="..\Source\FrameBox.h" />
+    <ClInclude Include="..\Source\TableBox.h" />
     <ClInclude Include="Resource.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="..\Source\ConBox.cpp" />
     <ClCompile Include="..\Source\FrameBox.cpp" />
+    <ClCompile Include="..\Source\TableBox.cpp" />
     <ClCompile Include="DemoApp.cpp" />
   </ItemGroup>
   <ItemGroup>

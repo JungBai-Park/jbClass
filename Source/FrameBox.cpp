@@ -11,12 +11,13 @@
     [UTIL]       AlignText
     [DETECT]     signal_map + set_default_signal_codes
     [PROC]       proc (static) -> dispatch (instance message router)
-    [EDIT]       toggle/enter/leave edit, on_key, on_drag, paint_frame, get_rect
+    [EDIT]       cancel_edit, toggle/enter/leave edit, on_key, on_drag, paint_frame, get_rect
     [SIGNAL]     signal()  (post WM_PARASITE_REPORT)
     [REWRITE]    find_char + LayOutRewrite  (rewrite OpenFrame/Add... literals)
     [HOST]       FrameBox: ctor/dtor/close, create_window, open, attach, timer,
-                 add_* member factories + finish_child, WindowProc,
-                 PreTranslateMessage (ESC/Enter), surveil, listen_core
+                 add_* member factories + finish_child, WindowProc (incl. WM_DPICHANGED
+                 / WM_DPICHANGED_AFTERPARENT), rescale_children, PreTranslateMessage
+                 (ESC/Enter), surveil, listen_core
 
     BEHAVIOUR
     ---------
@@ -526,6 +527,12 @@ LRESULT Parasite::dispatch(HWND h, UINT msg, WPARAM w, LPARAM l) {
 // ======================================================================
 #if defined(_DEBUG)
 
+void Parasite::cancel_edit() {
+    Parasite* p = active();
+    if (p && p->target && ::IsWindow(p->target->m_hWnd))
+        p->leave_edit(p->target->m_hWnd, false);   // restore via last_rect, no rewrite
+}
+
 void Parasite::toggle_edit(HWND h) {
     if (editing) leave_edit(h, false);        // middle-click exit: no commit
     else          enter_edit(h);
@@ -577,15 +584,15 @@ void Parasite::leave_edit(HWND h, bool commit) {
         get_rect(h, phys);
         int tdpi = ::GetDpiForWindow(h);
         if (tdpi <= 0) tdpi = 96;
-        // Convert physical to logical for comparison and storage.
-        // NOTE: LayOutRewrite still receives physical coords here; Step 4 will
-        // change it to pass logical coords so the source file stores 96 DPI values.
+        // Convert physical to logical (96 DPI) for comparison, storage, AND the
+        // source rewrite, so the file always stores DPI-invariant coords. Editing at
+        // a non-96 DPI monitor introduces integer rounding (prefer rewriting at 96 DPI).
         CRect logical(MulDiv(phys.left,   96, tdpi),
                       MulDiv(phys.top,    96, tdpi),
                       MulDiv(phys.right,  96, tdpi),
                       MulDiv(phys.bottom, 96, tdpi));
         if (logical != last_rect) {
-            LayOutRewrite(file, line, phys);
+            LayOutRewrite(file, line, logical);
             last_rect = logical;
         }
     }
@@ -735,6 +742,8 @@ static void rewrite_error(const char* msg, const char* file, int line) {
     ::MessageBoxW(nullptr, buff, L"Parasite rewrite error", MB_OK | MB_ICONERROR);
 }
 
+// `rect` is written verbatim into the source literals; the caller passes 96 DPI
+// logical coords (see leave_edit) so the file stays DPI-invariant.
 bool LayOutRewrite(const char* file, int line, const RECT& rect) {
     // 1) binary backup file -> file.bak, rejecting UTF-16 (BOM) sources.
     char bak[512];
@@ -1240,6 +1249,26 @@ void FrameBox::surveil(int count, CWnd** list, bool on) {
     }
 }
 
+// Reposition every WS_CHILD registry entry from its 96 DPI logical rect to physical
+// pixels at the current `dpi`, and reapply `sys_font`. Called on a DPI change after
+// `dpi`/`sys_font` are updated. Popup child frames (AddFrame, WS_POPUP) are skipped:
+// they receive their own WM_DPICHANGED and rescale themselves. A WS_CHILD zone frame
+// is moved here by its parent, then rescales ITS OWN children in WM_DPICHANGED_AFTERPARENT.
+void FrameBox::rescale_children() {
+    HFONT font = sys_font ? sys_font : default_ui_font();
+    for (ChildEntry& e : registry) {
+        if (!e.layout) continue;
+        CWnd* w = static_cast<CWnd*>(*e.layout);            // borrowed or owned target
+        if (!w || !::IsWindow(w->m_hWnd)) continue;
+        if ((::GetWindowLongW(w->m_hWnd, GWL_STYLE) & WS_CHILD) == 0) continue;
+        const CRect& lr = e.layout->logical_rect();
+        w->MoveWindow(MulDiv(lr.left, dpi, 96), MulDiv(lr.top, dpi, 96),
+                      MulDiv(lr.Width(), dpi, 96), MulDiv(lr.Height(), dpi, 96), TRUE);
+        ::SendMessageW(w->m_hWnd, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+    }
+    Invalidate();
+}
+
 LRESULT FrameBox::WindowProc(UINT msg, WPARAM wParam, LPARAM lParam) {
     // Paint background with the dialog face color instead of the CWnd default.
     if (msg == WM_ERASEBKGND) {
@@ -1248,6 +1277,35 @@ LRESULT FrameBox::WindowProc(UINT msg, WPARAM wParam, LPARAM lParam) {
         ::FillRect(reinterpret_cast<HDC>(wParam), &rc,
                    ::GetSysColorBrush(COLOR_BTNFACE));
         return 1;
+    }
+
+    // Live DPI change for a top-level / owned-popup frame. Cancel any active
+    // layout-edit first (it restores via the logical last_rect), then resize the
+    // frame to the OS-suggested rect (lParam), rebuild the system font at the new
+    // DPI, and rescale all WS_CHILD entries.
+    if (msg == WM_DPICHANGED) {
+        Parasite::cancel_edit();
+        dpi = static_cast<int>(LOWORD(wParam));
+        const RECT* r = reinterpret_cast<const RECT*>(lParam);
+        ::SetWindowPos(m_hWnd, nullptr, r->left, r->top,
+                       r->right - r->left, r->bottom - r->top,
+                       SWP_NOZORDER | SWP_NOACTIVATE);
+        if (sys_font) ::DeleteObject(sys_font);
+        sys_font = make_dpi_font(dpi);
+        rescale_children();
+        return 0;
+    }
+
+    // A WS_CHILD zone frame's parent changed DPI. The parent already resized this
+    // zone via its own rescale_children(); here we rebuild our font and rescale OUR
+    // children (the parent does not recurse into the zone's registry). wParam/lParam
+    // are 0 for AFTERPARENT, so query the new DPI from the window.
+    if (msg == WM_DPICHANGED_AFTERPARENT) {
+        dpi = static_cast<int>(::GetDpiForWindow(m_hWnd));
+        if (sys_font) ::DeleteObject(sys_font);
+        sys_font = make_dpi_font(dpi);
+        rescale_children();
+        return 0;
     }
 
     // Timer fired: break out of the modal loop and return this from listen().
@@ -1305,7 +1363,7 @@ LRESULT FrameBox::WindowProc(UINT msg, WPARAM wParam, LPARAM lParam) {
 // TRAP: the editing_hwnd() guard does NOT restrict this to edit mode -- it only yields
 // to the Parasite subclass proc when a control is actively being repositioned (so Enter
 // commits and ESC cancels the drag). In normal mode both keys are still always consumed,
-// EXCEPT when the focused window returns DLGC_WANTALLKEYS (e.g. cConBox terminal widget).
+// EXCEPT when the focused window returns DLGC_WANTALLKEYS (e.g. ConBox terminal widget).
 BOOL FrameBox::PreTranslateMessage(MSG* pMsg) {
     // While a window is in layout-edit mode, the edit gestures must stay with the
     // editing window and the OTHER controls must be inert. Messages destined for a

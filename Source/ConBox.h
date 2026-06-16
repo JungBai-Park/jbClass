@@ -13,8 +13,11 @@
 //     portability unit use explicit W-suffix functions so both character-set settings compile.
 //   - start() (ConPTY child) needs Windows 10 1809 (build 17763)+. Pure-view use does not.
 //   - imm32.lib (Korean IME) is auto-linked by ConBox.cpp via #pragma comment (no host setup).
-//   - For crisp glyphs the HOST app calls SetProcessDPIAware() at startup. DPI awareness is a
-//     process-wide property, so the host enables it, not this control.
+//   - For crisp glyphs the HOST app enables DPI awareness at startup (DPI awareness is a process-wide
+//     property, so the host sets it, not this control; PerMonitorV2 via the app manifest is preferred).
+//     ConBox itself is per-monitor aware: fonts/cell metrics use the window's own DPI (GetDpiForWindow)
+//     and it rebuilds them on a DPI change (WM_DPICHANGED_AFTERPARENT), so text stays correctly sized
+//     when the host window moves between monitors of different DPI.
 //   - Every string API takes UTF-8 (const char*) so C++ string literals pass directly.
 //   - Self-contained: includes its own headers, does not depend on a precompiled header.
 //   - Save .h/.cpp as ASCII (comments are ASCII-only) so encoding is unambiguous.
@@ -25,7 +28,7 @@
 //   - Text cursor is hidden when the window loses focus (WM_KILLFOCUS) and restored on WM_SETFOCUS.
 //
 // --- Usage (inside the host parent window) ---
-//     cConBox box;                            // usually held as a member
+//     ConBox box;                            // usually held as a member
 //     box.set_efont("Consolas", 13, "B");     // (optional) font; omitted = defaults
 //     box.open(parent, 0, 0);                  // create child window at (left,top); size from cfg
 //     box.print("hello\n");                   // output (UTF-8) flows into the cell grid
@@ -80,14 +83,14 @@ enum {
 
 typedef std::vector<CharInfo> Row;
 
-class cConBox : public CWnd
+class ConBox : public CWnd
 {
 public:
     // Returned by grid_size(). rows, cols in ROW, COL order.
     struct GridSize { int rows, cols; };
 
-    cConBox();
-    virtual ~cConBox();
+    ConBox();
+    virtual ~ConBox();
 
     // Create the child window at (left, top) inside parent. Pixel size is computed from the
     // cfg_rows/cfg_cols set by setup_from_ini() (defaults: 96 cols x 32 rows). If cfg_cmdline is
@@ -96,16 +99,16 @@ public:
     // call GetClientRect() on the ConBox CWnd to get the actual pixel size for its own layout.
     void open(CWnd* parent, int left = 0, int top = 0);
 
-    // Set the English font. size is in points. opts is an attribute string (see set_builtin_glyphs
-    // note below and ConBox.cpp ParseFontOpts for the grammar).
-    void set_efont(const char* name, float size, const char* opts);
+    // Set the English font. size is in points. option is an attribute string and may be omitted
+    // (see set_builtin_glyphs note below and ConBox.cpp ParseFontOpts for the grammar).
+    void set_efont(const char* name, float size, const char* option = 0);
 
     // Set the Korean font (same arg rules as set_efont). If size <= 0, "match mode" turns on:
     // Korean is rasterized to the same pixel (em) height as English (the size value is ignored) and
     // line height tracks English, which keeps box-drawing vertical lines connecting. If size > 0,
     // match mode is off: Korean keeps that size and line height is the max of the two fonts.
     // Default (nothing set) is match mode on.
-    void set_kfont(const char* name, float size, const char* opts);
+    void set_kfont(const char* name, float size, const char*option = 0);
 
     // Pad (or trim) each side of every cell by a pixel amount, applied after font metrics are computed.
     // Positive adds margin on that side; negative eats into it. The font size is unchanged -- only the
@@ -293,13 +296,36 @@ protected:
     afx_msg LRESULT OnImeEnd(WPARAM w, LPARAM l);
     // IME state change (e.g. Korean/English toggle); updates the cursor width immediately.
     afx_msg LRESULT OnImeNotify(WPARAM w, LPARAM l);
+    // Live DPI change. The WS_CHILD case (usual AddNew) is handled entirely in OnSize: when the host
+    // (FrameBox) resizes us to a new-DPI rect, OnSize sees GetDpiForWindow != box_dpi and rebuilds the
+    // fonts while PRESERVING the logical grid (cols/rows) -- a DPI change only rescales cell pixels, so
+    // the child PTY must NOT be resized (that makes the shell re-emit -> duplicated/lost content). This
+    // is order-independent (no reliance on WM_DPICHANGED_*PARENT delivery timing). OnDpiChanged is only
+    // for a top-level/popup ConBox: it applies the OS-suggested rect (lParam), and the resulting OnSize
+    // does the font rebuild + grid preservation.
+    afx_msg LRESULT OnDpiChanged(WPARAM w, LPARAM l);
     DECLARE_MESSAGE_MAP()
 
 private:
     // Build one font into font, leaving the resulting LOGFONT in lf_out and width ratio in width_pct.
-    void make_font(CFont& font, LOGFONTW& lf_out, int& width_pct, const char* name, float size, const char* opts);
+    void make_font(CFont& font, LOGFONTW& lf_out, int& width_pct, const char* name, float size, const char* option);
 
-    // Fill any unset font with the defaults (English Cascadia Mono, Korean Malgun Gothic).
+    // Build the base font + its bold/italic/bold-italic variants from the stored spec members
+    // (efont_*/kfont_*). Used by set_efont/set_kfont, open(), and DPI changes. The double-size
+    // variant and the kfont match-height sync are done in calc_cell_size (after these run).
+    void build_efont();
+    void build_kfont();
+
+    // Rebuild both fonts at the window's current DPI, recompute the grid, and repaint. Called from
+    // the WM_DPICHANGED / WM_DPICHANGED_AFTERPARENT handlers.
+    void relayout_for_dpi();
+
+    // Scale a 96 DPI pixel constant to the control's current DPI (identity at 96). Used for the
+    // overlay scrollbar geometry so it stays proportional on high-DPI monitors.
+    int  sbar_px(int base96) const { return ::MulDiv(base96, box_dpi > 0 ? box_dpi : 96, 96); }
+
+    // Ensure a font spec exists for any font the host never set (English Cascadia Mono 12pt,
+    // Korean Malgun Gothic match-mode). Specs only; the GDI build happens in build_efont/build_kfont.
     void apply_default_fonts();
 
     // Measure the fixed-grid cell width/height/baseline from the current fonts.
@@ -308,6 +334,12 @@ private:
 
     // Derive cols/rows that fit the client area.
     void update_metrics();
+
+    // Recompute origin_x/origin_y: the drawing offset that centers the grid in the client area.
+    void recalc_origin();
+
+    // Grow the window (never shrink) so the preserved grid fits at the current DPI; used on DPI change.
+    void snap_to_grid();
 
     void scroll_to_bottom();
 
@@ -494,6 +526,18 @@ private:
     LOGFONTW efont_lf;
     LOGFONTW kfont_lf; // keeps the user's original size/style
 
+    // Original (DPI-independent) font specs, stored by set_efont/set_kfont (and apply_default_fonts
+    // for the unset case). Kept so fonts can be rebuilt at a new DPI (build_efont/build_kfont) without
+    // the host re-calling. efont_size/kfont_size are in points; kfont_size<=0 means match mode.
+    std::string efont_name, efont_opts;
+    float       efont_size;
+    std::string kfont_name, kfont_opts;
+    float       kfont_size;
+
+    int box_dpi;            // control's current DPI; set in open() (from parent) and updated in OnSize
+                            // when the window's DPI changes. make_font uses it pre-window; sbar_px()
+                            // scales scrollbar px by it; OnSize compares it to detect a DPI change.
+
     bool kfont_match_efont; // on: match Korean height to English and base line height on English
                             // (turned on by set_kfont size<=0, default true)
 
@@ -506,6 +550,9 @@ private:
     int cell_h;        // px height of one line cell
     int cell_base;     // px from cell top to glyph baseline (baseline alignment)
 
+    int origin_x;      // px offset of the grid's left edge: grid is centered in the client (recalc_origin)
+    int origin_y;      // px offset of the grid's top edge; clamps to 0 when the grid overflows the client
+
     int adjust_left;   // per-side cell padding in px (see adjust()); left/top also shift the glyph
     int adjust_top;
     int adjust_right;
@@ -514,10 +561,20 @@ private:
     int cols;
     int rows;
 
-    int margin_top;    // inner padding (px); glyphs draw only inside it
+    // Configured margins are 96 DPI LOGICAL inner padding. They are used ONLY to size the window in
+    // open() and to derive cols/rows on resize in update_metrics() (scaled to physical via MulDiv at
+    // box_dpi). They are NOT used when drawing: the grid is centered (recalc_origin), so the realized
+    // margin can differ from the configured value. adjust() padding stays in raw physical pixels.
+    int margin_top;
     int margin_bottom;
     int margin_left;
     int margin_right;
+
+    // DPI-change window snap policy (snap_to_grid). 0 = centering only (window stays at the host's
+    // linearly-scaled rect, bottom/right clipped if the grid does not fit); 1 = grow only (snap larger
+    // only when the grid would be clipped); 2 = always snap to the exact grid+margin size (grow or
+    // shrink). Snapping keeps the upper-left corner fixed and moves the right/bottom edges.
+    int snap_mode;
 
     // Cell grid. screen = current screen (always rows lines x cols cells). scrollback = lines pushed
     // off the top. Cursor (cur_row, cur_col) is a 0-based on-screen cell coord (VT absolute moves).

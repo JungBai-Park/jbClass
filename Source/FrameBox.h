@@ -144,6 +144,18 @@ public:
     // listen()/surveil() list and be compared against listen()'s return value.
     operator CWnd*() const { return target; }
 
+    // The control's 96 DPI logical rect (set at layout()/enter_edit(), updated on
+    // commit). Used by FrameBox to reposition the target on a DPI change.
+    const CRect& logical_rect() const { return last_rect; }
+
+    // Cancel any control currently in layout-edit mode (restore via last_rect, no
+    // source rewrite). Called by FrameBox before a DPI reposition. No-op in release.
+#if defined(_DEBUG)
+    static void cancel_edit();
+#else
+    static void cancel_edit() {}
+#endif
+
     static LRESULT CALLBACK proc(HWND hWnd, UINT msg, WPARAM wParam,
                                      LPARAM lParam, UINT_PTR id, DWORD_PTR ref);
 
@@ -206,9 +218,10 @@ private:
 void AlignText(CWnd* wnd, int number);
 
 // Rewrite the 4 coordinate literals of the Add.../Open(...) call at file:line.
-// Returns false (and shows a message box) on failure. Integer literals only;
-// the call must be on a single line; ANSI/UTF-8 source (BOM/UTF-16 rejected).
-// Compiled only in _DEBUG builds; not available in release.
+// `rect` is written verbatim: the caller (leave_edit) passes 96 DPI LOGICAL coords
+// so the source stays DPI-invariant. Returns false (and shows a message box) on
+// failure. Integer literals only; the call must be on a single line; ANSI/UTF-8
+// source (BOM/UTF-16 rejected). Compiled only in _DEBUG builds.
 #if defined(_DEBUG)
 bool LayOutRewrite(const char* file, int line, const RECT& rect);
 #endif
@@ -234,7 +247,7 @@ bool LayOutRewrite(const char* file, int line, const RECT& rect);
 //     frame (replaces the old ParasiteZone). add_frame(): WS_POPUP separate-window
 //     child frame. Both are owned by this frame's registry (destroyed recursively).
 //   - add_new()/add_asitis(): attach an already-created external CWnd (e.g. a
-//     `new cConBox`). Coords-first; the window pointer is the trailing argument.
+//     `new ConBox`). Coords-first; the window pointer is the trailing argument.
 //     add_new OWNS it (registry destroys+deletes); add_asitis BORROWS it.
 //   - attach(CWinApp*): bind as the app main window (m_pMainWnd = this), cleared
 //     on close so CWnd teardown never leaves a dangling main window.
@@ -243,6 +256,11 @@ bool LayOutRewrite(const char* file, int line, const RECT& rect);
 //   - WindowProc reflects child notifications (WM_COMMAND/WM_NOTIFY/WM_HSCROLL/
 //     WM_VSCROLL) to the control HWND as WM_PARASITE_CALLBACK. This runs always, so a
 //     child frame reflects its own controls even while a parent runs listen().
+//   - WindowProc handles live DPI changes: WM_DPICHANGED (top-level/popup) resizes the
+//     frame to the OS-suggested rect; WM_DPICHANGED_AFTERPARENT (WS_CHILD zone) reacts to
+//     the parent's DPI change. Both update `dpi`, rebuild `sys_font`, then call
+//     rescale_children() to reposition every WS_CHILD entry from its logical rect and
+//     reapply the font. Owned popup child frames (AddFrame) get their own WM_DPICHANGED.
 //   - PreTranslateMessage intercepts ESC (post WM_CLOSE) and Enter (click focused
 //     push button) in both normal and edit mode, matching CDialog. Exceptions:
 //       * focused window returns DLGC_WANTALLKEYS -> both keys pass through
@@ -349,6 +367,7 @@ private:
     CWnd*     attach_external(CWnd* wnd, bool owned, int x0,int y0,int x1,int y1,const char* f,int ln);
     CWnd*     listen_core(int count, CWnd** list);
     void      surveil(int count, CWnd** list, bool on);
+    void      rescale_children();   // reposition WS_CHILD entries + reapply sys_font at current dpi
 
     std::vector<ChildEntry> registry;     // children this frame owns
     int       next_id;                    // per-instance control id counter

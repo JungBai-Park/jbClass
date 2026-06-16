@@ -24,6 +24,9 @@
     <ClInclude Include="..\Source\FrameBox.h">
       <Filter>헤더 파일</Filter>
     </ClInclude>
+    <ClInclude Include="..\Source\TableBox.h">
+      <Filter>헤더 파일</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="..\Source\FrameBox.cpp">
@@ -33,6 +36,9 @@
       <Filter>소스 파일</Filter>
     </ClCompile>
     <ClCompile Include="..\Source\ConBox.cpp">
+      <Filter>소스 파일</Filter>
+    </ClCompile>
+    <ClCompile Include="..\Source\TableBox.cpp">
       <Filter>소스 파일</Filter>
     </ClCompile>
   </ItemGroup>

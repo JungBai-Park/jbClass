@@ -1,24 +1,24 @@
 ﻿// ConBox.cpp
 //
-// Implementation of cConBox. To only USE the control, ConBox.h is enough; read this file when
+// Implementation of ConBox. To only USE the control, ConBox.h is enough; read this file when
 // MODIFYING behavior. Use the table of contents below to Grep to one function instead of reading
 // the whole file.
 //
 // === File layout (roughly this order) ===
 //   helpers (static): IsWideChar, ParseFontOpts, DrawBlockElement, DrawBoxLine
 //   message map     : BEGIN_MESSAGE_MAP ... END_MESSAGE_MAP
-//   window/font     : open, make_font, apply_default_fonts, calc_cell_size,
-//                     set_efont, set_kfont, set_builtin_glyphs
+//   window/font     : open, make_font, apply_default_fonts, build_efont, build_kfont, calc_cell_size,
+//                     set_efont, set_kfont, relayout_for_dpi, set_builtin_glyphs
 //   color/cursor    : set_fg_color, set_bg_color, set_cursor_blend, set_cursor_blink, set_cursor, bump_cursor, remap_paper_color, OnTimer
 //   margin          : set_margin, grid_size
 //   config          : setup_from_ini, setup, CreateDefaultIni(static), ResolveIniPath(static), ParseIni(static), ParseColor(static)
 //   cursor geometry : blend_cursor_color, cursor_screen_pos, get_cursor_rect, is_hangul_mode
-//   grid/output     : update_metrics, blank_row, reset_screen, line_at, clamp_cursor, erase_cells,
+//   grid/output     : update_metrics, recalc_origin, snap_to_grid, blank_row, reset_screen, line_at, clamp_cursor, erase_cells,
 //                     scroll_lines_up/down, scroll_up_region, scroll_down_region, line_feed,
 //                     insert_lines, delete_lines, insert_chars, delete_chars,
 //                     enter_alt_screen, leave_alt_screen, put_char, print, update_scrollbar
 //   VT parser       : Xterm256ToRgb(static), vt_feed, dispatch_csi
-//   window messages : OnEraseBkgnd, OnSize, OnGetDlgCode, OnMouseWheel
+//   window messages : OnEraseBkgnd, OnSize (also detects DPI change), OnGetDlgCode, OnMouseWheel, OnDpiChanged
 //   overlay scrollbar: sbar_geometry, sbar_show, draw_overlay_scrollbar, OnMouseLeave
 //   IME (Korean)    : OnImeStart, OnImeComp, OnImeEnd, OnImeNotify
 //   input           : set_input_sink, set_resize_sink, send_input_bytes, send_input_wide,
@@ -136,6 +136,7 @@
 #include <string>
 #include <sstream>
 #include <map>
+#include <cmath>            // std::fabs (overlay scrollbar antialiasing)
 #include <imm.h>            // Korean IME (Input Method Manager)
 #pragma comment(lib, "imm32.lib")
 #include <winspool.h>       // EnumPrintersW, OpenPrinterW, GetPrinterW, CreateDCW (save_pdf)
@@ -169,8 +170,11 @@ static const int   SBAR_MIN_THUMB  = 24;   // minimum thumb height so it stays g
 static const DWORD SBAR_HOLD_MS    = 700;  // stay fully visible this long after the last activity
 static const UINT  SBAR_FADE_TICK_MS = 33; // fade animation tick (~30 fps)
 static const int   SBAR_FADE_STEP  = 24;   // alpha removed per tick once fading (gentle ~0.35s fade)
-static const int   SBAR_OP_IDLE    = 110;  // max thumb opacity when shown (translucent, wt-like)
-static const int   SBAR_OP_HOVER   = 200;  // brighter when hovering / dragging
+static const int   SBAR_OP_IDLE    = 130;  // max thumb opacity when shown (translucent, wt-like)
+static const int   SBAR_OP_HOVER   = 215;  // brighter when hovering / dragging
+static const int   SBAR_GUTTER_OP  = 70;   // gutter strip opacity (scaled by the fade alpha), full
+                                            // SBAR_W width, always drawn while shown -- TableBox.cpp
+                                            // uses the same values; keep both in sync (see its comment).
 static const COLORREF SBAR_THUMB_COLOR = RGB(200, 200, 200);   // light gray, blended over content
 
 // VT default colors: where SGR 0 (reset) and 39/49 return to (also the Requirements default). Tuned to
@@ -182,7 +186,7 @@ enum { VT_GROUND = 0, VT_ESC = 1, VT_CSI = 2, VT_OSC = 3 };
 
 // MAX_SCROLLBACK is now the instance member max_scrollback (configurable via config()).
 
-BEGIN_MESSAGE_MAP(cConBox, CWnd)
+BEGIN_MESSAGE_MAP(ConBox, CWnd)
     ON_WM_PAINT()
     ON_WM_ERASEBKGND()
     ON_WM_SIZE()
@@ -201,10 +205,11 @@ BEGIN_MESSAGE_MAP(cConBox, CWnd)
     ON_WM_DROPFILES()
     ON_WM_SETFOCUS()
     ON_WM_KILLFOCUS()
-    ON_MESSAGE(WM_IME_STARTCOMPOSITION, &cConBox::OnImeStart)
-    ON_MESSAGE(WM_IME_COMPOSITION, &cConBox::OnImeComp)
-    ON_MESSAGE(WM_IME_ENDCOMPOSITION, &cConBox::OnImeEnd)
-    ON_MESSAGE(WM_IME_NOTIFY, &cConBox::OnImeNotify)
+    ON_MESSAGE(WM_DPICHANGED, &ConBox::OnDpiChanged)
+    ON_MESSAGE(WM_IME_STARTCOMPOSITION, &ConBox::OnImeStart)
+    ON_MESSAGE(WM_IME_COMPOSITION, &ConBox::OnImeComp)
+    ON_MESSAGE(WM_IME_ENDCOMPOSITION, &ConBox::OnImeEnd)
+    ON_MESSAGE(WM_IME_NOTIFY, &ConBox::OnImeNotify)
 END_MESSAGE_MAP()
 
 // Whether a char is double-width (Korean, CJK, etc.): 1 cell for English, 2 cells for this range.
@@ -222,12 +227,12 @@ static bool IsWideChar(wchar_t ch)
         || (ch >= 0xFFE0 && ch <= 0xFFE6);  // fullwidth signs
 }
 
-// Convert a font name/size + opts string to a LOGFONTW. (Helper for make_font.)
-// opts grammar: a number applies to the attribute letter that follows it.
+// Convert a font name/size + option string to a LOGFONTW. (Helper for make_font.)
+// option grammar: a number applies to the attribute letter that follows it.
 //   B=Bold (with a number = lfWeight), I=Italic, U=Underline, S=Strikeout,
 //   Q=Quality (0..6), W=Width ratio percent (100=default).
 // dpi_y converts points to pixel height (usually 96). width_pct returns the width ratio.
-static LOGFONTW ParseFontOpts(const char* name, float size_pt, const char* opts, int dpi_y, int& width_pct)
+static LOGFONTW ParseFontOpts(const char* name, float size_pt, const char* option, int dpi_y, int& width_pct)
 {
     LOGFONTW lf;
     ZeroMemory(&lf, sizeof(lf));
@@ -243,10 +248,10 @@ static LOGFONTW ParseFontOpts(const char* name, float size_pt, const char* opts,
 
     width_pct = 100;
 
-    // Parse opts left to right; a run of digits becomes the value of the attribute letter that follows.
+    // Parse option left to right; a run of digits becomes the value of the attribute letter that follows.
     int num = 0;
     bool has_num = false;
-    for (const char* p = opts; p != nullptr && *p != '\0'; ++p) {
+    for (const char* p = option; p != nullptr && *p != '\0'; ++p) {
         char c = *p;
 
         if (c >= '0' && c <= '9') {
@@ -460,7 +465,7 @@ static bool DrawBoxLine(CDC& dc, wchar_t ch, int px, int py, int cw, int chh, CO
     }
 }
 
-cConBox::cConBox()
+ConBox::ConBox()
 {
     default_fg = DEFAULT_FG;
     default_bg = DEFAULT_BG;
@@ -481,6 +486,11 @@ cConBox::cConBox()
     margin_bottom = 10;
     margin_left = 10;
     margin_right = 10;
+
+    origin_x = 0;
+    origin_y = 0;
+
+    snap_mode = 2;
 
     view_top = 0;
     cur_row = 0;
@@ -555,6 +565,12 @@ cConBox::cConBox()
     ZeroMemory(&efont_lf, sizeof(efont_lf));
     ZeroMemory(&kfont_lf, sizeof(kfont_lf));
 
+    // Font specs (name/option default empty = "unset"; apply_default_fonts fills them). box_dpi 0 until
+    // open() sets it from the parent monitor; make_font then falls back to the primary monitor DPI.
+    efont_size = 0.0f;
+    kfont_size = 0.0f;
+    box_dpi = 0;
+
     sel_active = false;
     selecting = false;
     sel_block = false;
@@ -611,7 +627,7 @@ cConBox::cConBox()
     print_ws.reserve(8192);
 }
 
-cConBox::~cConBox()
+ConBox::~ConBox()
 {
     // Tear down child/PTY/polling if still up (OnDestroy usually handles it first; this is a safety net).
     stop();
@@ -712,7 +728,7 @@ static void CreateDefaultIni(const wchar_t* path)
         "; 섹션 이름은 무시됩니다 -- 키 이름으로만 인식합니다.\n"
         "\n"
         "[font]\n"
-        "; 폰트 크기는 포인트(pt) 단위. opts: B=굵게, I=기울임, 90W=너비 90%\n"
+        "; 폰트 크기는 포인트(pt) 단위. option: B=굵게, I=기울임, 90W=너비 90%\n"
         "efont_name    = Cascadia Mono   ; 영문 폰트 이름\n"
         "efont_size    = 12              ; 영문 폰트 크기 (포인트)\n"
         "efont_opts    =                 ; 영문 폰트 옵션\n"
@@ -732,6 +748,7 @@ static void CreateDefaultIni(const wchar_t* path)
         "adjust_bottom = 0               ; 셀 아래쪽 패딩\n"
         "grid_cols     = 96              ; 가로 칸 수\n"
         "grid_rows     = 32              ; 세로 줄 수\n"
+        "snap_mode     = 2               ; DPI 변경시 창 스냅: 0=센터링만(작으면 우/하단 짤림), 1=작을때만 확대, 2=margin 확보후 항상 스냅\n"
         "\n"
         "[screen]\n"
         "; 색상 형식: #RRGGBB\n"
@@ -795,7 +812,7 @@ static void CreateDefaultIni(const wchar_t* path)
 }
 
 // Apply INI-format settings from a string. contents: UTF-8 with \n line endings.
-void cConBox::setup(const char* contents)
+void ConBox::setup(const char* contents)
 {
     if (!contents) return;
 
@@ -831,6 +848,7 @@ void cConBox::setup(const char* contents)
     int al = geti("adjust_left", 0), at = geti("adjust_top", -2);
     int ar = geti("adjust_right", 0), ab = geti("adjust_bottom", 0);
     adjust(al, at, ar, ab);
+    snap_mode = geti("snap_mode", 2);
 
     // Screen colors: screen_text / screen_back / screen_palette00..15 (0-indexed, matching ANSI indices 0..15).
     if (const std::string* s = get("screen_text")) set_fg_color(ParseColor(*s, default_fg));
@@ -876,7 +894,7 @@ void cConBox::setup(const char* contents)
 // - File not found: auto-created with compiled-in defaults at the resolved path; a status message is
 //   stored in ini_msg and printed by open() once the window exists. Settings stay at constructor defaults.
 // - File found but cannot be opened: same deferred print() path, no settings changed.
-void cConBox::setup_from_ini(const char* path)
+void ConBox::setup_from_ini(const char* path)
 {
     bool explicit_path = (path && *path);
     const char* src = explicit_path ? path : "ConBox.ini";
@@ -915,7 +933,7 @@ void cConBox::setup_from_ini(const char* path)
     setup(content.c_str());
 }
 
-void cConBox::open(CWnd* parent, int left, int top)
+void ConBox::open(CWnd* parent, int left, int top)
 {
     // Register the "ConBox" window class on first call; subsequent calls (multiple instances) skip.
     // Fixed name allows FindWindowEx(parent, NULL, L"ConBox", NULL) from host/test scripts.
@@ -934,14 +952,20 @@ void cConBox::open(CWnd* parent, int left, int top)
     }
 
     // Compute cell metrics before creating the window so the pixel size can be derived from the
-    // configured grid. calc_cell_size() falls back to GetDC(NULL) when the window does not exist yet,
-    // so this is safe to call here. (Font defaults fill in if the host did not call set_efont/set_kfont.)
+    // configured grid. The window does not exist yet, so seed box_dpi from the parent's monitor DPI
+    // (a WS_CHILD inherits its parent's DPI under Per-Monitor V2); make_font uses it for the pt->px
+    // conversion. Then ensure specs and build the fonts at that DPI. (Fonts the host set earlier via
+    // setup_from_ini were built at the primary-monitor DPI; building again here corrects them.)
+    box_dpi = (int)::GetDpiForWindow(parent->GetSafeHwnd());
     apply_default_fonts();
+    build_efont();
+    build_kfont();
     calc_cell_size();
 
-    // Window size = configured grid (cfg_rows x cfg_cols cells) plus the margins.
-    int pw = cfg_cols * cell_w + margin_left + margin_right;
-    int ph = cfg_rows * cell_h + margin_top  + margin_bottom;
+    // Window size = configured grid (cfg_rows x cfg_cols cells) plus the margins. Margins are 96 DPI
+    // logical, so scale them to physical pixels at box_dpi (cell_w/cell_h are already physical).
+    int pw = cfg_cols * cell_w + ::MulDiv(margin_left, box_dpi, 96) + ::MulDiv(margin_right, box_dpi, 96);
+    int ph = cfg_rows * cell_h + ::MulDiv(margin_top,  box_dpi, 96) + ::MulDiv(margin_bottom, box_dpi, 96);
     CRect rc(left, top, left + pw, top + ph);
 
     // No WS_VSCROLL: a native vertical scrollbar would shrink the client area the first time scrollback
@@ -983,13 +1007,23 @@ void cConBox::open(CWnd* parent, int left, int top)
         start(cfg_cmdline.c_str());
 }
 
-void cConBox::make_font(CFont& font, LOGFONTW& lf_out, int& width_pct, const char* name, float size, const char* opts)
+void ConBox::make_font(CFont& font, LOGFONTW& lf_out, int& width_pct, const char* name, float size, const char* option)
 {
-    HDC hdc = ::GetDC(NULL);
-    int dpi = ::GetDeviceCaps(hdc, LOGPIXELSY);
-    ::ReleaseDC(NULL, hdc);
+    // Per-monitor DPI for pt->pixel conversion. Prefer the window's own DPI
+    // (GetDpiForWindow) so the font matches the monitor the control lives on.
+    // make_font also runs BEFORE the window exists (set_efont/set_kfont via
+    // setup_from_ini, and build_efont/build_kfont inside open() before CreateWindowExW):
+    // there GetDpiForWindow(NULL) returns 0. Fall back to box_dpi (set by open() from the
+    // parent monitor), then to the primary-monitor DPI (GetDeviceCaps) if even that is unknown.
+    int dpi = m_hWnd ? (int)::GetDpiForWindow(m_hWnd) : 0;
+    if (dpi <= 0) dpi = box_dpi;
+    if (dpi <= 0) {
+        HDC hdc = ::GetDC(NULL);
+        dpi = ::GetDeviceCaps(hdc, LOGPIXELSY);
+        ::ReleaseDC(NULL, hdc);
+    }
 
-    lf_out = ParseFontOpts(name, size, opts, dpi, width_pct);
+    lf_out = ParseFontOpts(name, size, option, dpi, width_pct);
     font.DeleteObject();
     font.Attach(::CreateFontIndirectW(&lf_out));
 }
@@ -1019,28 +1053,18 @@ static void MakeDoubleFont(CFont& dst, CFont& src)
     dst.Attach(::CreateFontIndirectW(&lf));
 }
 
-void cConBox::apply_default_fonts()
+void ConBox::apply_default_fonts()
 {
     // Defaults: English Cascadia Mono 12pt normal, Korean Malgun Gothic normal (wt.exe Claude profile).
     // Korean size 0 = match-English-height mode (kfont_match_efont=true in the ctor), consistent with
-    // the "size<=0 means match" rule.
-    if (efont.GetSafeHandle() == NULL) {
-        make_font(efont, efont_lf, efont_width_pct, "Cascadia Mono", 12, "");
-        MakeFontVariant(efont_bold,        efont_lf, true,  false);
-        MakeFontVariant(efont_italic,      efont_lf, false, true);
-        MakeFontVariant(efont_bold_italic, efont_lf, true,  true);
-    }
-    if (kfont.GetSafeHandle() == NULL) {
-        make_font(kfont, kfont_lf, kfont_width_pct, "Malgun Gothic", 0, "");
-        MakeFontVariant(kfont_bold,        kfont_lf, true,  false);
-        MakeFontVariant(kfont_italic,      kfont_lf, false, true);
-        MakeFontVariant(kfont_bold_italic, kfont_lf, true,  true);
-    }
-    // efont_double / kfont_double are built in calc_cell_size (after fonts are finalized).
+    // the "size<=0 means match" rule. Specs only -- the GDI build happens in build_efont/build_kfont,
+    // so the empty-name test marks a font the host never set (set_efont/set_kfont fill the name).
+    if (efont_name.empty()) { efont_name = "Cascadia Mono"; efont_size = 12.0f; efont_opts.clear(); }
+    if (kfont_name.empty()) { kfont_name = "Malgun Gothic"; kfont_size = 0.0f;  kfont_opts.clear(); }
 }
 
 // (design: [FONT])
-void cConBox::calc_cell_size()
+void ConBox::calc_cell_size()
 {
     BOOL has_wnd = ::IsWindow(m_hWnd);
     HWND meas_wnd = has_wnd ? m_hWnd : NULL;
@@ -1161,13 +1185,36 @@ void cConBox::calc_cell_size()
     }
 }
 
-void cConBox::set_efont(const char* name, float size, const char* opts)
+// Build efont + variants from the stored efont_* spec at the current DPI (make_font).
+void ConBox::build_efont()
 {
-    make_font(efont, efont_lf, efont_width_pct, name, size, opts);
+    make_font(efont, efont_lf, efont_width_pct, efont_name.c_str(), efont_size, efont_opts.c_str());
     MakeFontVariant(efont_bold,        efont_lf, true,  false);
     MakeFontVariant(efont_italic,      efont_lf, false, true);
     MakeFontVariant(efont_bold_italic, efont_lf, true,  true);
-    // efont_double is (re)built in calc_cell_size below.
+    // efont_double is (re)built in calc_cell_size.
+}
+
+// Build kfont + variants from the stored kfont_* spec; size<=0 keeps match mode.
+void ConBox::build_kfont()
+{
+    make_font(kfont, kfont_lf, kfont_width_pct, kfont_name.c_str(), kfont_size, kfont_opts.c_str());
+    MakeFontVariant(kfont_bold,        kfont_lf, true,  false);
+    MakeFontVariant(kfont_italic,      kfont_lf, false, true);
+    MakeFontVariant(kfont_bold_italic, kfont_lf, true,  true);
+    // kfont_double is (re)built in calc_cell_size.
+
+    // size<=0 turns on match mode (size ignored); positive turns it off. Match mode changes line
+    // height (cell_h); the caller recomputes the grid.
+    kfont_match_efont = (kfont_size <= 0.0f);
+}
+
+void ConBox::set_efont(const char* name, float size, const char* option)
+{
+    efont_name = name ? name : "";
+    efont_size = size;
+    efont_opts = option ? option : "";
+    build_efont();
 
     // Cell size changed; recompute the grid if the window is up.
     if (::IsWindow(m_hWnd)) {
@@ -1176,17 +1223,12 @@ void cConBox::set_efont(const char* name, float size, const char* opts)
     }
 }
 
-void cConBox::set_kfont(const char* name, float size, const char* opts)
+void ConBox::set_kfont(const char* name, float size, const char* option)
 {
-    make_font(kfont, kfont_lf, kfont_width_pct, name, size, opts);
-    MakeFontVariant(kfont_bold,        kfont_lf, true,  false);
-    MakeFontVariant(kfont_italic,      kfont_lf, false, true);
-    MakeFontVariant(kfont_bold_italic, kfont_lf, true,  true);
-    // kfont_double is (re)built in calc_cell_size below.
-
-    // size<=0 turns on match mode (size ignored); positive turns it off. Match mode changes line
-    // height (cell_h), so the grid is recomputed below.
-    kfont_match_efont = (size <= 0.0f);
+    kfont_name = name ? name : "";
+    kfont_size = size;
+    kfont_opts = option ? option : "";
+    build_kfont();
 
     if (::IsWindow(m_hWnd)) {
         calc_cell_size();
@@ -1201,7 +1243,40 @@ void cConBox::set_kfont(const char* name, float size, const char* opts)
     }
 }
 
-void cConBox::adjust(int left, int top, int right, int bottom)
+// Rebuild both fonts at the window's current DPI and repaint, PRESERVING the logical grid (cols/rows).
+// Does NOT call update_metrics(): a DPI change only rescales cell pixels, so the child PTY must not be
+// resized (that makes the shell re-emit -> duplicated/lost content). Called from OnSize when it detects
+// a DPI change (box_dpi != GetDpiForWindow), which is the single, order-independent DPI entry point for
+// the WS_CHILD case.
+void ConBox::relayout_for_dpi()
+{
+    box_dpi = (int)::GetDpiForWindow(m_hWnd);
+    if (box_dpi <= 0) box_dpi = 96;
+    build_efont();
+    build_kfont();
+    calc_cell_size();
+    recalc_origin();   // grid (cols/rows) preserved, but cell pixels changed -> re-center
+
+    int maxtop = (int)scrollback.size();
+    if (maxtop < 0) maxtop = 0;
+    if (view_top > maxtop) view_top = maxtop;
+
+    update_scrollbar();
+    Invalidate();
+}
+
+LRESULT ConBox::OnDpiChanged(WPARAM, LPARAM l)
+{
+    // Top-level / popup ConBox only (a WS_CHILD ConBox gets no WM_DPICHANGED; OnSize handles it).
+    // Apply the OS-suggested rect; the resulting OnSize rebuilds fonts + preserves the grid.
+    const RECT* r = reinterpret_cast<const RECT*>(l);
+    if (r)
+        ::SetWindowPos(m_hWnd, nullptr, r->left, r->top,
+                       r->right - r->left, r->bottom - r->top, SWP_NOZORDER | SWP_NOACTIVATE);
+    return 0;
+}
+
+void ConBox::adjust(int left, int top, int right, int bottom)
 {
     // Stored per-side pixel padding persists until the next font change.
     adjust_left = left;
@@ -1222,7 +1297,7 @@ void cConBox::adjust(int left, int top, int right, int bottom)
     }
 }
 
-void cConBox::set_builtin_glyphs(int level)
+void ConBox::set_builtin_glyphs(int level)
 {
     if (level < 0) level = 0;
     if (level > 2) level = 2;
@@ -1233,19 +1308,19 @@ void cConBox::set_builtin_glyphs(int level)
         Invalidate();
 }
 
-void cConBox::set_fg_color(COLORREF fg)
+void ConBox::set_fg_color(COLORREF fg)
 {
     default_fg = fg;
     cur_fg = fg;
 }
 
-void cConBox::set_bg_color(COLORREF bg)
+void ConBox::set_bg_color(COLORREF bg)
 {
     default_bg = bg;
     cur_bg = bg;
 }
 
-void cConBox::set_cursor_blend(int bg_weight, int fg_weight)
+void ConBox::set_cursor_blend(int bg_weight, int fg_weight)
 {
     // Clamp negatives to 0; ignore a zero sum (no meaning).
     if (bg_weight < 0) bg_weight = 0;
@@ -1263,7 +1338,7 @@ void cConBox::set_cursor_blend(int bg_weight, int fg_weight)
     }
 }
 
-void cConBox::set_cursor_blink(int interval_ms)
+void ConBox::set_cursor_blink(int interval_ms)
 {
     // interval_ms <= 0: follow the system caret rate (GetCaretBlinkTime). If the system has blink
     // disabled (INFINITE), cursor_blink_ms stays 0 = always on (no timer). This matches the INI
@@ -1284,7 +1359,7 @@ void cConBox::set_cursor_blink(int interval_ms)
     }
 }
 
-void cConBox::set_cursor(int type)
+void ConBox::set_cursor(int type)
 {
     // type 0 = default. Default = blinking underline (3), matching the classic conhost.exe cursor.
     if (type == 0)
@@ -1302,7 +1377,7 @@ void cConBox::set_cursor(int type)
     }
 }
 
-void cConBox::bump_cursor()
+void ConBox::bump_cursor()
 {
     // Make the cursor visible now and restart the timer so it stays solid for a beat after input/move
     // (so no off-frame lands right then). Fixed (even) types never blink, so leave their timer alone.
@@ -1313,7 +1388,7 @@ void cConBox::bump_cursor()
     }
 }
 
-void cConBox::OnTimer(UINT_PTR id)
+void ConBox::OnTimer(UINT_PTR id)
 {
     if (id == CURSOR_TIMER) {
         if ((cursor_type & 1) == 0)   // fixed (even) type: ignore the blink tick
@@ -1363,7 +1438,7 @@ void cConBox::OnTimer(UINT_PTR id)
         if (sbar_geometry(track, thumb)) {
             CRect full;
             GetClientRect(&full);
-            CRect gutter(full.right - SBAR_W, full.top, full.right, full.bottom);
+            CRect gutter(full.right - sbar_px(SBAR_W), full.top, full.right, full.bottom);
             InvalidateRect(&gutter, FALSE);
         }
         return;
@@ -1371,7 +1446,7 @@ void cConBox::OnTimer(UINT_PTR id)
     CWnd::OnTimer(id);
 }
 
-void cConBox::set_margin(int top, int left, int bottom, int right)
+void ConBox::set_margin(int top, int left, int bottom, int right)
 {
     // CSS-shorthand omission: resolve left before right (right can follow left).
     if (left < 0) left = top;
@@ -1400,7 +1475,7 @@ void cConBox::set_margin(int top, int left, int bottom, int right)
 
 // Cursor block color: mix default bg and fg per channel at cursor_bg_weight:cursor_fg_weight. The
 // default 6:4 is near-bg so a glyph drawn over the block in fg stays legible. Independent of SGR colors.
-COLORREF cConBox::blend_cursor_color() const
+COLORREF ConBox::blend_cursor_color() const
 {
     int bw = cursor_bg_weight;
     int fw = cursor_fg_weight;
@@ -1416,7 +1491,7 @@ COLORREF cConBox::blend_cursor_color() const
 
 // Map a screen COLORREF to its paper (export) equivalent.
 // Matches default_fg/bg and ansi_colors[0..15]; truecolor / 256-color values pass through.
-COLORREF cConBox::remap_paper_color(COLORREF c) const
+COLORREF ConBox::remap_paper_color(COLORREF c) const
 {
     if (c == default_fg) return paper_default_fg;
     if (c == default_bg) return paper_default_bg;
@@ -1425,7 +1500,7 @@ COLORREF cConBox::remap_paper_color(COLORREF c) const
     return c;
 }
 
-bool cConBox::cursor_screen_pos(int& row_out, int& vx_out) const
+bool ConBox::cursor_screen_pos(int& row_out, int& vx_out) const
 {
     if (screen.empty())
         return false;
@@ -1438,7 +1513,7 @@ bool cConBox::cursor_screen_pos(int& row_out, int& vx_out) const
     return true;
 }
 
-bool cConBox::get_cursor_rect(CRect& rc) const
+bool ConBox::get_cursor_rect(CRect& rc) const
 {
     int row, vx;
     if (!cursor_screen_pos(row, vx))
@@ -1450,15 +1525,15 @@ bool cConBox::get_cursor_rect(CRect& rc) const
     // English mode 1 cell.
     int cw = is_hangul_mode() ? cell_w * 2 : cell_w;
 
-    int px = margin_left + vx * cell_w;
-    int py = margin_top + row * cell_h;
+    int px = origin_x + vx * cell_w;
+    int py = origin_y + row * cell_h;
     rc.SetRect(px, py, px + cw, py + cell_h);
     return true;
 }
 
 // Whether the IME is in Korean (jamo) mode: ImmGetConversionStatus's IME_CMODE_NATIVE flag. Correct
 // right after a Korean/English toggle (before composition starts).
-bool cConBox::is_hangul_mode() const
+bool ConBox::is_hangul_mode() const
 {
     HIMC himc = ImmGetContext(m_hWnd);
     if (!himc)
@@ -1473,20 +1548,23 @@ bool cConBox::is_hangul_mode() const
     return native;
 }
 
-void cConBox::update_metrics()
+void ConBox::update_metrics()
 {
     int old_cols = cols, old_rows = rows;
 
     CRect rc;
     GetClientRect(&rc);
 
-    int avail_w = rc.Width() - margin_left - margin_right;
-    int avail_h = rc.Height() - margin_top - margin_bottom;
+    // Margins are 96 DPI logical; scale to physical at box_dpi before subtracting from the client.
+    int dpi = box_dpi > 0 ? box_dpi : 96;
+    int avail_w = rc.Width()  - ::MulDiv(margin_left, dpi, 96) - ::MulDiv(margin_right, dpi, 96);
+    int avail_h = rc.Height() - ::MulDiv(margin_top,  dpi, 96) - ::MulDiv(margin_bottom, dpi, 96);
     cols = (cell_w > 0) ? (avail_w / cell_w) : 1;
     rows = (cell_h > 0) ? (avail_h / cell_h) : 1;
     if (cols < 1) cols = 1;
     if (rows < 1) rows = 1;
 
+    recalc_origin();
     reset_screen();
 
     // If the grid actually changed and a resize sink is set, notify it (to sync the child PTY size).
@@ -1494,7 +1572,67 @@ void cConBox::update_metrics()
         resize_sink(rows, cols, resize_sink_user);
 }
 
-Row cConBox::blank_row() const
+// Center the grid (cols*cell_w x rows*cell_h) in the client area. The configured margins do NOT
+// position the grid for drawing -- they only sized the window / derived cols,rows -- so the realized
+// margin is whatever centering leaves and may exceed or fall short of the configured value. When the
+// grid is larger than the client (integer rounding at some DPI), the origin clamps to 0 so drawing
+// starts at the top-left corner and the bottom/right is clipped. hit_test, the caret, and the IME
+// windows all read origin_x/origin_y so they stay aligned with what OnPaint draws.
+void ConBox::recalc_origin()
+{
+    CRect rc;
+    GetClientRect(&rc);
+    origin_x = (rc.Width()  - cols * cell_w) / 2;
+    origin_y = (rc.Height() - rows * cell_h) / 2;
+    if (origin_x < 0) origin_x = 0;
+    if (origin_y < 0) origin_y = 0;
+}
+
+// Resize the window so the preserved grid fits, per snap_mode (ini). On a DPI change the host moves us
+// to a linearly-scaled rect, but cell pixels do not scale linearly (integer font rounding), so the same
+// cols/rows may need a few more (or fewer) pixels than the linear rect provides -> the last column(s)/row
+// get clipped (deficit) or extra slack appears (surplus). The whole-grid size is cols*cell_w / rows*cell_h
+// plus the DPI-scaled margins.
+//   snap_mode 0: do nothing (recalc_origin centers the slack; a deficit is clipped at the bottom/right).
+//   snap_mode 1: grow only -- snap an axis up to the grid size when it would be clipped; leave a surplus
+//                axis alone (centered slack).
+//   snap_mode 2: always snap each axis to the exact grid+margin size (grow or shrink).
+// SWP_NOMOVE keeps the upper-left corner fixed; only the right/bottom edges move. The SetWindowPos
+// triggers a follow-up OnSize with cur == box_dpi, which recomputes the IDENTICAL grid (same size ->
+// no resize_sink -> no PTY resize). The non-client difference is added so a bordered popup ConBox sizes
+// its CLIENT (not its frame) to the grid.
+void ConBox::snap_to_grid()
+{
+    if (snap_mode <= 0)
+        return;
+
+    int dpi = box_dpi > 0 ? box_dpi : 96;
+    int need_w = cols * cell_w + ::MulDiv(margin_left, dpi, 96) + ::MulDiv(margin_right, dpi, 96);
+    int need_h = rows * cell_h + ::MulDiv(margin_top,  dpi, 96) + ::MulDiv(margin_bottom, dpi, 96);
+
+    CRect cr, wr;
+    GetClientRect(&cr);
+
+    int tw, th;
+    if (snap_mode == 1) {
+        if (cr.Width() >= need_w && cr.Height() >= need_h)
+            return;   // both axes already fit -> leave surplus to centering
+        tw = max(cr.Width(),  need_w);
+        th = max(cr.Height(), need_h);
+    } else {          // snap_mode 2: exact grid+margin on both axes
+        if (cr.Width() == need_w && cr.Height() == need_h)
+            return;
+        tw = need_w;
+        th = need_h;
+    }
+
+    GetWindowRect(&wr);
+    int nc_w = wr.Width()  - cr.Width();    // non-client width  (0 for a borderless WS_CHILD)
+    int nc_h = wr.Height() - cr.Height();
+    SetWindowPos(nullptr, 0, 0, tw + nc_w, th + nc_h, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+Row ConBox::blank_row() const
 {
     // Filled with the current SGR background so erase/scroll follow the background color.
     CharInfo c;
@@ -1505,7 +1643,7 @@ Row cConBox::blank_row() const
     return Row(cols < 1 ? 1 : cols, c);
 }
 
-void cConBox::reset_screen()
+void ConBox::reset_screen()
 {
     // Fit screen to the current rows x cols. Existing lines are kept but padded/truncated to cols and
     // the row count adjusted to rows (cell-level pad/truncate only; no fine reflow).
@@ -1539,7 +1677,7 @@ void cConBox::reset_screen()
 }
 
 // (design: [COORD]/[DM])
-const Row& cConBox::line_at(int idx) const
+const Row& ConBox::line_at(int idx) const
 {
     // Unified index: scrollback first, then the current screen.
     int sb = (int)scrollback.size();
@@ -1548,7 +1686,7 @@ const Row& cConBox::line_at(int idx) const
     return screen[idx - sb];
 }
 
-void cConBox::clamp_cursor()
+void ConBox::clamp_cursor()
 {
     if (cur_row < 0) cur_row = 0;
     if (cur_row > rows - 1) cur_row = rows - 1;
@@ -1556,7 +1694,7 @@ void cConBox::clamp_cursor()
     if (cur_col > cols) cur_col = cols;   // cols = "just past line end" (wraps on the next glyph)
 }
 
-void cConBox::erase_cells(int row, int c0, int c1)
+void ConBox::erase_cells(int row, int c0, int c1)
 {
     if (row < 0 || row >= (int)screen.size())
         return;
@@ -1571,7 +1709,7 @@ void cConBox::erase_cells(int row, int c0, int c1)
     }
 }
 
-void cConBox::scroll_lines_up(int top, int bot, int n)
+void ConBox::scroll_lines_up(int top, int bot, int n)
 {
     // Rotate [top, bot] up by n (drop n top lines, add n blanks at the bottom). Pure line move, does
     // not touch scrollback (the caller pushes first if preservation is needed).
@@ -1588,7 +1726,7 @@ void cConBox::scroll_lines_up(int top, int bot, int n)
     }
 }
 
-void cConBox::scroll_lines_down(int top, int bot, int n)
+void ConBox::scroll_lines_down(int top, int bot, int n)
 {
     // Rotate [top, bot] down by n (drop n bottom lines, add n blanks at the top).
     if (top < 0) top = 0;
@@ -1604,7 +1742,7 @@ void cConBox::scroll_lines_down(int top, int bot, int n)
     }
 }
 
-void cConBox::scroll_up_region(int n)
+void ConBox::scroll_up_region(int n)
 {
     // Scroll [scroll_top, scroll_bot] up by n. Only on the main screen with the region top at the
     // screen top (scroll_top==0) are the displaced lines preserved into scrollback. On the alt screen
@@ -1624,13 +1762,13 @@ void cConBox::scroll_up_region(int n)
     scroll_lines_up(scroll_top, scroll_bot, n);
 }
 
-void cConBox::scroll_down_region(int n)
+void ConBox::scroll_down_region(int n)
 {
     // RI/SD. Does not touch scrollback.
     scroll_lines_down(scroll_top, scroll_bot, n);
 }
 
-void cConBox::line_feed()
+void ConBox::line_feed()
 {
     // At the region bottom, scroll the region up (cursor stays on that line); otherwise advance one
     // line without leaving the screen.
@@ -1641,7 +1779,7 @@ void cConBox::line_feed()
     }
 }
 
-void cConBox::insert_lines(int n)
+void ConBox::insert_lines(int n)
 {
     // IL: only when the cursor is inside the scroll region. Insert n blank lines at the cursor line,
     // pushing lines below toward scroll_bot. Cursor moves to column 1.
@@ -1652,7 +1790,7 @@ void cConBox::insert_lines(int n)
     cur_col = 0;
 }
 
-void cConBox::delete_lines(int n)
+void ConBox::delete_lines(int n)
 {
     // DL: only inside the scroll region. Delete n lines from the cursor line, pulling lines up and
     // filling blanks at the region bottom. Cursor moves to column 1.
@@ -1663,7 +1801,7 @@ void cConBox::delete_lines(int n)
     cur_col = 0;
 }
 
-void cConBox::insert_chars(int n)
+void ConBox::insert_chars(int n)
 {
     // ICH: insert n blanks at the cursor within the line; right cells shift and overflow past cols is
     // dropped. Cursor stays put.
@@ -1683,7 +1821,7 @@ void cConBox::insert_chars(int n)
     line.resize(cols, blank);   // drop overflow to keep line width = cols
 }
 
-void cConBox::delete_chars(int n)
+void ConBox::delete_chars(int n)
 {
     // DCH: delete n cells at the cursor within the line, pull right cells in, fill blanks at the end.
     if (cur_row < 0 || cur_row >= (int)screen.size())
@@ -1702,7 +1840,7 @@ void cConBox::delete_chars(int n)
     line.resize(cols, blank);   // refill the end to keep line width = cols
 }
 
-void cConBox::enter_alt_screen()
+void ConBox::enter_alt_screen()
 {
     // Back up the main screen and cursor, switch to a blank alt screen. Scrollback remains but is
     // frozen (hidden) while alt_active.
@@ -1719,7 +1857,7 @@ void cConBox::enter_alt_screen()
     alt_active = true;
 }
 
-void cConBox::leave_alt_screen()
+void ConBox::leave_alt_screen()
 {
     // Restore the backed-up main screen and cursor.
     if (!alt_active)
@@ -1737,7 +1875,7 @@ void cConBox::leave_alt_screen()
 }
 
 // (design: [VT])
-void cConBox::put_char(wchar_t wc)
+void ConBox::put_char(wchar_t wc)
 {
     // Write one glyph at the cursor, autowrapping first if it would exceed cols. A wide glyph goes in
     // the lead cell and sets the next cell to trail (ch=0).
@@ -1777,7 +1915,7 @@ void cConBox::put_char(wchar_t wc)
     cur_col += advance;
 }
 
-void cConBox::print(const char* text)
+void ConBox::print(const char* text)
 {
     if (text == nullptr)
         return;
@@ -1863,7 +2001,7 @@ static COLORREF Xterm256ToRgb(int n, const COLORREF* pal)
 }
 
 // (design: [VT])
-void cConBox::vt_feed(wchar_t wc)
+void ConBox::vt_feed(wchar_t wc)
 {
     // Parser state machine. State (vt_state etc.) is a member, so a sequence survives print() chunks.
     switch (vt_state) {
@@ -1973,7 +2111,7 @@ void cConBox::vt_feed(wchar_t wc)
 }
 
 // (design: [VT])
-void cConBox::dispatch_csi(wchar_t fin)
+void ConBox::dispatch_csi(wchar_t fin)
 {
     // Sequences prefixed with '<' '=' '>' (2nd DA, kitty keyboard protocol, XTMODKEYS...) are
     // unsupported. Their final byte (u/m/q...) must not be misparsed as a standard command (e.g.
@@ -2168,7 +2306,7 @@ void cConBox::dispatch_csi(wchar_t fin)
     }
 }
 
-void cConBox::update_scrollbar()
+void ConBox::update_scrollbar()
 {
     // No native scrollbar (the overlay bar is what the user sees). This now only clamps/pins view_top;
     // the overlay's visibility is driven by sbar_show()/SBAR_TIMER, its geometry by sbar_geometry().
@@ -2194,15 +2332,28 @@ void cConBox::update_scrollbar()
     if (view_top > maxtop) view_top = maxtop;
 }
 
-BOOL cConBox::OnEraseBkgnd(CDC* dc)
+BOOL ConBox::OnEraseBkgnd(CDC* dc)
 {
     // Background is erased in OnPaint to avoid flicker; return TRUE to block the default erase.
     return TRUE;
 }
 
-void cConBox::OnSize(UINT type, int cx, int cy)
+void ConBox::OnSize(UINT type, int cx, int cy)
 {
     CWnd::OnSize(type, cx, cy);
+
+    // DPI change detection. The host resizes us to a new-DPI rect on a monitor change; the window's
+    // own DPI is now authoritative. If it differs from box_dpi this is a DPI change (not a user
+    // resize): rebuild fonts and PRESERVE the logical grid (no update_metrics -> no child PTY resize
+    // -> the shell does not re-emit, so content is not duplicated/lost). Order-independent: it does
+    // not depend on WM_DPICHANGED_*PARENT timing. A genuine user resize has cur == box_dpi and falls
+    // through to the normal grid recompute.
+    int cur = (int)::GetDpiForWindow(m_hWnd);
+    if (cur > 0 && cur != box_dpi) {
+        relayout_for_dpi();
+        snap_to_grid();   // grow (never shrink) so the preserved grid is not clipped at the new DPI
+        return;
+    }
 
     update_metrics();
 
@@ -2214,7 +2365,7 @@ void cConBox::OnSize(UINT type, int cx, int cy)
     Invalidate();
 }
 
-UINT cConBox::OnGetDlgCode()
+UINT ConBox::OnGetDlgCode()
 {
     // Take arrows/Tab/Enter/chars directly so a parent dialog does not intercept them.
     return DLGC_WANTALLKEYS | DLGC_WANTCHARS | DLGC_WANTARROWS | DLGC_WANTTAB;
@@ -2224,7 +2375,7 @@ UINT cConBox::OnGetDlgCode()
 
 // Compute the gutter (track) and thumb rects for the current view. Returns false when there is nothing
 // to scroll (no scrollback, or the alt screen owns the surface), in which case the bar is not drawn.
-bool cConBox::sbar_geometry(CRect& track, CRect& thumb) const
+bool ConBox::sbar_geometry(CRect& track, CRect& thumb) const
 {
     if (alt_active)
         return false;
@@ -2240,13 +2391,14 @@ bool cConBox::sbar_geometry(CRect& track, CRect& thumb) const
 
     // Gutter is a thin strip at the right edge (mostly over the right margin, so it barely covers text).
     // Track runs between the two arrow buttons (each SBAR_BTN_H px tall at the gutter top/bottom).
-    track.SetRect(rc.right - SBAR_W, rc.top + SBAR_BTN_H, rc.right, rc.bottom - SBAR_BTN_H);
+    track.SetRect(rc.right - sbar_px(SBAR_W), rc.top + sbar_px(SBAR_BTN_H), rc.right, rc.bottom - sbar_px(SBAR_BTN_H));
 
     int track_h = track.Height();
     if (track_h <= 0)
         return false;
     int thumb_h = (int)((double)track_h * rows / total);
-    if (thumb_h < SBAR_MIN_THUMB) thumb_h = SBAR_MIN_THUMB;
+    int min_thumb = sbar_px(SBAR_MIN_THUMB);
+    if (thumb_h < min_thumb) thumb_h = min_thumb;
     if (thumb_h > track_h)        thumb_h = track_h;
 
     int thumb_y = track.top + (int)((double)(track_h - thumb_h) * view_top / maxtop);
@@ -2254,13 +2406,14 @@ bool cConBox::sbar_geometry(CRect& track, CRect& thumb) const
     if (thumb_y > track.bottom - thumb_h)  thumb_y = track.bottom - thumb_h;
 
     // Thumb is a slim bar near the edge, inset by SBAR_INSET (does not touch the very right edge).
-    int tx = track.right - SBAR_INSET - SBAR_THUMB_W;
-    thumb.SetRect(tx, thumb_y, tx + SBAR_THUMB_W, thumb_y + thumb_h);
+    int thumb_w = sbar_px(SBAR_THUMB_W);
+    int tx = track.right - sbar_px(SBAR_INSET) - thumb_w;
+    thumb.SetRect(tx, thumb_y, tx + thumb_w, thumb_y + thumb_h);
     return true;
 }
 
 // Make the overlay fully opaque and (re)start the fade timer. Called on user scroll and gutter hover.
-void cConBox::sbar_show()
+void ConBox::sbar_show()
 {
     if (!::IsWindow(m_hWnd))
         return;
@@ -2272,22 +2425,21 @@ void cConBox::sbar_show()
     SetTimer(SBAR_TIMER, SBAR_FADE_TICK_MS, NULL);
     CRect full;
     GetClientRect(&full);
-    CRect gutter(full.right - SBAR_W, full.top, full.right, full.bottom);
+    CRect gutter(full.right - sbar_px(SBAR_W), full.top, full.right, full.bottom);
     InvalidateRect(&gutter, FALSE);
 }
 
-// Fill `rc` with a translucent rounded rectangle in `color`. Uses a 32bpp top-down DIB section with a
-// per-pixel alpha channel so the corners are genuinely rounded (a 1x1 stretch can only do hard edges).
-// baseAlpha = per-pixel opacity (0..255) when fully shown; fadeAlpha = the current fade level applied on
-// top via AlphaBlend's SourceConstantAlpha. Colors are premultiplied by baseAlpha as AC_SRC_ALPHA needs.
-static void DrawRoundedThumb(CDC& dc, const CRect& rc, COLORREF color, int baseAlpha, int radius, BYTE fadeAlpha)
+// Render an antialiased shape into rc via 4x4 supersampling: inside(x,y) tests a point in LOCAL
+// pixel coordinates (0,0 = rc's top-left, sub-pixel positions allowed). Used for the rounded
+// thumb and arrow triangles so their curved/diagonal edges are smooth, not a hard pixel staircase.
+// baseAlpha = per-pixel opacity when fully shown; fadeAlpha = the current fade level (AlphaBlend's
+// SourceConstantAlpha). Same technique as TableBox.cpp's DrawAA -- keep both in sync.
+template <typename InsideTest>
+static void DrawAA(CDC& dc, const CRect& rc, COLORREF color, int baseAlpha, BYTE fadeAlpha, InsideTest inside)
 {
     int w = rc.Width(), h = rc.Height();
     if (w <= 0 || h <= 0)
         return;
-    if (radius > w / 2) radius = w / 2;
-    if (radius > h / 2) radius = h / 2;
-    if (radius < 0)     radius = 0;
 
     BITMAPINFO bi;
     ZeroMemory(&bi, sizeof(bi));
@@ -2303,25 +2455,22 @@ static void DrawRoundedThumb(CDC& dc, const CRect& rc, COLORREF color, int baseA
     if (dib == NULL)
         return;
 
-    int pr = GetRValue(color) * baseAlpha / 255;   // premultiplied channels
-    int pg = GetGValue(color) * baseAlpha / 255;
-    int pb = GetBValue(color) * baseAlpha / 255;
-    DWORD inside = ((DWORD)baseAlpha << 24) | ((DWORD)pr << 16) | ((DWORD)pg << 8) | (DWORD)pb;
+    const int SS = 4;   // 4x4 = 16 samples per output pixel
+    int r = GetRValue(color), g = GetGValue(color), b = GetBValue(color);
     DWORD* px = (DWORD*)bits;
     for (int y = 0; y < h; ++y) {
         for (int x = 0; x < w; ++x) {
-            // Inside the rounded rect unless this pixel falls in a corner quadrant outside its radius.
-            int cx = -1, cy = -1;
-            if      (x < radius && y < radius)             { cx = radius;        cy = radius; }
-            else if (x >= w - radius && y < radius)        { cx = w - radius - 1; cy = radius; }
-            else if (x < radius && y >= h - radius)        { cx = radius;        cy = h - radius - 1; }
-            else if (x >= w - radius && y >= h - radius)   { cx = w - radius - 1; cy = h - radius - 1; }
-            bool in = true;
-            if (cx >= 0) {
-                int dx = x - cx, dy = y - cy;
-                in = (dx * dx + dy * dy) <= radius * radius;
+            int hit = 0;
+            for (int sy = 0; sy < SS; ++sy) {
+                double fy = y + (sy + 0.5) / SS;
+                for (int sx = 0; sx < SS; ++sx) {
+                    double fx = x + (sx + 0.5) / SS;
+                    if (inside(fx, fy)) hit++;
+                }
             }
-            px[y * w + x] = in ? inside : 0;
+            int a = baseAlpha * hit / (SS * SS);
+            int pr = r * a / 255, pg = g * a / 255, pb = b * a / 255;
+            px[y * w + x] = ((DWORD)a << 24) | ((DWORD)pr << 16) | ((DWORD)pg << 8) | (DWORD)pb;
         }
     }
 
@@ -2338,67 +2487,66 @@ static void DrawRoundedThumb(CDC& dc, const CRect& rc, COLORREF color, int baseA
     ::DeleteObject(dib);
 }
 
-// Draw a filled up or down pointing triangle into `rc`, using the same DIB/AlphaBlend path as
-// DrawRoundedThumb. The triangle vertices are padded 3px from the rect edges.
+// Antialiased rounded-rect fill (thumb). Standard rounded-box inside test: clamp the point's
+// offset from center into the corner region, then circle-test there (degenerates to a flat
+// half-plane test away from the corners).
+static void DrawRoundedThumb(CDC& dc, const CRect& rc, COLORREF color, int baseAlpha, int radius, BYTE fadeAlpha)
+{
+    int w = rc.Width(), h = rc.Height();
+    if (radius > w / 2) radius = w / 2;
+    if (radius > h / 2) radius = h / 2;
+    if (radius < 0)     radius = 0;
+    double hw = w / 2.0, hh = h / 2.0, rad = radius;
+    DrawAA(dc, rc, color, baseAlpha, fadeAlpha, [hw, hh, rad](double x, double y) {
+        double ax = std::fabs(x - hw) - (hw - rad); if (ax < 0) ax = 0;
+        double ay = std::fabs(y - hh) - (hh - rad); if (ay < 0) ay = 0;
+        return ax * ax + ay * ay <= rad * rad;
+    });
+}
+
+// Antialiased filled triangle (arrow button), tip up or down, padded 3px from rc's edges.
 static void DrawTriangle(CDC& dc, const CRect& rc, COLORREF color, int baseAlpha, BYTE fadeAlpha, bool up)
 {
     int w = rc.Width(), h = rc.Height();
-    if (w <= 0 || h <= 0)
+    const double pad = 3.0;
+    double v0x = w / 2.0,     v0y = up ? pad        : h - 1 - pad;   // tip
+    double v1x = pad,         v1y = up ? h - 1 - pad : pad;          // base left
+    double v2x = w - 1 - pad, v2y = v1y;                             // base right
+    DrawAA(dc, rc, color, baseAlpha, fadeAlpha, [=](double x, double y) {
+        double d0 = (v1x-v0x)*(y-v0y) - (v1y-v0y)*(x-v0x);
+        double d1 = (v2x-v1x)*(y-v1y) - (v2y-v1y)*(x-v1x);
+        double d2 = (v0x-v2x)*(y-v2y) - (v0y-v2y)*(x-v2x);
+        return (d0 >= 0 && d1 >= 0 && d2 >= 0) || (d0 <= 0 && d1 <= 0 && d2 <= 0);
+    });
+}
+
+// Flat translucent fill (the gutter strip background) -- a 1x1 source stretched over rc via
+// AlphaBlend. No AA needed: the gutter is always an axis-aligned rect, so its edges are already
+// pixel-exact. Same technique as TableBox.cpp's FillTranslucent -- keep both in sync.
+static void FillTranslucent(CDC& dc, const CRect& rc, COLORREF color, BYTE alpha)
+{
+    if (rc.Width() <= 0 || rc.Height() <= 0 || alpha == 0)
         return;
-
-    BITMAPINFO bi;
-    ZeroMemory(&bi, sizeof(bi));
-    bi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
-    bi.bmiHeader.biWidth       = w;
-    bi.bmiHeader.biHeight      = -h;
-    bi.bmiHeader.biPlanes      = 1;
-    bi.bmiHeader.biBitCount    = 32;
-    bi.bmiHeader.biCompression = BI_RGB;
-
-    void* bits = nullptr;
-    HBITMAP dib = ::CreateDIBSection(dc.GetSafeHdc(), &bi, DIB_RGB_COLORS, &bits, NULL, 0);
-    if (!dib)
-        return;
-
-    int pr = GetRValue(color) * baseAlpha / 255;
-    int pg = GetGValue(color) * baseAlpha / 255;
-    int pb = GetBValue(color) * baseAlpha / 255;
-    DWORD col = ((DWORD)baseAlpha << 24) | ((DWORD)pr << 16) | ((DWORD)pg << 8) | (DWORD)pb;
-    DWORD* px = (DWORD*)bits;
-
-    // Triangle vertices (padded 3px from rect edges); tip at top for up, bottom for down.
-    const int pad = 3;
-    int v0x = w / 2,     v0y = up ? pad       : h - 1 - pad;   // tip
-    int v1x = pad,       v1y = up ? h-1-pad   : pad;            // base left
-    int v2x = w-1-pad,   v2y = v1y;                             // base right
-
-    for (int y = 0; y < h; ++y) {
-        for (int x = 0; x < w; ++x) {
-            int d0 = (v1x-v0x)*(y-v0y) - (v1y-v0y)*(x-v0x);
-            int d1 = (v2x-v1x)*(y-v1y) - (v2y-v1y)*(x-v1x);
-            int d2 = (v0x-v2x)*(y-v2y) - (v0y-v2y)*(x-v2x);
-            bool in = (d0 >= 0 && d1 >= 0 && d2 >= 0) || (d0 <= 0 && d1 <= 0 && d2 <= 0);
-            px[y * w + x] = in ? col : 0;
-        }
-    }
-
-    CDC mem;
-    mem.CreateCompatibleDC(&dc);
-    HGDIOBJ old = ::SelectObject(mem.GetSafeHdc(), dib);
+    CDC src;
+    src.CreateCompatibleDC(&dc);
+    CBitmap bmp;
+    bmp.CreateCompatibleBitmap(&dc, 1, 1);
+    CBitmap* old = src.SelectObject(&bmp);
+    src.SetPixel(0, 0, color);
     BLENDFUNCTION bf;
-    bf.BlendOp             = AC_SRC_OVER;
-    bf.BlendFlags          = 0;
-    bf.SourceConstantAlpha = fadeAlpha;
-    bf.AlphaFormat         = AC_SRC_ALPHA;
-    dc.AlphaBlend(rc.left, rc.top, w, h, &mem, 0, 0, w, h, bf);
-    ::SelectObject(mem.GetSafeHdc(), old);
-    ::DeleteObject(dib);
+    bf.BlendOp = AC_SRC_OVER;
+    bf.BlendFlags = 0;
+    bf.AlphaFormat = 0;
+    bf.SourceConstantAlpha = alpha;
+    dc.AlphaBlend(rc.left, rc.top, rc.Width(), rc.Height(), &src, 0, 0, 1, 1, bf);
+    src.SelectObject(old);
 }
 
 // Composite the overlay scrollbar into the back buffer (called last in OnPaint, on top of glyphs/cursor).
-// A translucent rounded thumb (brighter when hovering/dragging); a faint groove behind it while active.
-// Arrow buttons at gutter top/bottom scroll by 1 line on click. All fade via sbar_alpha.
-void cConBox::draw_overlay_scrollbar(CDC& dc)
+// A full-width gutter fill (always drawn while shown, not just while active) makes the bar read as a
+// SBAR_W-wide strip rather than just the thin thumb; the rounded thumb (brighter on hover/drag) and the
+// two arrow buttons (scroll 1 line on click) are drawn on top, all antialiased. All fade via sbar_alpha.
+void ConBox::draw_overlay_scrollbar(CDC& dc)
 {
     if (sbar_alpha <= 0)
         return;
@@ -2408,47 +2556,33 @@ void cConBox::draw_overlay_scrollbar(CDC& dc)
 
     bool active = (sbar_hover || sbar_dragging);
 
-    // Pick thumb/groove shades that contrast with the current background so the bar stays visible on
+    // Pick thumb/gutter shades that contrast with the current background so the bar stays visible on
     // both dark and light backgrounds (the fixed dark grays were invisible on white). Perceived
-    // luminance of default_bg decides: bright bg -> dark thumb + light groove, dark bg -> the original
-    // light thumb + dark groove. The groove is a fainter mid-shade so it reads as a subtle track.
+    // luminance of default_bg decides: bright bg -> dark thumb + light gutter, dark bg -> the original
+    // light thumb + dark gutter.
     int bg_lum = (GetRValue(default_bg) * 299 + GetGValue(default_bg) * 587 + GetBValue(default_bg) * 114) / 1000;
     bool light_bg = (bg_lum > 128);
     COLORREF thumb_color  = light_bg ? RGB(96, 96, 96)    : SBAR_THUMB_COLOR;
-    COLORREF groove_color = light_bg ? RGB(176, 176, 176) : RGB(80, 80, 80);
+    COLORREF gutter_color = light_bg ? RGB(176, 176, 176) : RGB(80, 80, 80);
 
-    // Faint groove behind the thumb while active (subtle, rectangular; hard edges are fine here).
-    if (active) {
-        CDC src;
-        src.CreateCompatibleDC(&dc);
-        CBitmap bmp;
-        bmp.CreateCompatibleBitmap(&dc, 1, 1);
-        CBitmap* oldb = src.SelectObject(&bmp);
-        src.SetPixel(0, 0, groove_color);
-        BLENDFUNCTION bf;
-        bf.BlendOp = AC_SRC_OVER;
-        bf.BlendFlags = 0;
-        bf.AlphaFormat = 0;
-        bf.SourceConstantAlpha = (BYTE)(sbar_alpha / 5);
-        CRect groove(thumb.left - 1, track.top, track.right - SBAR_INSET + 1, track.bottom);
-        dc.AlphaBlend(groove.left, groove.top, groove.Width(), groove.Height(), &src, 0, 0, 1, 1, bf);
-        src.SelectObject(oldb);
-    }
+    CRect rc_full;
+    GetClientRect(&rc_full);
+    CRect gutter(rc_full.right - sbar_px(SBAR_W), rc_full.top, rc_full.right, rc_full.bottom);
+    FillTranslucent(dc, gutter, gutter_color, (BYTE)(SBAR_GUTTER_OP * sbar_alpha / 255));
 
     // The thumb: translucent (idle) or brighter (hover/drag), rounded, fading by sbar_alpha.
     int opcap = active ? SBAR_OP_HOVER : SBAR_OP_IDLE;
-    DrawRoundedThumb(dc, thumb, thumb_color, opcap, SBAR_RADIUS, (BYTE)sbar_alpha);
+    DrawRoundedThumb(dc, thumb, thumb_color, opcap, sbar_px(SBAR_RADIUS), (BYTE)sbar_alpha);
 
     // Arrow buttons at gutter top/bottom (same opacity as thumb).
-    CRect rc_full;
-    GetClientRect(&rc_full);
-    CRect btn_up(rc_full.right - SBAR_W, rc_full.top, rc_full.right, rc_full.top + SBAR_BTN_H);
-    CRect btn_dn(rc_full.right - SBAR_W, rc_full.bottom - SBAR_BTN_H, rc_full.right, rc_full.bottom);
+    int sw = sbar_px(SBAR_W), bh = sbar_px(SBAR_BTN_H);
+    CRect btn_up(rc_full.right - sw, rc_full.top, rc_full.right, rc_full.top + bh);
+    CRect btn_dn(rc_full.right - sw, rc_full.bottom - bh, rc_full.right, rc_full.bottom);
     DrawTriangle(dc, btn_up, thumb_color, opcap, (BYTE)sbar_alpha, true);
     DrawTriangle(dc, btn_dn, thumb_color, opcap, (BYTE)sbar_alpha, false);
 }
 
-BOOL cConBox::OnMouseWheel(UINT flags, short zDelta, CPoint pt)
+BOOL ConBox::OnMouseWheel(UINT flags, short zDelta, CPoint pt)
 {
     // Scrollback view is frozen on the alt screen (the child owns the screen); ignore the wheel.
     if (alt_active)
@@ -2473,18 +2607,18 @@ BOOL cConBox::OnMouseWheel(UINT flags, short zDelta, CPoint pt)
 // ===== Mouse drag selection / clipboard =====
 // hit_test: client pixel coords -> unified (scrollback+screen) row index + cell column. Coords outside
 // the margins clamp to the edge cell.
-void cConBox::hit_test(CPoint pt, int& abs_row, int& col) const
+void ConBox::hit_test(CPoint pt, int& abs_row, int& col) const
 {
     int total = (int)scrollback.size() + rows;
 
-    int r = (pt.y - margin_top) / cell_h;  // screen row (relative to view_top)
+    int r = (pt.y - origin_y) / cell_h;  // screen row (relative to view_top)
     if (r < 0) r = 0;
     if (r >= rows) r = rows - 1;
     abs_row = view_top + r;
     if (abs_row < 0) abs_row = 0;
     if (abs_row >= total) abs_row = total - 1;
 
-    int c = (pt.x - margin_left) / cell_w;
+    int c = (pt.x - origin_x) / cell_w;
     if (c < 0) c = 0;
     if (c >= cols) c = cols - 1;
 
@@ -2500,7 +2634,7 @@ void cConBox::hit_test(CPoint pt, int& abs_row, int& col) const
 
 // copy_selection: extract the selected text as Unicode to the clipboard. Sort the row range, collect
 // each line's selected cells, trim trailing spaces, join lines with CR+LF. Trail cells (ch=0) skipped.
-void cConBox::copy_selection()
+void ConBox::copy_selection()
 {
     if (!sel_active) return;
 
@@ -2580,7 +2714,7 @@ void cConBox::copy_selection()
     ::CloseClipboard();
 }
 
-void cConBox::clear_selection()
+void ConBox::clear_selection()
 {
     if (sel_active) {
         sel_active = false;
@@ -2588,7 +2722,7 @@ void cConBox::clear_selection()
     }
 }
 
-void cConBox::OnSetFocus(CWnd*)
+void ConBox::OnSetFocus(CWnd*)
 {
     has_focus = true;
     cursor_on = true;
@@ -2600,14 +2734,14 @@ void cConBox::OnSetFocus(CWnd*)
     if (get_cursor_rect(rc)) InvalidateRect(&rc, FALSE);
 }
 
-void cConBox::OnKillFocus(CWnd*)
+void ConBox::OnKillFocus(CWnd*)
 {
     has_focus = false;
     CRect rc;
     if (get_cursor_rect(rc)) InvalidateRect(&rc, FALSE);
 }
 
-void cConBox::OnLButtonDown(UINT flags, CPoint pt)
+void ConBox::OnLButtonDown(UINT flags, CPoint pt)
 {
     SetFocus();   // claim keyboard focus on click (CWnd does not auto-focus on click unlike standard controls)
     // Finalize any IME composition first (a click is also a composition-ending trigger).
@@ -2621,11 +2755,12 @@ void cConBox::OnLButtonDown(UINT flags, CPoint pt)
     if (sbar_geometry(track, thumb)) {
         CRect full;
         GetClientRect(&full);
-        CRect gutter(full.right - SBAR_W, full.top, full.right, full.bottom);
+        CRect gutter(full.right - sbar_px(SBAR_W), full.top, full.right, full.bottom);
         if (gutter.PtInRect(pt)) {
             int maxtop = (int)scrollback.size();
-            CRect btn_up(gutter.left, gutter.top, gutter.right, gutter.top + SBAR_BTN_H);
-            CRect btn_dn(gutter.left, gutter.bottom - SBAR_BTN_H, gutter.right, gutter.bottom);
+            int bh = sbar_px(SBAR_BTN_H);
+            CRect btn_up(gutter.left, gutter.top, gutter.right, gutter.top + bh);
+            CRect btn_dn(gutter.left, gutter.bottom - bh, gutter.right, gutter.bottom);
             if (btn_up.PtInRect(pt)) {
                 // Arrow up: scroll one line toward older content.
                 int nt = view_top - 1;
@@ -2668,7 +2803,7 @@ void cConBox::OnLButtonDown(UINT flags, CPoint pt)
     Invalidate();
 }
 
-void cConBox::OnLButtonDblClk(UINT flags, CPoint pt)
+void ConBox::OnLButtonDblClk(UINT flags, CPoint pt)
 {
     // Double-click: select the "word" under the cursor (a maximal run of non-space cells).
     // Whitespace class (ch==' ' or ch==0) expands over adjacent spaces; word class over non-spaces.
@@ -2680,7 +2815,7 @@ void cConBox::OnLButtonDblClk(UINT flags, CPoint pt)
     CRect track, thumb;
     if (sbar_geometry(track, thumb)) {
         CRect full; GetClientRect(&full);
-        if (CRect(full.right - SBAR_W, full.top, full.right, full.bottom).PtInRect(pt))
+        if (CRect(full.right - sbar_px(SBAR_W), full.top, full.right, full.bottom).PtInRect(pt))
             return;
     }
 
@@ -2717,7 +2852,7 @@ void cConBox::OnLButtonDblClk(UINT flags, CPoint pt)
     Invalidate();
 }
 
-void cConBox::OnLButtonUp(UINT flags, CPoint pt)
+void ConBox::OnLButtonUp(UINT flags, CPoint pt)
 {
     // End a thumb drag (if any) before the selection path.
     if (sbar_dragging) {
@@ -2746,7 +2881,7 @@ void cConBox::OnLButtonUp(UINT flags, CPoint pt)
     Invalidate();
 }
 
-void cConBox::OnMouseMove(UINT flags, CPoint pt)
+void ConBox::OnMouseMove(UINT flags, CPoint pt)
 {
     // Dragging the overlay thumb: map the cursor y to view_top (inverse of sbar_geometry's thumb_y).
     if (sbar_dragging) {
@@ -2773,7 +2908,7 @@ void cConBox::OnMouseMove(UINT flags, CPoint pt)
         if (has) {
             CRect full;
             GetClientRect(&full);
-            gutter_rc.SetRect(full.right - SBAR_W, full.top, full.right, full.bottom);
+            gutter_rc.SetRect(full.right - sbar_px(SBAR_W), full.top, full.right, full.bottom);
         }
         bool in = has && gutter_rc.PtInRect(pt);
         if (in && !sbar_hover) {
@@ -2799,7 +2934,7 @@ void cConBox::OnMouseMove(UINT flags, CPoint pt)
     Invalidate();
 }
 
-void cConBox::OnMouseLeave()
+void ConBox::OnMouseLeave()
 {
     // Left the window: drop gutter hover so the overlay can fade. The fade timer is already running
     // (started by sbar_show on hover); just refresh the hold window so it lingers briefly, then fades.
@@ -2812,13 +2947,13 @@ void cConBox::OnMouseLeave()
         if (sbar_geometry(track, thumb)) {
             CRect full;
             GetClientRect(&full);
-            CRect gutter(full.right - SBAR_W, full.top, full.right, full.bottom);
+            CRect gutter(full.right - sbar_px(SBAR_W), full.top, full.right, full.bottom);
             InvalidateRect(&gutter, FALSE);
         }
     }
 }
 
-void cConBox::OnRButtonDown(UINT flags, CPoint pt)
+void ConBox::OnRButtonDown(UINT flags, CPoint pt)
 {
     finalize_composition();
     ime_committed = false;   // a click is not an arrow; don't let it enable the arrow correction
@@ -2827,7 +2962,7 @@ void cConBox::OnRButtonDown(UINT flags, CPoint pt)
     paste_clipboard();
 }
 
-void cConBox::OnDropFiles(HDROP hdrop)
+void ConBox::OnDropFiles(HDROP hdrop)
 {
     // Type dropped file paths to the child stdin (wt.exe behavior).
     // Paths with spaces are wrapped in double quotes; multiple files are space-separated.
@@ -2856,7 +2991,7 @@ void cConBox::OnDropFiles(HDROP hdrop)
     DragFinish(hdrop);
 }
 
-LRESULT cConBox::OnImeStart(WPARAM w, LPARAM l)
+LRESULT ConBox::OnImeStart(WPARAM w, LPARAM l)
 {
     // Move the composition/candidate windows to the cursor and set the composing font to Korean. We
     // draw the composing glyph ourselves, so no default composition window (return below).
@@ -2867,8 +3002,8 @@ LRESULT cConBox::OnImeStart(WPARAM w, LPARAM l)
             COMPOSITIONFORM cf;
             ZeroMemory(&cf, sizeof(cf));
             cf.dwStyle = CFS_POINT;
-            cf.ptCurrentPos.x = margin_left + vx * cell_w;
-            cf.ptCurrentPos.y = margin_top + row * cell_h;
+            cf.ptCurrentPos.x = origin_x + vx * cell_w;
+            cf.ptCurrentPos.y = origin_y + row * cell_h;
             ImmSetCompositionWindow(himc, &cf);
 
             // Candidate list just below the cursor.
@@ -2876,8 +3011,8 @@ LRESULT cConBox::OnImeStart(WPARAM w, LPARAM l)
             ZeroMemory(&caf, sizeof(caf));
             caf.dwIndex = 0;
             caf.dwStyle = CFS_CANDIDATEPOS;
-            caf.ptCurrentPos.x = margin_left + vx * cell_w;
-            caf.ptCurrentPos.y = margin_top + (row + 1) * cell_h;
+            caf.ptCurrentPos.x = origin_x + vx * cell_w;
+            caf.ptCurrentPos.y = origin_y + (row + 1) * cell_h;
             ImmSetCandidateWindow(himc, &caf);
 
             ImmSetCompositionFontW(himc, &kfont_lf);
@@ -2891,7 +3026,7 @@ LRESULT cConBox::OnImeStart(WPARAM w, LPARAM l)
 }
 
 // (design: [IME])
-LRESULT cConBox::OnImeComp(WPARAM w, LPARAM l)
+LRESULT ConBox::OnImeComp(WPARAM w, LPARAM l)
 {
     // Committed text (GCS_RESULTSTR) goes to the child as UTF-8; the uncommitted part (GCS_COMPSTR) is
     // stored in comp_str and drawn by ConBox in the cursor cell (OnPaint). System inline display is
@@ -2936,7 +3071,7 @@ LRESULT cConBox::OnImeComp(WPARAM w, LPARAM l)
     // (OnPaint shifts that strip right to mimic insertion, so invalidate the strip, not just 2 cells).
     CRect rc;
     if (get_cursor_rect(rc)) {
-        rc.right = margin_left + cols * cell_w + cell_w;
+        rc.right = origin_x + cols * cell_w + cell_w;
         InvalidateRect(rc);
     }
     bump_cursor();
@@ -2944,7 +3079,7 @@ LRESULT cConBox::OnImeComp(WPARAM w, LPARAM l)
     return 0;
 }
 
-LRESULT cConBox::OnImeEnd(WPARAM w, LPARAM l)
+LRESULT ConBox::OnImeEnd(WPARAM w, LPARAM l)
 {
     // Composition ended: clear our composing display (comp_str) and repaint. The committed part was
     // already sent in OnImeComp (GCS_RESULTSTR) and is drawn by the child's echo.
@@ -2952,14 +3087,14 @@ LRESULT cConBox::OnImeEnd(WPARAM w, LPARAM l)
     // Invalidate to the line end to undo the rightward shift drawn during composition.
     CRect rc;
     if (get_cursor_rect(rc)) {
-        rc.right = margin_left + cols * cell_w + cell_w;
+        rc.right = origin_x + cols * cell_w + cell_w;
         InvalidateRect(rc);
     }
     bump_cursor();
     return Default();
 }
 
-LRESULT cConBox::OnImeNotify(WPARAM w, LPARAM l)
+LRESULT ConBox::OnImeNotify(WPARAM w, LPARAM l)
 {
     // A conversion-mode change (e.g. the Korean/English key) notifies here. Repaint the cursor area to
     // reflect the matching width (long/short) at once. Other notifications (candidate window etc.) go
@@ -2976,25 +3111,25 @@ LRESULT cConBox::OnImeNotify(WPARAM w, LPARAM l)
     return res;
 }
 
-void cConBox::set_input_sink(void (*sink)(const char* bytes, int len, void* user), void* user)
+void ConBox::set_input_sink(void (*sink)(const char* bytes, int len, void* user), void* user)
 {
     input_sink = sink;
     input_sink_user = user;
 }
 
-void cConBox::set_resize_sink(void (*sink)(int rows, int cols, void* user), void* user)
+void ConBox::set_resize_sink(void (*sink)(int rows, int cols, void* user), void* user)
 {
     resize_sink = sink;
     resize_sink_user = user;
 }
 
-void cConBox::send_input_bytes(const char* bytes, int len)
+void ConBox::send_input_bytes(const char* bytes, int len)
 {
     if (input_sink != nullptr && bytes != nullptr && len > 0)
         input_sink(bytes, len, input_sink_user);
 }
 
-void cConBox::send_input_wide(const wchar_t* ws, int n)
+void ConBox::send_input_wide(const wchar_t* ws, int n)
 {
     if (input_sink == nullptr || ws == nullptr || n <= 0)
         return;
@@ -3009,7 +3144,7 @@ void cConBox::send_input_wide(const wchar_t* ws, int n)
 // Encode non-char keys (arrows/edit keys) as VT sequences to the child. Printable chars / Enter / Tab /
 // Backspace / Esc / Ctrl+letter go through the WM_CHAR path (OnChar), not here (avoids duplication).
 // Returns true if it sent something.
-bool cConBox::terminal_keydown(UINT vk, bool ctrl, bool shift)
+bool ConBox::terminal_keydown(UINT vk, bool ctrl, bool shift)
 {
     // Ctrl+C: with a selection, copy + clear it; otherwise send interrupt (0x03).
     if (ctrl && (vk == 'C')) {
@@ -3089,7 +3224,7 @@ bool cConBox::terminal_keydown(UINT vk, bool ctrl, bool shift)
     return false;
 }
 
-void cConBox::paste_clipboard()
+void ConBox::paste_clipboard()
 {
     // Send clipboard Unicode text to the child stdin. In bracketed paste mode wrap it in
     // ESC[200~ / ESC[201~ so the child handles the paste as one chunk.
@@ -3112,7 +3247,7 @@ void cConBox::paste_clipboard()
     ::CloseClipboard();
 }
 
-bool cConBox::finalize_composition()
+bool ConBox::finalize_composition()
 {
     // Force-commit an in-progress Korean composition. CPS_COMPLETE dispatches WM_IME_COMPOSITION
     // (GCS_RESULTSTR) synchronously, so before this returns OnImeComp has already sent the completed
@@ -3137,7 +3272,7 @@ bool cConBox::finalize_composition()
     return had;
 }
 
-void cConBox::OnChar(UINT ch, UINT rep, UINT flags)
+void ConBox::OnChar(UINT ch, UINT rep, UINT flags)
 {
     // Terminal (raw) mode: no local edit/echo; send chars/control bytes to the child. (WM_CHAR is the
     // post-layout/IME result, so it suits printable/control byte sending.)
@@ -3176,7 +3311,7 @@ void cConBox::OnChar(UINT ch, UINT rep, UINT flags)
     // Read-only viewer (no input sink): no local edit/echo.
 }
 
-void cConBox::OnKeyDown(UINT vk, UINT rep, UINT flags)
+void ConBox::OnKeyDown(UINT vk, UINT rep, UINT flags)
 {
     // Terminal (raw) mode: arrows/edit keys as VT sequences; printable / Enter / Backspace / Tab / Esc
     // go through WM_CHAR (OnChar). No local line editing.
@@ -3256,7 +3391,7 @@ void cConBox::OnKeyDown(UINT vk, UINT rep, UINT flags)
 // Lazily prepare the double-buffer memory DC/bitmap. The DC is created once and reused; the bitmap is
 // rebuilt only when the client size changes (avoids a CreateCompatibleDC/Bitmap per frequent repaint
 // such as cursor blink).
-void cConBox::ensure_back_buffer(CDC* ref, int w, int h)
+void ConBox::ensure_back_buffer(CDC* ref, int w, int h)
 {
     if (back_dc.GetSafeHdc() == nullptr)
         back_dc.CreateCompatibleDC(ref);
@@ -3278,7 +3413,7 @@ void cConBox::ensure_back_buffer(CDC* ref, int w, int h)
 }
 
 // (design: [PAINT]/[IME])
-void cConBox::OnPaint()
+void ConBox::OnPaint()
 {
     CPaintDC paintDC(this);
 
@@ -3345,8 +3480,8 @@ void cConBox::OnPaint()
             const CharInfo& c = line[i];
             int w = (c.flags & CELL_WIDE) ? 2 : 1;
 
-            int px = margin_left + i * cell_w;
-            int py = margin_top + row * cell_h;
+            int px = origin_x + i * cell_w;
+            int py = origin_y + row * cell_h;
 
             COLORREF fg = c.fg;
             COLORREF bg = c.bg;
@@ -3453,7 +3588,7 @@ void cConBox::OnPaint()
             // in the same DC). The composing block is drawn into the exposed gap below. The trailing
             // glyph is clipped, but this is a temporary composing display, restored on composition end
             // (OnImeComp/OnImeEnd invalidate).
-            int row_right = margin_left + cols * cell_w;
+            int row_right = origin_x + cols * cell_w;
             if (cur.left < row_right) {
                 CRect scroll_rc(cur.left, cur.top, row_right, cur.bottom);
                 dc.ScrollDC(comp_w_px, 0, &scroll_rc, &scroll_rc, NULL, NULL);
@@ -3601,7 +3736,7 @@ void cConBox::OnPaint()
 
 // (design: [PAINT]) -- same coordinate/cell logic as OnPaint but targets an EMF DC.
 // Returns true if at least one EMF file was successfully written.
-bool cConBox::save_emf(const char* dir)
+bool ConBox::save_emf(const char* dir)
 {
     if (!dir || !*dir) return false;
 
@@ -3756,7 +3891,7 @@ bool cConBox::save_emf(const char* dir)
 // after every StartPage.  The cell rendering loop is a verbatim copy of save_emf's loop.
 // (design: [PAINT])
 
-bool cConBox::save_pdf(const char* path)
+bool ConBox::save_pdf(const char* path)
 {
     if (!path || !*path) return false;
 
@@ -3966,7 +4101,7 @@ bool cConBox::save_pdf(const char* path)
 // CELL_DOUBLE extras: Korean (CELL_WIDE+CELL_DOUBLE) = 4-cell advance -> skip trail + 2 blanks.
 //                     English/etc (CELL_DOUBLE only)  = 2-cell advance -> skip 1 blank.
 
-std::vector<std::string> cConBox::get_text_lines() const
+std::vector<std::string> ConBox::get_text_lines() const
 {
     int total = (int)scrollback.size() + rows;
     std::vector<std::string> result;
@@ -4028,7 +4163,7 @@ std::vector<std::string> cConBox::get_text_lines() const
 // VT codes are preserved exactly as the child emitted them (no conversion, no CR/LF translation).
 // Calling with nullptr/empty closes any open log; calling with a path creates/replaces the file.
 // No window is needed -- safe to call before open() so the file is ready before the child starts.
-int cConBox::save_log(const char* file_name)
+int ConBox::save_log(const char* file_name)
 {
     // Close any currently open log (idempotent; also the close path when file_name is null).
     if (log_file != INVALID_HANDLE_VALUE) {
@@ -4130,13 +4265,13 @@ static bool CreatePtyPipes(int cols, int rows,
     return true;
 }
 
-bool cConBox::start()
+bool ConBox::start()
 {
     return start(cfg_cmdline.c_str());
 }
 
 // (design: [PTY])
-bool cConBox::start(const char* cmdline)
+bool ConBox::start(const char* cmdline)
 {
     // Restart if already running.
     stop();
@@ -4218,8 +4353,8 @@ bool cConBox::start(const char* cmdline)
 
     // Wire input (ConBox keys -> child stdin) and resize (grid -> ResizePseudoConsole) to itself, reusing
     // the generic sink mechanism (same path as a pure-view host's set_input_sink).
-    set_input_sink(&cConBox::child_input_thunk, this);
-    set_resize_sink(&cConBox::child_resize_thunk, this);
+    set_input_sink(&ConBox::child_input_thunk, this);
+    set_resize_sink(&ConBox::child_resize_thunk, this);
 
     // Output polling timer on ConBox's own window. start() must be called after open() (the timer needs
     // the window).
@@ -4229,7 +4364,7 @@ bool cConBox::start(const char* cmdline)
     return true;
 }
 
-void cConBox::write(const char* data, int len)
+void ConBox::write(const char* data, int len)
 {
     if (in_write == nullptr || data == nullptr || len <= 0)
         return;
@@ -4237,14 +4372,14 @@ void cConBox::write(const char* data, int len)
     ::WriteFile(in_write, data, (DWORD)len, &written, NULL);
 }
 
-void cConBox::child_input_thunk(const char* bytes, int len, void* user)
+void ConBox::child_input_thunk(const char* bytes, int len, void* user)
 {
-    cConBox* self = (cConBox*)user;
+    ConBox* self = (ConBox*)user;
     if (self != nullptr)
         self->write(bytes, len);
 }
 
-void cConBox::resize(int rows, int cols)
+void ConBox::resize(int rows, int cols)
 {
     // Only resize while the pseudo console is alive. The child detects the size change and repaints.
     if (h_pc == nullptr || !child_running)
@@ -4257,29 +4392,29 @@ void cConBox::resize(int rows, int cols)
     ::ResizePseudoConsole(h_pc, size);
 }
 
-void cConBox::child_resize_thunk(int rows, int cols, void* user)
+void ConBox::child_resize_thunk(int rows, int cols, void* user)
 {
-    cConBox* self = (cConBox*)user;
+    ConBox* self = (ConBox*)user;
     if (self != nullptr)
         self->resize(rows, cols);
 }
 
-void cConBox::set_exit_callback(void (*cb)(void* user), void* user)
+void ConBox::set_exit_callback(void (*cb)(void* user), void* user)
 {
     exit_cb = cb;
     exit_cb_user = user;
 }
 
-void cConBox::stop()
+void ConBox::stop()
 {
     // Kill the polling timer first (so pump is no longer called). KillTimer only while the window lives.
     if (GetSafeHwnd() != nullptr)
         KillTimer(PUMP_TIMER);
 
     // Release the input/resize sinks start() wired to itself (with no child, input is dropped).
-    if (input_sink == &cConBox::child_input_thunk)
+    if (input_sink == &ConBox::child_input_thunk)
         set_input_sink(nullptr, nullptr);
-    if (resize_sink == &cConBox::child_resize_thunk)
+    if (resize_sink == &ConBox::child_resize_thunk)
         set_resize_sink(nullptr, nullptr);
 
     // Closing the pseudo console ends the child console session.
@@ -4307,12 +4442,12 @@ void cConBox::stop()
     child_running = false;
 }
 
-bool cConBox::is_running() const
+bool ConBox::is_running() const
 {
     return child_running;
 }
 
-void cConBox::pump()
+void ConBox::pump()
 {
     if (!child_running || out_read == nullptr)
         return;
@@ -4357,7 +4492,7 @@ void cConBox::pump()
     }
 }
 
-void cConBox::handle_child_exit()
+void ConBox::handle_child_exit()
 {
     // The child exited naturally. Grab the callback info first, then clean up, then call the callback
     // with cleanup done (is_running()==false) so it may immediately start() again without conflict.
@@ -4368,7 +4503,7 @@ void cConBox::handle_child_exit()
         cb(user);
 }
 
-void cConBox::OnDestroy()
+void ConBox::OnDestroy()
 {
     // Clean up child/polling timer before the window is destroyed (so polling never touches a dying window).
     stop();

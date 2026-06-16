@@ -3,9 +3,11 @@
 
     A listen() modal loop dispatching on the returned pointer. The root window is
     a cDemoBox (FrameBox subclass, stack local) that OWNS its controls (Add*
-    member factories) and a cConBox attached via AddNew. InitInstance runs
-    DemoMain() then returns FALSE; DemoMain drives everything through listen() and
-    ~FrameBox tears down all children + clears m_pMainWnd at scope exit.
+    member factories), a ConBox attached via AddNew, and a TableBox attached the
+    same way (AddNew with all-zero coords = attach-only, keeping the size/position
+    TableBox::open() already computed). InitInstance runs DemoMain() then returns
+    FALSE; DemoMain drives everything through listen() and ~FrameBox tears down
+    all children + clears m_pMainWnd at scope exit.
 
     cDemoBox overrides WindowProc to:
       - WM_DPICHANGED: update title bar with current DPI + received count (verification).
@@ -36,6 +38,7 @@
 #endif
 #include "..\Source\FrameBox.h"
 #include "..\Source\ConBox.h"
+#include "..\Source\TableBox.h"
 #include <shlobj.h>    // SHBrowseForFolderW, SHGetPathFromIDListW
 
 // System menu IDs: must be multiples of 0x10, below 0xF000.
@@ -63,7 +66,7 @@ public:
 
 class cDemoBox : public FrameBox {
 public:
-    cConBox* con_box = nullptr;
+    ConBox* con_box = nullptr;
     int dpi_changed_count = 0;
 
     void update_title() {
@@ -219,25 +222,41 @@ public:
 
 cDemoApp theApp;
 
+// TableBox demo callback: text source for every cell, "[row:col]" (0-based).
+static const char* DefaultTableText(int row, int col, void* user) {
+    static char buf[32];
+    sprintf_s(buf, sizeof(buf), "[%d:%d]", row, col);
+    return buf;
+}
+
 void DemoMain() {
     cDemoBox Top;
-    Top.OpenFrame(&theApp, 100, 100, 1000, 800);   // main + self live-edit
+    Top.OpenFrame(&theApp, 510, -910, 1410, -170);   // main + self live-edit
     Top.CenterWindow();
     Top.update_title();   // show initial DPI (count=0)
 
-    cConBox* conBox = new cConBox;
+    ConBox* conBox = new ConBox;
     conBox->setup_from_ini("..\\..\\Documents\\ConBox.ini");
     conBox->open(&Top, 5, 5);
-    Top.AddNew(0, 0, 0, 0, conBox);   // coords-first; Top owns conBox
+    Top.AddNew(5, 300, 601, 695, conBox);   // coords-first; Top owns conBox
     Top.con_box = conBox;
     Top.setup_sysmenu();
 
-    CEdit*     edit   = Top.AddEdit  (25, 430, 410, 490);
+    TableBox* table = new TableBox;
+    table->set_cols(100, 15);
+    table->set_rows(25, 60);
+    table->set_fixed(1, 1);
+    table->set_callback(DefaultTableText, nullptr);
+    table->set_font("Malgun Gothic", 10);
+    table->open(&Top, 5, 5, 8, 8);
+    Top.AddNew(0, 0, 0, 0, table);    // attach-only; keep the size/position open() computed
 
-    CButton*   button = Top.AddButton(25, 579, 129, 611, "Close");
-    CButton*   subBtn = Top.AddButton(140, 579, 244, 611, "Sub");
-    CStatic*   label  = Top.AddStatic(29, 508, 279, 532, "강누리 만세");
-    CComboBox* combo  = Top.AddCombo (35, 540, 208, 563, "Left,Center,Right");
+    CEdit*     edit   = Top.AddEdit  (685, 365, 875, 405);
+
+    CButton*   button = Top.AddButton(710, 330, 790, 355, "Close");
+    CButton*   subBtn = Top.AddButton(795, 330, 875, 355, "Sub");
+    CStatic*   label  = Top.AddStatic(665, 415, 875, 435, "강누리 만세");
+    CComboBox* combo  = Top.AddCombo (685, 300, 875, 323, "Left,Center,Right");
 
     AlignText(edit, 5);
     AlignText(label, 3);
@@ -257,7 +276,7 @@ void DemoSub(CWnd* owner) {
     Sub.OpenFrame(owner, 929, -628, 1229, -408);   // centered on the top (secondary) monitor
     Sub.update_title();   // show initial DPI (count=0)
     CStatic* msg = Sub.AddStatic(22, 124, 262, 148, "모달 서브 프레임");
-    CButton* ok  = Sub.AddButton(40, 70, 160, 102, "OK");
+    CButton* ok  = Sub.AddButton(155, 9, 275, 41, "OK");
     AlignText(msg, 5);
     while (::IsWindow(Sub)) {
         CWnd* ev = Sub.listen(ok);
