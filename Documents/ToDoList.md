@@ -33,23 +33,82 @@ visual style for consistency. The cross-monitor DPI rescale was not separately e
 (code path reuses the ConBox-proven OnSize pattern) -- worth a real check early in Stage 3
 if anything looks off.
 
-## Stage 3+ - Proposed (to confirm/refine after Stage 2)
+## Stage 3 - Selection & keyboard navigation (CORE) -- DONE
 
-Order reflects dependencies; CORE vs OPTIONAL noted. Re-confirm scope after Stage 2 results.
+Implemented: `cur_row`/`cur_col` (focused cell) + `anchor_row`/`anchor_col` (range start);
+`hit_test`/`select_range`/`move_current`/`ensure_visible`/`clamp_cursor`; `OnGetDlgCode`
+(`DLGC_WANTARROWS|DLGC_WANTALLKEYS`) so `FrameBox` does not steal arrows/Enter/Esc; `OnKeyDown`
+(arrows, PageUp/Down, Home/End, Ctrl+Home/End, Shift to extend); mouse drag range-select in the
+body; header-band click selects the whole row/col. `cell_status(row,col)` (-1 fixed/0 normal/
+1 selected) drives `draw_cell`'s background (see Requirements.md 3.6). `draw_focus_border()`
+draws the green focus border as a final overlay AFTER grid lines, so it overwrites the gray
+grid line itself instead of being overwritten by it. Fixed-cell rendering changed from the old
+3D raised look to `RGB(236,233,210)` + a 1px white inset line on the top/left edge.
+Refined after user review: the focus border only shows while the window has keyboard focus
+(`OnSetFocus`/`OnKillFocus`; `cur_row`/`cur_col` are remembered across a focus loss so it
+reappears in place); header-click whole-row/col selection places focus on the first body cell
+without auto-scrolling to the far end. Verified by the user running the demo (build success +
+interactive review across several rounds of fixes); no separate screenshot pass recorded.
 
-- Stage 3 (CORE) - Selection & keyboard navigation: focus/current cell, arrow/PageUp-Down/
-  Home/End/Ctrl moves, auto-scroll to keep the target visible, mouse click + drag range select,
-  fixed-header click selects whole row/col, Excel-like selection highlight (default `draw_cell`
-  reflects selection; overriders may ignore).
-- Stage 4 (CORE, vector form only) - Runtime column/row resize: 8px border hit-zone + cursor
-  change + drag to resize (FrameBox hit-zone style); ignored for uniform-form grids.
-  Optional: double-click border = auto-fit to measured text width.
-- Stage 5 (CORE) - In-place editing: double-click / Enter / F2 -> overlaid `CEdit`; write path
-  separate from the read-only callback via `set_edit_callback(row,col,text,user)`; ESC cancel,
-  Enter commit+down, Tab commit+right.
-- Stage 6 (OPTIONAL) - Clipboard: Ctrl+C copies the selection as tab/newline-delimited text
-  (Excel paste-compatible); optional Ctrl+V via the edit-callback path.
-- Stage 7 (CORE) - Polish: background-color-driven grid/header contrast (scrollbar contrast
-  already done in Stage 2), visible-cell + clipping performance pass (minimize callback calls),
-  demo integration, doc updates (Requirements/Learned). NOTE: DPI handling is intentionally NOT
-  here (folded into Stage 2).
+## Stage 4 - Runtime column/row resize (CORE, vector form only) -- DONE
+
+Implemented: header-band border drag-resize and double-click auto-fit, vector-form axes only
+(`cols_uniform`/`rows_uniform` gate; see Requirements.md 3.7). `hit_col_border`/`hit_row_border`
+find the border under the cursor (+-4 logical px); `OnSetCursor` switches to `IDC_SIZEWE`/
+`IDC_SIZENS` over a border; `OnLButtonDown`/`OnMouseMove`/`OnLButtonUp` drive the live drag
+(`SetCapture`, delta from drag-start size, 10 logical px minimum); `OnLButtonDblClk` auto-fits
+via `GetTextExtentPoint32W` over every currently visible cell on that column/row.
+Extended (per user request) to match Excel's selection-aware resize: `col_selection_span`/
+`row_selection_span` find the dragged/double-clicked border's selection span (the single
+column/row if it is not part of the current selection); drag sets every column/row in the span
+to the SAME resulting size, double-click auto-fits each one in the span INDEPENDENTLY. Also
+added: clicking the top-left corner cell selects the entire grid; a fresh header click now
+starts a drag that extends the row/column selection across header cells (Excel-style header
+drag-select) instead of being one-shot.
+Verified: build + demo launch only; the actual drag/double-click/cursor interaction was not
+exercised by the AI (screenshot-review territory) -- worth a user pass before Stage 5.
+
+## Stage 5 - In-place editing (CORE) -- DONE
+
+Implemented per the final design agreed in a grill session (see Requirements.md 3.8 for the
+confirmed spec; supersedes this stage's original draft plan -- notably: no F2 trigger, Esc
+explicitly cancels, combo cells use a `"\x1Bindex, item0, item1, ..."` spec parsed from
+`text_cb`, and a single click on a combo cell's arrow opens it immediately).
+`set_edit_callback`, `virtual edit_cell(row,col)`, the private nested `TableEditBox : public
+CEdit` (plain-text edit, catches Enter/Esc/Tab in `PreTranslateMessage` before `TranslateMessage`
+posts a `WM_CHAR`) and `TableComboPopup : public CWnd` (owner-draw dropdown, genuine `WS_POPUP`)
+are all in `TableBox.cpp`; `DemoApp.cpp` wires `set_edit_callback` back into `table_text` and
+seeds a combo demo cell at `table_text[2][2]`.
+User tuning round completed. Refinements applied: combo arrow rendered as U+25BC via cell font;
+popup window sized with AdjustWindowRectEx (client = cell_h*N exact); two-pass item paint +
+separator at (i+1)*rh-1; CS_DROPSHADOW; cancel_edit() called from OnMouseWheel/OnLButtonDown/
+OnSize to discard floating editor before layout changes; double-destroy guard in OnActivate.
+
+## Stage 6 - Clipboard (OPTIONAL)
+
+- Ctrl+C: build a tab/newline-delimited UTF-8 string from the selection rect via `cell_text`
+  (Excel paste-compatible layout), convert to UTF-16 (`MultiByteToWideChar`), and place it on
+  the clipboard as `CF_UNICODETEXT` (`OpenClipboard`/`EmptyClipboard`/
+  `GlobalAlloc(GMEM_MOVEABLE)`/`SetClipboardData`).
+- Ctrl+V (only meaningful when `set_edit_callback` is registered): read `CF_UNICODETEXT`,
+  split rows on `\r\n`/`\n` and columns on `\t`, convert each piece to UTF-8
+  (`WideCharToMultiByte`), and call `edit_cb` for each target cell starting at `cur`,
+  advancing row/col per piece.
+- Lowest priority of the proposed stages; implement only when explicitly requested.
+
+## Stage 7 - Polish (CORE)
+
+- [DONE] Excel-style header highlighting: row/col headers matching cursor/selection get
+  RGB(224,221,200) background + RGB(128,128,128) inset line (implemented as user request).
+- Background-contrast pass: extend the body-background sampling already used for the overlay
+  scrollbar (Stage 2) to `draw_grid_lines` so grid lines stay visible against a `draw_cell`
+  override that paints something other than white (not just the scrollbar).
+- Visible-cell + clipping performance pass: audit `draw_block`/`last_visible_row`/
+  `last_visible_col` so the text callback is never invoked for off-screen cells, and avoid a
+  full back-buffer repaint on events that don't change pixels (e.g. scrollbar fade timer ticks
+  once alpha has settled, plain mouse-move hover with no visible change).
+- Demo integration: extend the `TableBox` section of `Project\DemoApp.cpp` to exercise
+  selection, resize, and in-place editing together (not just the static `[row:col]` text demo
+  from Stage 2).
+- DPI handling is intentionally NOT revisited here -- it was folded into Stage 2 and already
+  verified.

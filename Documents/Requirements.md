@@ -183,7 +183,8 @@ Project-wide environment, encoding, folder, build, and coding rules are defined 
   `virtual void draw_cell(CDC& dc, int row, int col, int x0, int y0, int x1, int y1)`.
   - `dc` is the back-buffer memory DC.
   - Coordinates are client-area PHYSICAL pixels (DPI already applied). `x1`/`y1` are exclusive (RECT convention).
-  - The default implementation calls the callback and renders text: normal cells on white, fixed cells with an Excel-like raised/button look (not flat gray). Subclasses may override to fully replace cell rendering or delegate to the base.
+  - The default implementation calls the callback and renders text: normal cells on white, fixed cells with a tan background (`RGB(236,233,210)`) and a 1px white inset line on the top/left edge, selected-range cells with a light blue tint (see 3.6). Subclasses may override to fully replace cell rendering or delegate to the base.
+- Excel-style header highlighting: a column header cell (row < fixed_rows, col >= fixed_cols) is highlighted when `col` falls inside `[min(anchor_col,cur_col)..max(anchor_col,cur_col)]`; a row header cell (col < fixed_cols, row >= fixed_rows) similarly for the row axis. Highlighted headers use `RGB(224,221,200)` background and `RGB(128,128,128)` inset line (vs. default tan background and white inset). Corner cells (both row and col inside the fixed band) are never highlighted.
 - Only visible cells are drawn. A partially visible cell IS drawn, with its FULL logical rect; the paint loop applies `IntersectClipRect(x0,y0,x1,y1)` before each `draw_cell` so overflow is clipped automatically (overriders always draw the whole cell).
 - Grid lines are drawn by the paint loop AFTER all cells (not by `draw_cell`), so overrides need not redraw borders and normal cells always keep their grid.
 - A protected helper `cell_text(row, col)` wraps the callback for overrides that only need the text.
@@ -200,3 +201,36 @@ Project-wide environment, encoding, folder, build, and coding rules are defined 
 
 - Per-monitor DPI aware. The initial render uses the creating monitor's DPI; a runtime DPI change (window moved to a different-DPI monitor) rebuilds the font and recomputes cell pixels.
 - The DPI change is handled in `OnSize` by comparing `GetDpiForWindow` to the stored DPI (same pattern as ConBox). Because rows/cols are fixed by `set_cols`/`set_rows` and there is no child process, the grid is simply re-rendered at the new DPI; ConBox's "preserve grid, do not resize the PTY" constraint does not apply.
+
+### 3.6 Selection and Keyboard Navigation
+
+- Focused cell: the single cell that arrow keys move and that owns the green border. Set by a body-cell click, then movable by Left/Right/Up/Down, PageUp/PageDown (one screenful of body rows), Home/End (first/last column of its row), Ctrl+Home/Ctrl+End (first/last body cell).
+- Selected cells: the cells inside the rectangular range defined by Shift+arrow keys or a mouse drag (anchor to focused cell). A 1x1 range (just the focused cell, no drag/Shift-extend) is NOT considered "selected".
+- `int cell_status(int row, int col) const` reports which of 3 cases a cell falls into, for rendering: `-1` fixed (header), `0` normal, `1` selected (a real, more-than-1-cell range only).
+- When a real selection range exists, the focused cell renders exactly like any other selected cell (selection background), with the green border drawn on top of it -- it is not exempted into a separate plain look.
+- The green focus border is visible only while the `TableBox` window itself has keyboard focus. Losing focus hides it; the focused cell position is remembered and the border reappears there when focus returns.
+- Clicking a fixed column header selects that whole column; clicking a fixed row header selects that whole row. Either selects the full row/col range but places the focused cell at the FIRST body cell (right after the fixed header) and does NOT auto-scroll the viewport to it. A following arrow key scrolls normally from there.
+- A fresh (non-Shift) header click also starts a drag: moving the mouse to another header cell while still pressed extends the selection across every column/row in between (Excel-style header drag-select), still without auto-scrolling.
+- Clicking the top-left corner cell (intersection of the fixed row and fixed column band) selects the entire grid, same focus/no-auto-scroll rule as a header click.
+
+### 3.7 Column/Row Resize and Auto-fit
+
+- Only valid on an axis configured through the vector form of `set_cols`/`set_rows`; the uniform-width/height form has no per-cell size to grab, so resize/auto-fit is a no-op on that axis.
+- Dragging a column/row border in the header band resizes it; double-clicking a border auto-fits it to the widest/tallest currently visible cell content on that column/row.
+- Matches Excel's selection-aware behavior: if the dragged/double-clicked border belongs to a column/row that is part of the current selection, the action applies to every column/row in that selection's span, not just the one under the cursor. Otherwise it applies to that single column/row only.
+  - Drag: every column/row in the span is set to the SAME resulting size (the one the drag produced).
+  - Auto-fit (double-click): every column/row in the span is fitted INDEPENDENTLY to its own content (sizes may differ from each other).
+
+### 3.8 In-Place Cell Editing
+
+- `set_edit_callback(void (*cb)(int row, int col, const char* text, void* user), void* user = nullptr)`: optional write-back path, separate from the read-only `set_callback`. `text` is UTF-8, valid only for the duration of the call. Editing is unavailable (Enter/double-click/typed-char are no-ops on a body cell) until this is called.
+- `virtual void edit_cell(int row, int col)`: overridable entry point into edit mode for a body cell, mirroring `draw_cell`'s overridability. The default implementation re-reads `cell_text(row,col)` to decide between the two edit UIs below.
+- Combo (dropdown) cell spec: a cell whose `text_cb` value starts with `"\x1B"` (ESC, a control byte that cannot collide with real data) is a combo cell. The rest of the string is `index, item0, item1, ...` (comma-separated, each item trimmed of surrounding spaces); `index` selects which item is currently shown. The default `draw_cell` renders the selected item's label plus the Unicode character `▼` (U+25BC) drawn right-aligned in the arrow column using the same cell font and `DrawTextW(DT_CENTER|DT_VCENTER|DT_SINGLELINE)`; the full arrow column rect is kept as the mouse hit-test zone regardless of the glyph's actual width.
+- Edit triggers on a body cell, only when not already editing:
+  - Double-click, or Enter on the focused cell: opens the CEdit (plain cell) or the dropdown (combo cell), matching whichever type the cell is.
+  - A printable character key: starts the CEdit and forwards the typed character so it replaces the selected (full) text -- Excel's type-to-overwrite. Combo cells are excluded (no free-text meaning).
+  - A single click on a combo cell's dropdown arrow (without Shift) opens the dropdown immediately, like clicking a real ComboBox's drop button.
+- Plain-text edit (CEdit): borderless, positioned exactly over the cell, current text pre-selected. Enter commits and moves the focused cell down one row; Tab commits and moves it right one column; Esc cancels (restores the original value, no callback call); losing focus to anything else commits with no move. `edit_cb` receives the box's text as-is.
+- Combo edit (owner-draw dropdown): a screen-positioned popup directly below the focused cell (so it can extend past TableBox's own client area, like a real combo dropdown), width = the cell's width, each item's row height = the cell's height (not achievable with `CComboBox`, whose per-item height is fixed by the font). The popup has `CS_DROPSHADOW` and a `WS_BORDER`; its window size is computed via `AdjustWindowRectEx` so the client area is exactly `cell_h * N` pixels (avoiding the 1-pixel-per-item shrinkage `WS_BORDER` would otherwise cause). Items are painted in two passes: backgrounds and text first, then separator lines (`RGB(191,191,191)`, same as grid lines) at `(i+1)*rh - 1` (the `-1` compensates for the 1px WS_BORDER top frame so separators align with the surrounding table grid). Clicking an item, or Enter on the highlighted item, commits; Up/Down move the highlight; Esc, or the popup losing activation (e.g. clicking elsewhere), cancels with no callback call. On commit, `edit_cb` receives the spec re-encoded as `"\x1B newindex, item0, item1, ..."`, so the host's data shape stays identical to what `set_callback` originally returned.
+- Disruption cancellation: `OnMouseWheel`, `OnLButtonDown`, and `OnSize` call `cancel_edit()` at entry (before any scrolling, focus change, or layout update). `cancel_edit()` discards the active `edit_box` or `combo_popup` without committing, then the triggering action proceeds normally. This prevents the floating editor from becoming misaligned when the table layout changes beneath it.
+- `TableBox` does not cache edited text itself; the host's `set_callback` source is expected to reflect the new value on the next `cell_text` call.

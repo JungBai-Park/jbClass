@@ -19,6 +19,7 @@
 //     table->set_fixed(1, 1);                     // frozen header row/col (default)
 //     table->set_callback(MyText, nullptr);       // text source for every cell
 //     table->set_font("Malgun Gothic", 10);       // single font (ConBox name/size/option grammar)
+//     table->set_edit_callback(MyEdit, nullptr);  // OPTIONAL write-back path, see edit_cell below
 //     table->open(parent, x0, y0, rows, cols);
 //     // rows/cols = initial VISIBLE cell count (NOT the grid's total row/col count -- that is
 //     // set_rows()/set_cols()'s "limit"/vector size). Clamped to the grid's row/col count.
@@ -41,8 +42,19 @@
 #include <vector>
 #include <string>
 
+// Implementation detail of in-place cell editing (Stage 5): a private nested CEdit and an
+// owner-draw dropdown popup, both defined inside TableBox.cpp. Forward-declared here only so
+// TableBox can hold a pointer to each; callers never see their definitions.
+class TableEditBox;
+class TableComboPopup;
+
 class TableBox : public CWnd
 {
+    // Tightly-coupled implementation details of in-place editing (Stage 5): they need to call
+    // back into TableBox's private end_text_edit/end_combo_edit and read/set ending_edit.
+    friend class TableEditBox;
+    friend class TableComboPopup;
+
 public:
     TableBox();
     virtual ~TableBox();
@@ -70,6 +82,15 @@ public:
     // so a reused static buffer is allowed. user is an opaque context passed back on every call.
     void set_callback(const char* (*cb)(int row, int col, void* user), void* user = nullptr);
 
+    // Write-back path for in-place editing (Stage 5), separate from the read-only set_callback.
+    // text is UTF-8 and valid only for the duration of the call. For a combo-type cell (see
+    // edit_cell) text is re-encoded as "\x1B newindex, item0, item1, ..." so the host's data
+    // shape stays identical to what set_callback returns -- TableBox does not cache edited text
+    // itself; the host's cell_text/set_callback source is expected to reflect the new value on
+    // the next call. Optional: editing is simply unavailable (Enter/double-click no-op on a body
+    // cell) if this is never called.
+    void set_edit_callback(void (*cb)(int row, int col, const char* text, void* user), void* user = nullptr);
+
     // Single font. Borrows ONLY ConBox's set_efont/set_kfont argument grammar (name / size in
     // points / option attribute string: B/I/U/S/Q -- see ConBox.cpp ParseFontOpts). No English/
     // Korean split and no height matching: cell sizes are explicit (set_cols/set_rows), so the
@@ -87,13 +108,43 @@ protected:
     // Wraps the text callback; for overrides that only need the cell's text.
     const char* cell_text(int row, int col) const;
 
+    // Enters in-place edit mode for body cell (row, col). Triggers: double-click, Enter on the
+    // focused (non-editing) cell, or a printable character key (Edit-type cells only -- see
+    // OnChar). Default implementation re-reads cell_text(row,col): a value starting with "\x1B"
+    // marks a combo (dropdown) cell -- "\x1B index, item0, item1, ..." (comma-separated, each
+    // item trimmed) opens an owner-draw popup list below the cell, sized to the cell's own width
+    // and per-item height (CComboBox cannot do this -- its item height is font-fixed). Any other
+    // value opens a borderless CEdit positioned over the cell with its text selected. No-op if
+    // set_edit_callback was never called. Subclasses may override to fully replace the edit UI.
+    virtual void edit_cell(int row, int col);
+
+    // Selection / current-cell state (keyboard + mouse navigation). The default draw_cell
+    // picks its background from cell_status(); overriding subclasses may call it too, or
+    // ignore it. -1 = fixed (header) cell, 0 = normal cell, 1 = selected cell. A selection
+    // collapsed to a single cell (anchor == cur, i.e. just the focused cell with no range)
+    // reports 0, not 1 -- a 1x1 range is not considered "selected".
+    int cell_status(int row, int col) const;
+
+    // True only for the single focused cell (the one arrow keys move and that owns the green
+    // border), AND only while the window has keyboard focus -- see has_focus. Independent of
+    // cell_status: the focused cell reports status 1 when it is part of a real (>1 cell)
+    // range, 0 otherwise.
+    bool is_current(int row, int col) const;
+
     afx_msg void OnPaint();
     afx_msg void OnSize(UINT type, int cx, int cy);
     afx_msg BOOL OnEraseBkgnd(CDC* dc);
+    afx_msg void OnSetFocus(CWnd* pOldWnd);
+    afx_msg void OnKillFocus(CWnd* pNewWnd);
+    afx_msg UINT OnGetDlgCode();
+    afx_msg void OnKeyDown(UINT nChar, UINT nRepCnt, UINT nFlags);
+    afx_msg void OnChar(UINT nChar, UINT nRepCnt, UINT nFlags);
     afx_msg BOOL OnMouseWheel(UINT flags, short zDelta, CPoint pt);
     afx_msg void OnLButtonDown(UINT flags, CPoint pt);
     afx_msg void OnMouseMove(UINT flags, CPoint pt);
     afx_msg void OnLButtonUp(UINT flags, CPoint pt);
+    afx_msg void OnLButtonDblClk(UINT flags, CPoint pt);
+    afx_msg BOOL OnSetCursor(CWnd* pWnd, UINT nHitTest, UINT message);
     afx_msg void OnMouseLeave();
     afx_msg void OnTimer(UINT_PTR id);
     DECLARE_MESSAGE_MAP()
@@ -126,6 +177,89 @@ private:
 
     // Clamp scroll_row/scroll_col into their valid range for the current window size/grid.
     void clamp_scroll();
+
+    // Map a client point to the grid cell under it. Always succeeds (clamps into the nearest
+    // valid cell) as long as the grid has at least one row and one column, so it doubles as the
+    // "clamp to visible cell" used when a drag-select moves past the rendered grid.
+    bool hit_test(CPoint pt, int& row, int& col) const;
+
+    // Last valid row/col index (>= fixed_rows/fixed_cols even when the grid is smaller).
+    int last_row_index() const;
+    int last_col_index() const;
+
+    // Set anchor/cur (clamped to the body range) and Invalidate. Scrolls so cur is visible
+    // unless scroll is false -- used by header-band whole-row/col selection, which places
+    // focus on the row/col's first cell without jumping the viewport to it.
+    void select_range(int anchor_r, int anchor_c, int cur_r, int cur_c, bool scroll = true);
+
+    // Keyboard-driven move: keeps the anchor when extend is true (Shift+key), else collapses
+    // the selection to the single target cell.
+    void move_current(int row, int col, bool extend);
+
+    // Adjust scroll_row/scroll_col (and re-clamp) so (row,col) is fully visible.
+    void ensure_visible(int row, int col);
+
+    // Clamp cur_row/cur_col/anchor_row/anchor_col after fixed_rows/fixed_cols or the grid size
+    // changes (set_fixed/set_cols/set_rows can shrink the grid below the current selection).
+    void clamp_cursor();
+
+    // On-screen pixel rect of (row,col), in the same coordinate space as draw_cell. False if
+    // the cell is not currently rendered (scrolled out of the fixed/body view).
+    bool cell_rect(int row, int col, CRect& rc) const;
+
+    // Stage 4: column/row border resize (vector-form axes only -- a no-op axis configured via
+    // the uniform set_cols/set_rows overload has no border to grab, see cols_uniform/rows_uniform).
+    // Border hit zones live in the header band: a column border is tested along y in [0,corner_h())
+    // at each visible column boundary (fixed + currently scrolled body columns); a row border is
+    // tested along x in [0,corner_w()) at each visible row boundary. Returns the index of the
+    // column/row whose right/bottom border was hit, or -1.
+    int hit_col_border(CPoint pt) const;
+    int hit_row_border(CPoint pt) const;
+
+    // Auto-fit: set col_widths[idx]/row_heights[idx] to the max text extent (GetTextExtentPoint32W)
+    // over every currently VISIBLE cell on that column/row (the virtual grid cannot be scanned in
+    // full), plus padding. No-op if the axis is uniform.
+    void autofit_col(int idx);
+    void autofit_row(int idx);
+
+    // Excel-style group resize/autofit: if the dragged/double-clicked border's column (row) hc/hr
+    // lies inside the current selection's column (row) span, the span covers every selected
+    // column/row; otherwise it collapses to [hc,hc]/[hr,hr] (that single column/row only). Used by
+    // both the drag-resize (same resulting size for the whole span) and the autofit double-click
+    // (each column/row in the span fitted independently -- see OnLButtonDblClk).
+    void col_selection_span(int hc, int& c0, int& c1) const;
+    void row_selection_span(int hr, int& r0, int& r1) const;
+
+    // Cancel the active edit session (edit_box or combo_popup) without committing. Safe to call
+    // when no session is open. Used by OnMouseWheel, OnLButtonDown, and OnSize to discard a
+    // floating editor before the table layout changes beneath it.
+    void cancel_edit();
+
+    // Stage 5: in-place cell editing. Starts the CEdit session over (row,col) with its current
+    // text selected. If initial_char != 0 it is forwarded to the new box right after creation
+    // (typed-key trigger: replaces the selection, Excel-style overwrite-on-type).
+    void start_text_edit(int row, int col, wchar_t initial_char = 0);
+
+    // Ends the active CEdit session: commit=true reads the box's text and calls edit_cb; both
+    // cases destroy the box and refocus the grid. move_dr/move_dc shift cur_row/cur_col after a
+    // committed edit (Enter -> +1 row, Tab -> +1 col); ignored when commit is false.
+    void end_text_edit(bool commit, int move_dr, int move_dc);
+
+    // Starts/ends the combo dropdown session over (row,col). end_combo_edit's new_index is the
+    // item the user picked (ignored when commit is false); the resulting text handed to edit_cb
+    // is re-encoded as "\x1B new_index, item0, item1, ...".
+    void start_combo_edit(int row, int col);
+    void end_combo_edit(bool commit, int new_index);
+
+    // Physical-px rect of the dropdown arrow icon at a combo cell's right edge -- shared by
+    // draw_cell (paints it) and OnLButtonDown (single-click-to-open hit test).
+    CRect combo_arrow_rect(const CRect& cell_rc) const;
+
+    // Paints the focused cell's green border as a final overlay, AFTER draw_grid_lines has
+    // already run for the block. Cannot live in draw_cell: draw_grid_lines runs once for the
+    // whole block right after draw_cell, so anything draw_cell paints on the cell's shared
+    // edge would be overwritten by the plain gray grid line that follows.
+    void draw_focus_border(CDC& dc);
 
     // Draw cells [r0,r1) x [c0,c1) with top-left pixel origin (x0,y0), advancing by each cell's
     // own physical size. Each cell is clipped to its own rect (SaveDC/IntersectClipRect/RestoreDC)
@@ -182,14 +316,61 @@ private:
     std::vector<int> col_widths;
     std::vector<int> row_heights;
 
+    // True when the axis was last set through the uniform set_cols/set_rows overload (also true
+    // for the ctor default); the vector-form overload clears it. Stage 4 resize/autofit are a
+    // no-op while the axis's flag is true (uniform axes have no per-cell width/height to grab).
+    bool cols_uniform;
+    bool rows_uniform;
+
+    // Stage 4 live border-drag state. resize_col/resize_row (-1 = not resizing) is the dragged
+    // border's column/row; resize_start_pt/resize_start_sz are the mouse coordinate (physical px)
+    // and that column/row's size (96 DPI logical px) at the moment the drag started, so OnMouseMove
+    // can recompute the size from the cursor delta without accumulating rounding error across moves.
+    // resize_group_c0/c1 (r0/r1) is the column/row span the computed size is applied to every move
+    // -- see col_selection_span/row_selection_span; equals [resize_col,resize_col] outside a
+    // multi-column/row selection, so the single-target case needs no special handling.
+    int resize_col;
+    int resize_row;
+    int resize_start_pt;
+    int resize_start_sz;
+    int resize_group_c0, resize_group_c1;
+    int resize_group_r0, resize_group_r1;
+
+    // True while a fresh (non-Shift) header-band click is being dragged across other header
+    // cells to multi-select columns/rows (Excel-style header drag-select); mutually exclusive
+    // with `selecting` (body-cell range drag) and the Stage 4 border drags above, since each
+    // starts its own SetCapture() from OnLButtonDown and they are tested in priority order there.
+    bool header_drag_col;
+    bool header_drag_row;
+
     int fixed_rows;   // frozen header row count (default 1)
     int fixed_cols;   // frozen header col count (default 1)
 
     int scroll_row;    // index of the first BODY row shown (>= fixed_rows)
     int scroll_col;    // index of the first BODY col shown (>= fixed_cols)
 
+    int  cur_row, cur_col;        // active/focused cell (keyboard navigation target)
+    int  anchor_row, anchor_col;  // selection-range start; equals cur_row/cur_col outside a range
+    bool selecting;                // true while dragging a body-cell range selection (mouse captured)
+    bool has_focus;                 // window has keyboard focus; the green focus border only
+                                     // draws while true, but cur_row/cur_col are remembered
+                                     // regardless so the border reappears where it was on refocus
+
     const char* (*text_cb)(int row, int col, void* user);
     void* text_cb_user;
+
+    void (*edit_cb)(int row, int col, const char* text, void* user);
+    void* edit_cb_user;
+
+    // Stage 5 edit session state. edit_box/combo_popup are mutually exclusive and non-null only
+    // while their respective session is open. ending_edit guards against a re-entrant commit
+    // when WM_KILLFOCUS fires as a side effect of our own DestroyWindow()/SetFocus() during
+    // commit/cancel (the box's real "lost focus to another control" case is the one we DO want
+    // to commit on; the teardown-triggered one must be ignored).
+    TableEditBox*    edit_box;
+    TableComboPopup* combo_popup;
+    int  edit_row, edit_col;
+    bool ending_edit;
 
     // Font spec (96 DPI logical / DPI-independent), stored by set_font (and the ctor default) so
     // the font can be rebuilt at a new DPI without the host re-calling. build_font() does the GDI work.

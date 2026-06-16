@@ -288,3 +288,114 @@ This file records project-specific pitfalls and implementation details that are 
   is a syntax error: `C2589`/`C2059`), not a clean "ambiguous call" error.
 - This project does not define `NOMINMAX`. Use a manual ternary (`a < b ? a : b`) instead of
   `std::min`/`std::max` in any new code; do not add `<algorithm>` for this purpose.
+
+### 5.2 draw_grid_lines Runs AFTER draw_cell and Owns the Shared Boundary Pixel
+
+- `draw_grid_lines` is called once per block, AFTER every `draw_cell` in that block has already
+  run. Anything `draw_cell` paints on a cell's edge pixel is overwritten by the plain gray grid
+  line that follows -- a cell-local border/inset line drawn exactly at `rc.left`/`rc.top`/
+  `rc.right`/`rc.bottom` from inside `draw_cell` never survives.
+- Hit this twice: the focused-cell green border (top/left edge looked thinner than bottom/right
+  because the trailing grid-line pass ate into the boundary) and the fixed-header inset white
+  line (invisible at `rc.left`/`rc.top`, only became visible 1px further in).
+- Fix pattern: draw such overlays from `OnPaint` AFTER the `draw_block`/`draw_grid_lines` pair
+  for the whole visible region (see `draw_focus_border`), or, if it must stay inside
+  `draw_cell`, offset it 1px inward (`rc.left+1`/`rc.top+1`/...) so the later grid-line draw
+  does not touch it (see the fixed-header inset line).
+- Pixel-exact alignment detail: `draw_grid_lines`'s right/bottom line for a cell is drawn AT
+  `rc.right`/`rc.bottom` (the next cell's left/top origin), not at `rc.right-1`/`rc.bottom-1`.
+  A plain `CDC::Rectangle(rc)` with a 1px pen draws its right/bottom edge at `rc.right-1`/
+  `rc.bottom-1` instead, one pixel off from the real grid line -- to overlay exactly on top of
+  it, call `Rectangle(rc.left, rc.top, rc.right+1, rc.bottom+1)`.
+
+### 5.3 Per-Zone Cursor Needs ON_WM_SETCURSOR, Not a SetCursor Call in OnMouseMove
+
+- `TableBox`'s window class registers a static `hCursor` (`IDC_ARROW`). On every mouse move
+  over the window, `DefWindowProc`'s default `WM_SETCURSOR` handling re-applies that class
+  cursor, so a `::SetCursor()` call made from `OnMouseMove` gets immediately overwritten.
+- Fix: add `ON_WM_SETCURSOR()` to the message map and override `OnSetCursor` to call
+  `::SetCursor()` and return `TRUE` (suppressing the default handling) when the point is over a
+  resize border (`hit_col_border`/`hit_row_border`); otherwise fall through to
+  `CWnd::OnSetCursor`. `OnSetCursor` does not receive the point directly -- use
+  `GetCursorPos` + `ScreenToClient`.
+- `IDC_SIZEWE`/`IDC_SIZENS` need the same `(LPCWSTR)` cast as `IDC_ARROW` when passed to
+  `LoadCursorW` in MBCS builds (see 2.2).
+
+### 5.4 In-Place Editing: SetFocus() Must Not Be Called From Inside the WM_KILLFOCUS Path
+
+- `TableEditBox`/`TableComboPopup` are private nested-by-coupling classes (not literal C++
+  nested classes) that need to call back into `TableBox`'s private `end_text_edit`/
+  `end_combo_edit` and read `ending_edit` -- granted via `friend class TableEditBox;` /
+  `friend class TableComboPopup;` in `TableBox.h`, since they are tightly-coupled
+  implementation details, not part of the public API.
+- `end_text_edit`/`end_combo_edit` deliberately do NOT call `SetFocus()` themselves. Calling
+  `SetFocus()` from code that can be reached while a `WM_KILLFOCUS` is being processed (Win32
+  warns against this) is ambiguous: when a click elsewhere triggers `TableBox::OnLButtonDown`'s
+  existing `SetFocus()` call, that synchronously raises `WM_KILLFOCUS` on the edit box, which
+  commits -- calling `SetFocus()` again from inside that commit would be a reentrant call into
+  an in-progress focus change. Instead, the CALLER decides: `TableEditBox::PreTranslateMessage`
+  (Enter/Esc/Tab, box still focused, no `WM_KILLFOCUS` involved) calls `owner->SetFocus()`
+  itself right after committing/cancelling; `OnKillFocus` does not call it at all (focus is
+  already headed wherever the click/Tab-out sent it). Same split for the combo popup: mouse
+  pick / Enter / Esc call `owner->SetFocus()` afterward, but `WM_ACTIVATE(WA_INACTIVE)` (the
+  user activated something else) never does -- that would steal focus back from whatever the
+  user actually clicked.
+- Because `end_text_edit`/`end_combo_edit` do not touch focus and `TableBox::OnLButtonDown`'s
+  pre-existing `SetFocus()` call already triggers the edit box's `WM_KILLFOCUS` synchronously,
+  no extra "commit pending edit before processing this click" code is needed in
+  `OnLButtonDown`/`OnLButtonDblClk` -- it falls out for free. Same for the combo popup via
+  `WM_ACTIVATE`: clicking elsewhere deactivates the popup before the new click's own handler runs.
+
+### 5.5 A Single-Line CEdit Already Vertically Centers Its Text
+
+- `TableEditBox` is created WITHOUT `ES_MULTILINE`. A plain single-line `CEdit` vertically
+  centers its text inside the control's height by itself, regardless of how much taller the
+  control is than the font -- no `EM_SETRECT` workaround needed. That workaround (section 3.5,
+  "CEdit Vertical Alignment") only applies to `ES_MULTILINE` edits, which default to top-aligned
+  text. Adding `ES_MULTILINE` here to chase the design doc's literal "use SetRect to center"
+  wording would have reintroduced that exact problem for no benefit.
+- `OnGetDlgCode` returning `DLGC_WANTALLKEYS` on both `TableEditBox` and `TableComboPopup` is
+  required so `FrameBox::PreTranslateMessage`'s `CDialog`-like Enter/Esc interception
+  (Requirements.md 1.3 / Learned.md 4.7) yields to them; `PreTranslateMessage` catching
+  Enter/Esc/Tab before `TranslateMessage` runs is the primary defense, `DLGC_WANTALLKEYS` is the
+  safety net in case the pretranslate walk does not reach them first.
+
+### 5.6 Combo-Cell Spec String Must Not Leak Into Autofit Measurement
+
+- After `cell_text` started returning the raw `"\x1Bindex, item0, item1, ..."` encoding for
+  combo cells, `autofit_col`/`autofit_row` (Stage 4) would measure that raw spec string instead
+  of the rendered label, sizing the column/row wrong. Fixed by routing both through a shared
+  `ComboDisplayLabel(raw)` helper that returns the selected item's label for a combo cell, the
+  text unchanged otherwise -- any future code that measures or displays `cell_text` needs the
+  same indirection, not the raw return value.
+
+### 5.7 Combo Popup Window Size: WS_BORDER Shrinks Client Area
+
+- `WS_BORDER` subtracts its frame (1px top + 1px bottom) from the client area. If the window
+  height is set to `cell_h * N`, the client height becomes `cell_h * N - 2`, so integer division
+  yields `row_h() = cell_h - 1`. Every item is 1px shorter than the cell, separator lines drift
+  1px per item (accumulating), and `N - 2` px of blank space remain at the bottom.
+- Fix: compute the window rect from the desired client rect via
+  `AdjustWindowRectEx(&adj, WS_POPUP|WS_BORDER, FALSE, WS_EX_TOOLWINDOW)` so the client area
+  is exactly `cell_h * N` regardless of system border metrics.
+- Separator alignment: client y=0 maps to screen y = window_top + 1 (top border), so a separator
+  drawn at client y = `(i+1)*rh` lands 1px below the matching table grid line. Draw at
+  `(i+1)*rh - 1` to compensate. This 1px correction is constant (no accumulation) once
+  `row_h() = cell_h` is exact.
+- Two-pass rendering: draw all item backgrounds and text first, then draw separator lines on top
+  in a second pass -- same pattern as `draw_block` + `draw_grid_lines` -- so separator lines
+  are never overwritten by a subsequent item's background fill.
+
+### 5.8 Combo Popup External Cancel: Prevent Double-Destroy via ending_edit
+
+- `end_combo_edit` is designed to be called by the popup AFTER it has already destroyed itself
+  (`DestroyWindow()` in `OnLButtonUp`/`OnKeyDown`/`OnActivate`); it only clears the pointer,
+  never calls `DestroyWindow` itself.
+- When `cancel_edit()` (called from `OnMouseWheel`/`OnLButtonDown`/`OnSize`) must cancel the
+  popup from outside, it must call `DestroyWindow` directly. During that destroy, Win32 may
+  dispatch `WM_ACTIVATE(WA_INACTIVE)` to the popup, whose `OnActivate` handler would then call
+  `DestroyWindow` a second time and `end_combo_edit` again -> double-destroy and double-cleanup.
+- Fix: in `cancel_edit`, set `combo_popup = nullptr` and `ending_edit = true` BEFORE calling
+  `DestroyWindow`, so any re-entrant `OnActivate` call sees the guard and returns immediately.
+  `OnActivate` checks `owner->ending_edit` and skips its body when true. Reset `ending_edit`
+  after `DestroyWindow` returns.

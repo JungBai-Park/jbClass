@@ -222,11 +222,23 @@ public:
 
 cDemoApp theApp;
 
-// TableBox demo callback: text source for every cell, "[row:col]" (0-based).
+// TableBox demo data: 50x50 cell text, filled by DemoMain before open().
+static std::vector<std::vector<std::string>> table_text;
+
+// TableBox demo callback: text source for every cell, served from table_text.
 static const char* DefaultTableText(int row, int col, void* user) {
-    static char buf[32];
-    sprintf_s(buf, sizeof(buf), "[%d:%d]", row, col);
-    return buf;
+    if (row < 0 || row >= (int)table_text.size() || col < 0 || col >= (int)table_text[row].size())
+        return "";
+    return table_text[row][col].c_str();
+}
+
+// TableBox demo edit callback (Stage 5): writes the user's in-place edit back into table_text,
+// the same backing store DefaultTableText reads from. text already carries the re-encoded
+// "\x1Bindex, items..." form for a combo cell, so no special-casing is needed here.
+static void DefaultTableEdit(int row, int col, const char* text, void* user) {
+    if (row < 0 || row >= (int)table_text.size() || col < 0 || col >= (int)table_text[row].size())
+        return;
+    table_text[row][col] = text;
 }
 
 void DemoMain() {
@@ -242,13 +254,30 @@ void DemoMain() {
     Top.con_box = conBox;
     Top.setup_sysmenu();
 
+    std::vector<int> col_widths(50);
+    for (size_t i = 0; i < col_widths.size(); ++i) col_widths[i] = (i % 2 == 0) ? 125 : 75;
+    std::vector<int> row_heights(50);
+    for (size_t i = 0; i < row_heights.size(); ++i) row_heights[i] = (i % 2 == 0) ? 25 : 25;
+
+    table_text.assign(50, std::vector<std::string>(50));
+    char cell_buf[32];
+    for (int row = 0; row < 50; ++row) {
+        for (int col = 0; col < 50; ++col) {
+            sprintf_s(cell_buf, sizeof(cell_buf), "자료(%d:%d)", row, col);
+            table_text[row][col] = cell_buf;
+        }
+    }
+
+    table_text[6][2] = "\x1B 2, 하나, 둘, 셋, 넷, 다섯";   // Stage 5 combo-cell demo
+
     TableBox* table = new TableBox;
-    table->set_cols(100, 15);
-    table->set_rows(25, 60);
+    table->set_cols(col_widths);
+    table->set_rows(row_heights);
     table->set_fixed(1, 1);
     table->set_callback(DefaultTableText, nullptr);
+    table->set_edit_callback(DefaultTableEdit, nullptr);
     table->set_font("Malgun Gothic", 10);
-    table->open(&Top, 5, 5, 8, 8);
+    table->open(&Top, 5, 5, 10, 8);
     Top.AddNew(0, 0, 0, 0, table);    // attach-only; keep the size/position open() computed
 
     CEdit*     edit   = Top.AddEdit  (685, 365, 875, 405);
