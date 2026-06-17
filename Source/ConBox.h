@@ -18,6 +18,9 @@
 //     ConBox itself is per-monitor aware: fonts/cell metrics use the window's own DPI (GetDpiForWindow)
 //     and it rebuilds them on a DPI change (WM_DPICHANGED_AFTERPARENT), so text stays correctly sized
 //     when the host window moves between monitors of different DPI.
+//   - Zoom (WM_JBZOOM from FrameBox): sets zoom_pm (x1000) and zoom_resize=true; next OnSize takes
+//     the relayout_for_dpi+snap_to_grid path (no PTY resize). eff_dpi()=box_dpi*zoom_pm/1000 drives
+//     build_font() and to_px() so fonts and scrollbar geometry scale with zoom like a DPI change.
 //   - Every string API takes UTF-8 (const char*) so C++ string literals pass directly.
 //   - Self-contained: includes its own headers, does not depend on a precompiled header.
 //   - Save .h/.cpp as ASCII (comments are ASCII-only) so encoding is unambiguous.
@@ -43,6 +46,11 @@
 // With no sink and no start(), it is a read-only viewer of print() output.
 
 #pragma once
+
+// Zoom message shared with FrameBox/TableBox (same numeric value in each module header).
+#ifndef WM_JBZOOM
+#define WM_JBZOOM  (WM_APP + 100)
+#endif
 
 // ConPTY (CreatePseudoConsole/HPCON/ResizePseudoConsole) is declared only on Win10 1809
 // (build 17763, RS5)+. afxwin.h pulls in windows.h, so set the minimum version before it.
@@ -304,11 +312,12 @@ protected:
     // for a top-level/popup ConBox: it applies the OS-suggested rect (lParam), and the resulting OnSize
     // does the font rebuild + grid preservation.
     afx_msg LRESULT OnDpiChanged(WPARAM w, LPARAM l);
+    afx_msg LRESULT OnJbZoom(WPARAM w, LPARAM l);  // WM_JBZOOM: update zoom_pm and flag next OnSize
     DECLARE_MESSAGE_MAP()
 
 private:
     // Build one font into font, leaving the resulting LOGFONT in lf_out and width ratio in width_pct.
-    void make_font(CFont& font, LOGFONTW& lf_out, int& width_pct, const char* name, float size, const char* option);
+    void build_font(CFont& font, LOGFONTW& lf_out, int& width_pct, const char* name, float size, const char* option);
 
     // Build the base font + its bold/italic/bold-italic variants from the stored spec members
     // (efont_*/kfont_*). Used by set_efont/set_kfont, open(), and DPI changes. The double-size
@@ -320,9 +329,10 @@ private:
     // the WM_DPICHANGED / WM_DPICHANGED_AFTERPARENT handlers.
     void relayout_for_dpi();
 
-    // Scale a 96 DPI pixel constant to the control's current DPI (identity at 96). Used for the
-    // overlay scrollbar geometry so it stays proportional on high-DPI monitors.
-    int  sbar_px(int base96) const { return ::MulDiv(base96, box_dpi > 0 ? box_dpi : 96, 96); }
+    // Effective DPI = real monitor DPI * zoom_pm / 1000. Used for all font/cell/scrollbar sizing.
+    int  eff_dpi()  const { int d = box_dpi > 0 ? box_dpi : 96; return max(1, ::MulDiv(d, zoom_pm, 1000)); }
+    // Scale a 96 DPI pixel constant to the effective DPI (identity at 96, zoom=1.0).
+    int  to_px(int base96) const { return ::MulDiv(base96, eff_dpi(), 96); }
 
     // Ensure a font spec exists for any font the host never set (English Cascadia Mono 12pt,
     // Korean Malgun Gothic match-mode). Specs only; the GDI build happens in build_efont/build_kfont.
@@ -534,9 +544,10 @@ private:
     std::string kfont_name, kfont_opts;
     float       kfont_size;
 
-    int box_dpi;            // control's current DPI; set in open() (from parent) and updated in OnSize
-                            // when the window's DPI changes. make_font uses it pre-window; sbar_px()
-                            // scales scrollbar px by it; OnSize compares it to detect a DPI change.
+    int  box_dpi;           // real monitor DPI; set in open() and updated in OnSize on a DPI change.
+                            // build_font uses it pre-window; OnSize compares it to detect a DPI change.
+    int  zoom_pm;           // zoom x1000 (1000=1.0x); set via WM_JBZOOM from FrameBox; eff_dpi() applies it
+    bool zoom_resize;       // true: next OnSize is zoom-triggered; skip update_metrics to preserve PTY grid
 
     bool kfont_match_efont; // on: match Korean height to English and base line height on English
                             // (turned on by set_kfont size<=0, default true)

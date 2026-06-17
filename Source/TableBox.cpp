@@ -10,7 +10,7 @@
 //   ctor/dtor         : TableBox, ~TableBox
 //   window/font       : open, build_font
 //   grid definition   : set_cols x2, set_rows x2, set_fixed, set_text_callback, set_font,
-//                        set_align, set_pad, set_edit_callback, set_edit_adjust
+//                        set_align, set_pad, set_grid_color, set_edit_callback, set_edit_adjust
 //   layout            : to_px, corner_w, corner_h, last_visible_row/col, max_scroll_row/col,
 //                        clamp_scroll
 //   painting          : ensure_back_buffer, draw_text_aligned, draw_block, draw_grid_lines,
@@ -327,9 +327,11 @@ TableBox::TableBox()
     font_opt.clear();
     ZeroMemory(&font_tm, sizeof(font_tm));
 
-    cell_align = 4;   // mid-left (matches the historical TextOutW default)
-    cell_pad   = 4;   // 96 DPI logical px
+    cell_align  = 4;              // mid-left (matches the historical TextOutW default)
+    cell_pad    = 4;              // 96 DPI logical px
+    grid_color  = RGB(191, 191, 191);
     box_dpi = 0;
+    zoom_pm = 1000;
 
     back_bmp_saved = nullptr;
     back_w = 0;
@@ -390,7 +392,7 @@ void TableBox::open(CWnd* parent, int x0, int y0, int rows, int cols)
 // open(), set_font() (if the window already exists), and OnSize on a DPI change.
 void TableBox::build_font()
 {
-    int dpi = box_dpi > 0 ? box_dpi : 96;
+    int dpi = eff_dpi();
     LOGFONTW lf = ParseFontOpts(font_name.c_str(), font_size, font_opt.c_str(), dpi);
     font.DeleteObject();
     font.Attach(::CreateFontIndirectW(&lf));
@@ -479,6 +481,12 @@ void TableBox::set_pad(int logical_px)
     if (::IsWindow(m_hWnd)) Invalidate();
 }
 
+void TableBox::set_grid_color(int r, int g, int b)
+{
+    grid_color = RGB(r, g, b);
+    if (::IsWindow(m_hWnd)) Invalidate(FALSE);
+}
+
 void TableBox::set_edit_adjust(int dx0, int dy0, int dx1, int dy1)
 {
     edit_adj_x0 = dx0;
@@ -489,7 +497,7 @@ void TableBox::set_edit_adjust(int dx0, int dy0, int dx1, int dy1)
 
 int TableBox::to_px(int logical96) const
 {
-    return ::MulDiv(logical96, box_dpi > 0 ? box_dpi : 96, 96);
+    return ::MulDiv(logical96, eff_dpi(), 96);
 }
 
 int TableBox::corner_w() const
@@ -1385,7 +1393,7 @@ void TableBox::draw_grid_lines(CDC& dc, int r0, int r1, int c0, int c1, int x0, 
     if (total_w <= 0 || total_h <= 0)
         return;
 
-    CPen pen(PS_SOLID, 1, RGB(191, 191, 191));   // Excel-like light gray gridlines
+    CPen pen(PS_SOLID, 1, grid_color);
     CPen* old = dc.SelectObject(&pen);
 
     int x = x0;
@@ -2114,6 +2122,7 @@ void TableBox::OnMouseLeave()
 void TableBox::OnTimer(UINT_PTR id)
 {
     if (id == SBAR_TIMER) {
+        int old_va = vsbar.alpha, old_ha = hsbar.alpha;
         bool any_visible = false;
 
         if (vsbar.dragging || vsbar.hover) {
@@ -2134,7 +2143,8 @@ void TableBox::OnTimer(UINT_PTR id)
 
         if (!any_visible)
             KillTimer(SBAR_TIMER);
-        Invalidate(FALSE);
+        if (vsbar.alpha != old_va || hsbar.alpha != old_ha)
+            Invalidate(FALSE);
         return;
     }
     CWnd::OnTimer(id);
@@ -2166,6 +2176,18 @@ void TableBox::OnTimer(UINT_PTR id)
 // corrupted state). English/ASCII input never raises these messages (handled by OnChar).
 LRESULT TableBox::WindowProc(UINT message, WPARAM wParam, LPARAM lParam)
 {
+    // WM_JBZOOM: FrameBox sends this before rescale_children()->MoveWindow so the new zoom_pm
+    // is active before OnSize redraws. build_font() and to_px() both use eff_dpi() = box_dpi*zoom_pm,
+    // so after MoveWindow->OnSize the table re-renders at the correct cell sizes automatically.
+    if (message == WM_JBZOOM) {
+        zoom_pm = static_cast<int>(wParam);
+        cancel_edit();
+        build_font();
+        clamp_scroll();
+        Invalidate();
+        return 0;
+    }
+
     if (message == WM_IME_STARTCOMPOSITION &&
         edit_cb != nullptr && edit_box == nullptr && combo_popup == nullptr &&
         cur_row >= fixed_rows && cur_col >= fixed_cols) {

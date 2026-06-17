@@ -7,7 +7,7 @@
 // === File layout (roughly this order) ===
 //   helpers (static): IsWideChar, ParseFontOpts, DrawBlockElement, DrawBoxLine
 //   message map     : BEGIN_MESSAGE_MAP ... END_MESSAGE_MAP
-//   window/font     : open, make_font, apply_default_fonts, build_efont, build_kfont, calc_cell_size,
+//   window/font     : open, build_font, apply_default_fonts, build_efont, build_kfont, calc_cell_size,
 //                     set_efont, set_kfont, relayout_for_dpi, set_builtin_glyphs
 //   color/cursor    : set_fg_color, set_bg_color, set_cursor_blend, set_cursor_blink, set_cursor, bump_cursor, remap_paper_color, OnTimer
 //   margin          : set_margin, grid_size
@@ -206,6 +206,7 @@ BEGIN_MESSAGE_MAP(ConBox, CWnd)
     ON_WM_SETFOCUS()
     ON_WM_KILLFOCUS()
     ON_MESSAGE(WM_DPICHANGED, &ConBox::OnDpiChanged)
+    ON_MESSAGE(WM_JBZOOM,    &ConBox::OnJbZoom)
     ON_MESSAGE(WM_IME_STARTCOMPOSITION, &ConBox::OnImeStart)
     ON_MESSAGE(WM_IME_COMPOSITION, &ConBox::OnImeComp)
     ON_MESSAGE(WM_IME_ENDCOMPOSITION, &ConBox::OnImeEnd)
@@ -227,7 +228,7 @@ static bool IsWideChar(wchar_t ch)
         || (ch >= 0xFFE0 && ch <= 0xFFE6);  // fullwidth signs
 }
 
-// Convert a font name/size + option string to a LOGFONTW. (Helper for make_font.)
+// Convert a font name/size + option string to a LOGFONTW. (Helper for build_font.)
 // option grammar: a number applies to the attribute letter that follows it.
 //   B=Bold (with a number = lfWeight), I=Italic, U=Underline, S=Strikeout,
 //   Q=Quality (0..6), W=Width ratio percent (100=default).
@@ -566,10 +567,12 @@ ConBox::ConBox()
     ZeroMemory(&kfont_lf, sizeof(kfont_lf));
 
     // Font specs (name/option default empty = "unset"; apply_default_fonts fills them). box_dpi 0 until
-    // open() sets it from the parent monitor; make_font then falls back to the primary monitor DPI.
+    // open() sets it from the parent monitor; build_font then falls back to the primary monitor DPI.
     efont_size = 0.0f;
     kfont_size = 0.0f;
-    box_dpi = 0;
+    box_dpi     = 0;
+    zoom_pm     = 1000;
+    zoom_resize = false;
 
     sel_active = false;
     selecting = false;
@@ -953,7 +956,7 @@ void ConBox::open(CWnd* parent, int left, int top)
 
     // Compute cell metrics before creating the window so the pixel size can be derived from the
     // configured grid. The window does not exist yet, so seed box_dpi from the parent's monitor DPI
-    // (a WS_CHILD inherits its parent's DPI under Per-Monitor V2); make_font uses it for the pt->px
+    // (a WS_CHILD inherits its parent's DPI under Per-Monitor V2); build_font uses it for the pt->px
     // conversion. Then ensure specs and build the fonts at that DPI. (Fonts the host set earlier via
     // setup_from_ini were built at the primary-monitor DPI; building again here corrects them.)
     box_dpi = (int)::GetDpiForWindow(parent->GetSafeHwnd());
@@ -1007,11 +1010,11 @@ void ConBox::open(CWnd* parent, int left, int top)
         start(cfg_cmdline.c_str());
 }
 
-void ConBox::make_font(CFont& font, LOGFONTW& lf_out, int& width_pct, const char* name, float size, const char* option)
+void ConBox::build_font(CFont& font, LOGFONTW& lf_out, int& width_pct, const char* name, float size, const char* option)
 {
     // Per-monitor DPI for pt->pixel conversion. Prefer the window's own DPI
     // (GetDpiForWindow) so the font matches the monitor the control lives on.
-    // make_font also runs BEFORE the window exists (set_efont/set_kfont via
+    // build_font also runs BEFORE the window exists (set_efont/set_kfont via
     // setup_from_ini, and build_efont/build_kfont inside open() before CreateWindowExW):
     // there GetDpiForWindow(NULL) returns 0. Fall back to box_dpi (set by open() from the
     // parent monitor), then to the primary-monitor DPI (GetDeviceCaps) if even that is unknown.
@@ -1022,6 +1025,7 @@ void ConBox::make_font(CFont& font, LOGFONTW& lf_out, int& width_pct, const char
         dpi = ::GetDeviceCaps(hdc, LOGPIXELSY);
         ::ReleaseDC(NULL, hdc);
     }
+    dpi = ::MulDiv(dpi, zoom_pm, 1000);   // apply zoom: effective font size = real DPI * zoom ratio
 
     lf_out = ParseFontOpts(name, size, option, dpi, width_pct);
     font.DeleteObject();
@@ -1185,10 +1189,10 @@ void ConBox::calc_cell_size()
     }
 }
 
-// Build efont + variants from the stored efont_* spec at the current DPI (make_font).
+// Build efont + variants from the stored efont_* spec at the current DPI (build_font).
 void ConBox::build_efont()
 {
-    make_font(efont, efont_lf, efont_width_pct, efont_name.c_str(), efont_size, efont_opts.c_str());
+    build_font(efont, efont_lf, efont_width_pct, efont_name.c_str(), efont_size, efont_opts.c_str());
     MakeFontVariant(efont_bold,        efont_lf, true,  false);
     MakeFontVariant(efont_italic,      efont_lf, false, true);
     MakeFontVariant(efont_bold_italic, efont_lf, true,  true);
@@ -1198,7 +1202,7 @@ void ConBox::build_efont()
 // Build kfont + variants from the stored kfont_* spec; size<=0 keeps match mode.
 void ConBox::build_kfont()
 {
-    make_font(kfont, kfont_lf, kfont_width_pct, kfont_name.c_str(), kfont_size, kfont_opts.c_str());
+    build_font(kfont, kfont_lf, kfont_width_pct, kfont_name.c_str(), kfont_size, kfont_opts.c_str());
     MakeFontVariant(kfont_bold,        kfont_lf, true,  false);
     MakeFontVariant(kfont_italic,      kfont_lf, false, true);
     MakeFontVariant(kfont_bold_italic, kfont_lf, true,  true);
@@ -1273,6 +1277,17 @@ LRESULT ConBox::OnDpiChanged(WPARAM, LPARAM l)
     if (r)
         ::SetWindowPos(m_hWnd, nullptr, r->left, r->top,
                        r->right - r->left, r->bottom - r->top, SWP_NOZORDER | SWP_NOACTIVATE);
+    return 0;
+}
+
+LRESULT ConBox::OnJbZoom(WPARAM w, LPARAM)
+{
+    // FrameBox sends WM_JBZOOM before calling rescale_children() -> MoveWindow -> OnSize.
+    // Set zoom_pm so build_font() uses the new ratio, and flag the next OnSize as zoom-triggered
+    // so it takes the relayout_for_dpi() path (preserves grid, no PTY resize) instead of
+    // update_metrics() (which would recompute cols/rows and resize the PTY).
+    zoom_pm     = static_cast<int>(w);
+    zoom_resize = true;
     return 0;
 }
 
@@ -1438,7 +1453,7 @@ void ConBox::OnTimer(UINT_PTR id)
         if (sbar_geometry(track, thumb)) {
             CRect full;
             GetClientRect(&full);
-            CRect gutter(full.right - sbar_px(SBAR_W), full.top, full.right, full.bottom);
+            CRect gutter(full.right - to_px(SBAR_W), full.top, full.right, full.bottom);
             InvalidateRect(&gutter, FALSE);
         }
         return;
@@ -1555,8 +1570,8 @@ void ConBox::update_metrics()
     CRect rc;
     GetClientRect(&rc);
 
-    // Margins are 96 DPI logical; scale to physical at box_dpi before subtracting from the client.
-    int dpi = box_dpi > 0 ? box_dpi : 96;
+    // Margins are 96 DPI logical; scale to physical at eff_dpi() before subtracting from the client.
+    int dpi = eff_dpi();
     int avail_w = rc.Width()  - ::MulDiv(margin_left, dpi, 96) - ::MulDiv(margin_right, dpi, 96);
     int avail_h = rc.Height() - ::MulDiv(margin_top,  dpi, 96) - ::MulDiv(margin_bottom, dpi, 96);
     cols = (cell_w > 0) ? (avail_w / cell_w) : 1;
@@ -1606,7 +1621,7 @@ void ConBox::snap_to_grid()
     if (snap_mode <= 0)
         return;
 
-    int dpi = box_dpi > 0 ? box_dpi : 96;
+    int dpi = eff_dpi();
     int need_w = cols * cell_w + ::MulDiv(margin_left, dpi, 96) + ::MulDiv(margin_right, dpi, 96);
     int need_h = rows * cell_h + ::MulDiv(margin_top,  dpi, 96) + ::MulDiv(margin_bottom, dpi, 96);
 
@@ -2349,9 +2364,11 @@ void ConBox::OnSize(UINT type, int cx, int cy)
     // not depend on WM_DPICHANGED_*PARENT timing. A genuine user resize has cur == box_dpi and falls
     // through to the normal grid recompute.
     int cur = (int)::GetDpiForWindow(m_hWnd);
-    if (cur > 0 && cur != box_dpi) {
-        relayout_for_dpi();
-        snap_to_grid();   // grow (never shrink) so the preserved grid is not clipped at the new DPI
+    bool dpi_changed = (cur > 0 && cur != box_dpi);
+    if (dpi_changed || zoom_resize) {
+        zoom_resize = false;
+        relayout_for_dpi();   // rebuilds fonts via build_font() which applies zoom_pm
+        snap_to_grid();       // adjusts window size per snap_mode; uses eff_dpi() for margins
         return;
     }
 
@@ -2391,13 +2408,13 @@ bool ConBox::sbar_geometry(CRect& track, CRect& thumb) const
 
     // Gutter is a thin strip at the right edge (mostly over the right margin, so it barely covers text).
     // Track runs between the two arrow buttons (each SBAR_BTN_H px tall at the gutter top/bottom).
-    track.SetRect(rc.right - sbar_px(SBAR_W), rc.top + sbar_px(SBAR_BTN_H), rc.right, rc.bottom - sbar_px(SBAR_BTN_H));
+    track.SetRect(rc.right - to_px(SBAR_W), rc.top + to_px(SBAR_BTN_H), rc.right, rc.bottom - to_px(SBAR_BTN_H));
 
     int track_h = track.Height();
     if (track_h <= 0)
         return false;
     int thumb_h = (int)((double)track_h * rows / total);
-    int min_thumb = sbar_px(SBAR_MIN_THUMB);
+    int min_thumb = to_px(SBAR_MIN_THUMB);
     if (thumb_h < min_thumb) thumb_h = min_thumb;
     if (thumb_h > track_h)        thumb_h = track_h;
 
@@ -2406,8 +2423,8 @@ bool ConBox::sbar_geometry(CRect& track, CRect& thumb) const
     if (thumb_y > track.bottom - thumb_h)  thumb_y = track.bottom - thumb_h;
 
     // Thumb is a slim bar near the edge, inset by SBAR_INSET (does not touch the very right edge).
-    int thumb_w = sbar_px(SBAR_THUMB_W);
-    int tx = track.right - sbar_px(SBAR_INSET) - thumb_w;
+    int thumb_w = to_px(SBAR_THUMB_W);
+    int tx = track.right - to_px(SBAR_INSET) - thumb_w;
     thumb.SetRect(tx, thumb_y, tx + thumb_w, thumb_y + thumb_h);
     return true;
 }
@@ -2425,7 +2442,7 @@ void ConBox::sbar_show()
     SetTimer(SBAR_TIMER, SBAR_FADE_TICK_MS, NULL);
     CRect full;
     GetClientRect(&full);
-    CRect gutter(full.right - sbar_px(SBAR_W), full.top, full.right, full.bottom);
+    CRect gutter(full.right - to_px(SBAR_W), full.top, full.right, full.bottom);
     InvalidateRect(&gutter, FALSE);
 }
 
@@ -2567,15 +2584,15 @@ void ConBox::draw_overlay_scrollbar(CDC& dc)
 
     CRect rc_full;
     GetClientRect(&rc_full);
-    CRect gutter(rc_full.right - sbar_px(SBAR_W), rc_full.top, rc_full.right, rc_full.bottom);
+    CRect gutter(rc_full.right - to_px(SBAR_W), rc_full.top, rc_full.right, rc_full.bottom);
     FillTranslucent(dc, gutter, gutter_color, (BYTE)(SBAR_GUTTER_OP * sbar_alpha / 255));
 
     // The thumb: translucent (idle) or brighter (hover/drag), rounded, fading by sbar_alpha.
     int opcap = active ? SBAR_OP_HOVER : SBAR_OP_IDLE;
-    DrawRoundedThumb(dc, thumb, thumb_color, opcap, sbar_px(SBAR_RADIUS), (BYTE)sbar_alpha);
+    DrawRoundedThumb(dc, thumb, thumb_color, opcap, to_px(SBAR_RADIUS), (BYTE)sbar_alpha);
 
     // Arrow buttons at gutter top/bottom (same opacity as thumb).
-    int sw = sbar_px(SBAR_W), bh = sbar_px(SBAR_BTN_H);
+    int sw = to_px(SBAR_W), bh = to_px(SBAR_BTN_H);
     CRect btn_up(rc_full.right - sw, rc_full.top, rc_full.right, rc_full.top + bh);
     CRect btn_dn(rc_full.right - sw, rc_full.bottom - bh, rc_full.right, rc_full.bottom);
     DrawTriangle(dc, btn_up, thumb_color, opcap, (BYTE)sbar_alpha, true);
@@ -2755,10 +2772,10 @@ void ConBox::OnLButtonDown(UINT flags, CPoint pt)
     if (sbar_geometry(track, thumb)) {
         CRect full;
         GetClientRect(&full);
-        CRect gutter(full.right - sbar_px(SBAR_W), full.top, full.right, full.bottom);
+        CRect gutter(full.right - to_px(SBAR_W), full.top, full.right, full.bottom);
         if (gutter.PtInRect(pt)) {
             int maxtop = (int)scrollback.size();
-            int bh = sbar_px(SBAR_BTN_H);
+            int bh = to_px(SBAR_BTN_H);
             CRect btn_up(gutter.left, gutter.top, gutter.right, gutter.top + bh);
             CRect btn_dn(gutter.left, gutter.bottom - bh, gutter.right, gutter.bottom);
             if (btn_up.PtInRect(pt)) {
@@ -2815,7 +2832,7 @@ void ConBox::OnLButtonDblClk(UINT flags, CPoint pt)
     CRect track, thumb;
     if (sbar_geometry(track, thumb)) {
         CRect full; GetClientRect(&full);
-        if (CRect(full.right - sbar_px(SBAR_W), full.top, full.right, full.bottom).PtInRect(pt))
+        if (CRect(full.right - to_px(SBAR_W), full.top, full.right, full.bottom).PtInRect(pt))
             return;
     }
 
@@ -2908,7 +2925,7 @@ void ConBox::OnMouseMove(UINT flags, CPoint pt)
         if (has) {
             CRect full;
             GetClientRect(&full);
-            gutter_rc.SetRect(full.right - sbar_px(SBAR_W), full.top, full.right, full.bottom);
+            gutter_rc.SetRect(full.right - to_px(SBAR_W), full.top, full.right, full.bottom);
         }
         bool in = has && gutter_rc.PtInRect(pt);
         if (in && !sbar_hover) {
@@ -2947,7 +2964,7 @@ void ConBox::OnMouseLeave()
         if (sbar_geometry(track, thumb)) {
             CRect full;
             GetClientRect(&full);
-            CRect gutter(full.right - sbar_px(SBAR_W), full.top, full.right, full.bottom);
+            CRect gutter(full.right - to_px(SBAR_W), full.top, full.right, full.bottom);
             InvalidateRect(&gutter, FALSE);
         }
     }

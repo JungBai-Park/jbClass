@@ -11,6 +11,9 @@
 //     the overlay scrollbar below is a from-scratch reimplementation of the ConBox style).
 //   - All coordinates passed to open()/set_cols/set_rows are 96 DPI logical px, scaled to
 //     physical px at the window's own DPI (GetDpiForWindow), same convention as ConBox/FrameBox.
+//   - Zoom (WM_JBZOOM from FrameBox): sets zoom_pm (x1000); eff_dpi()=box_dpi*zoom_pm/1000 drives
+//     build_font() and to_px() so fonts and cell geometry scale with zoom like a DPI change.
+//     build_font() and to_px() match ConBox's naming convention for the same operations.
 //
 // --- Usage ---
 //     TableBox* table = new TableBox;
@@ -28,6 +31,11 @@
 //     // A FrameBox host may then attach it like any CWnd*, e.g. Top.AddNew(0,0,0,0, table).
 //
 #pragma once
+
+// Zoom message shared with FrameBox/ConBox (same numeric value in each module header).
+#ifndef WM_JBZOOM
+#define WM_JBZOOM  (WM_APP + 100)
+#endif
 
 // Self-contained: define these before afxwin.h pulls in windows.h, same as ConBox.h, in case
 // this header is included without FrameBox.h/ConBox.h having run first.
@@ -118,6 +126,9 @@ public:
     // Inner padding (96 DPI logical px) applied to both left and right of the text rect inside
     // each cell. Also used as the gap between the combo label and the arrow button. Default is 4.
     void set_pad(int logical_px);
+
+    // Grid line color (RGB). Default is RGB(191,191,191). Can be called before or after open().
+    void set_grid_color(int red, int green, int blue);
 
 protected:
     // Default rendering: normal body-cell white + text aligned per set_align(); fixed cell an
@@ -419,9 +430,12 @@ private:
     CFont       font;
     TEXTMETRICW font_tm;
 
-    int cell_align; // numpad-style text alignment (1-9); set by set_align(), default 4 (mid-left)
-    int cell_pad;   // inner left/right text padding (96 DPI logical px); set by set_pad(), default 4
-    int box_dpi;    // control's current DPI; set in open() and updated in OnSize on a DPI change
+    int cell_align;    // numpad-style text alignment (1-9); set by set_align(), default 4 (mid-left)
+    int cell_pad;      // inner left/right text padding (96 DPI logical px); set by set_pad(), default 4
+    COLORREF grid_color; // grid line color; set by set_grid_color(), default RGB(191,191,191)
+    int box_dpi;       // real monitor DPI; set in open() and updated in OnSize on a DPI change
+    int zoom_pm;       // zoom x1000 (1000=1.0x); set via WM_JBZOOM from FrameBox
+    int eff_dpi() const { int d = box_dpi > 0 ? box_dpi : 96; return max(1, ::MulDiv(d, zoom_pm, 1000)); }
 
     CDC      back_dc;          // persistent memory DC (double-buffered paint)
     CBitmap  back_bmp;         // back buffer bitmap (matches client size)

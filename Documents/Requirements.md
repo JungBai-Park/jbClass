@@ -39,6 +39,7 @@ Project-wide environment, encoding, folder, build, and coding rules are defined 
   - Escape restores the `last_rect` captured before entering edit mode and does not rewrite source code.
   - Leaving edit mode by clicking the middle mouse button again does not rewrite source code.
   - The Enter and Escape key events are fully consumed by the edit session. The trailing `WM_CHAR` (`'\r'` or `'\x1b'`) that `TranslateMessage` posts before the subclass proc runs is discarded via `PeekMessageW` so it does not reach the child window.
+- **Zoom-invariant layout editing**: all physical↔logical pixel conversions in `Parasite` (`enter_edit`, `leave_edit` ESC restore, commit/source rewrite) use `eff_dpi()` (= `MulDiv(real_dpi, zoom_pm, 1000)`) so the written 96 DPI logical coordinates are correct regardless of active zoom level. `Parasite` holds `FrameBox* owner_frame` (set by every factory via `set_owner(this)`); `friend class Parasite` in `FrameBox` grants access to the protected `eff_dpi()`. Factory placement (`finish_child`, `make_child`, `attach_external`) also uses `eff_dpi()` for the initial `MoveWindow`. `make_child` propagates the parent's `zoom_pm` to the newly created child `FrameBox` so both share a consistent `eff_dpi()` at construction time.
 
 ### 1.4 Host Framework Interoperability
 
@@ -70,6 +71,11 @@ Project-wide environment, encoding, folder, build, and coding rules are defined 
 - The root `FrameBox` is a STACK LOCAL inside the modal-loop driver (e.g. `DemoMain()`): `FrameBox Top; Top.OpenFrame(&theApp, ...);`. `~FrameBox` runs at scope exit, releasing the root and all its heap members (controls, attached `ConBox`, `Parasite`s) before the CRT exit leak snapshot, so no global cleanup call and no global/static window object are needed.
 - **DPI coordinate convention**: all coordinates passed to `Add*`/`OpenFrame` macros are **96 DPI logical pixels**. `FrameBox::open()` and `add_*` factories scale them to physical pixels using `MulDiv(coord, monitor_dpi, 96)` at creation time. The target monitor DPI is determined via `MonitorFromPoint` + `GetDpiForMonitor` on the center of the intended rect.
 - `FrameBox` retrieves a DPI-correct system font via `SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS)` and sends it to every registered child control via `WM_SETFONT` at creation. The font is stored as `sys_font` and freed in `close()`.
+- **Ctrl+Wheel zoom**: `FrameBox::PreTranslateMessage` intercepts `WM_MOUSEWHEEL` with `MK_CONTROL` before any child handles it. Each wheel detent changes `zoom_pm` by ±100 (clamped to [500, 3000]; 1000 = 1.0×). `eff_dpi() = MulDiv(dpi, zoom_pm, 1000)` is the effective DPI used for all child layout and font sizing. When the cursor is inside the frame, the pixel under the cursor is kept fixed on screen (cursor-anchor mode).
+- `WM_JBZOOM = WM_APP + 100`: sent to every registry child **before** `rescale_children()` → `MoveWindow` so ConBox/TableBox set their `zoom_pm` (and any needed flags) before `OnSize` fires. Each module header (`FrameBox.h`, `ConBox.h`, `TableBox.h`) defines the constant independently under an `#ifndef` guard with the same numeric value. Child-zone FrameBoxes receiving `WM_JBZOOM` forward it to their own children, rebuild `sys_font`, and call `rescale_children()` (no self-resize — parent's `rescale_children` handles their window size).
+- `apply_zoom(int new_pm, bool cursor_anchor)` is `virtual protected` so subclasses can override it to add post-zoom actions (e.g. updating a title bar display) by calling `FrameBox::apply_zoom` then their own code.
+- `dpi`, `zoom_pm`, `eff_dpi()`, and `apply_zoom` are in the `protected` section to allow subclass access without `friend` declarations.
+- `set_margin(int margin_96)`: when `margin_96 >= 0`, after every `rescale_children()` call `fit_to_children()` reads each WS_CHILD's actual rect (`GetWindowRect` + `ScreenToClient`) to find the maximum right/bottom edge, then calls `SetWindowPos(SWP_NOMOVE)` to size FrameBox's client area to fit all children plus `MulDiv(margin_96, eff_dpi(), 96)` physical pixels of padding. `AdjustWindowRectEx` accounts for the non-client area. Default `-1` = disabled. Because `snap_to_grid()` inside ConBox runs synchronously within `MoveWindow`, `fit_to_children()` always sees the post-snap final child sizes.
 
 ## 2. ConBox
 
@@ -91,6 +97,7 @@ Project-wide environment, encoding, folder, build, and coding rules are defined 
 - `ConBox` is per-monitor DPI aware: fonts/cell metrics use the window's own DPI and rebuild when it changes. A DPI change must rescale only the cell pixels and KEEP the grid (rows/cols) fixed, so the child pseudo-console is not resized (a resize would make the shell re-emit its screen and corrupt scrollback). Font sizes are stored as DPI-independent specs so they can be rebuilt at the new DPI; overlay scrollbar pixel metrics scale with DPI.
 - Margins are 96 DPI LOGICAL padding used ONLY to compute the initial window size and to derive rows/cols on resize (scaled to physical via the window DPI); `adjust` padding stays in raw physical pixels. The grid is NOT drawn at the margin offset: it is centered in the client area, and when it overflows it is drawn from the top-left and clipped at the bottom/right.
 - Because cell pixels do not scale by the exact DPI ratio (integer font rounding), a preserved grid may not fit the linearly-scaled window after a DPI change. The `snap_mode` ini option controls the response: 0 = centering only (clip if too small); 1 = grow the window only when the grid would be clipped; 2 (default) = always snap the window to the exact grid+margin size. Snapping keeps the upper-left corner fixed and moves the right/bottom edges, and never resizes the pseudo-console.
+- **Zoom via `WM_JBZOOM`**: On receipt, ConBox sets `zoom_pm` and `zoom_resize = true`. The next `OnSize` (triggered by FrameBox `rescale_children` → `MoveWindow`) detects `zoom_resize` and takes the `relayout_for_dpi()` + `snap_to_grid()` path — identical to a real DPI change — preserving the logical grid without calling `update_metrics` or `resize_sink` (no PTY resize). `build_font()` applies `zoom_pm` through `eff_dpi()` so fonts scale with zoom exactly as they do with DPI changes.
 
 ### 2.3 Font and Cell Metrics
 
@@ -200,10 +207,11 @@ Project-wide environment, encoding, folder, build, and coding rules are defined 
 - Each bar has arrow buttons at both ends that move one row/col per click; clicking the empty track between the thumb and an arrow pages by 3/4 of the visible extent.
 - The vertical and horizontal bars never both show at once: in the shared corner where their hit zones overlap, whichever bar is already showing keeps the interaction; vertical wins when neither (or both) is showing.
 
-### 3.5 DPI Awareness
+### 3.5 DPI Awareness and Zoom
 
 - Per-monitor DPI aware. The initial render uses the creating monitor's DPI; a runtime DPI change (window moved to a different-DPI monitor) rebuilds the font and recomputes cell pixels.
 - The DPI change is handled in `OnSize` by comparing `GetDpiForWindow` to the stored DPI (same pattern as ConBox). Because rows/cols are fixed by `set_cols`/`set_rows` and there is no child process, the grid is simply re-rendered at the new DPI; ConBox's "preserve grid, do not resize the PTY" constraint does not apply.
+- **Zoom via `WM_JBZOOM`**: On receipt, TableBox sets `zoom_pm`, cancels any active in-place editor, calls `build_font()` (which uses `eff_dpi() = MulDiv(box_dpi, zoom_pm, 1000)`), clamps scroll, and invalidates. The subsequent `MoveWindow` from FrameBox's `rescale_children` fires `OnSize`, which redraws all cell geometry through `to_px()` at the new effective DPI.
 
 ### 3.6 Selection and Keyboard Navigation
 

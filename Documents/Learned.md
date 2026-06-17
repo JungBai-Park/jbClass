@@ -168,6 +168,18 @@ This file records project-specific pitfalls and implementation details that are 
   ownership. Requires `<shellscalingapi.h>` and `Shcore.lib` (added to FrameBox.cpp).
 - `FrameBox::open_core` now uses this approach for all window creation paths.
 
+### 3.10 Parasite::set_owner Must Be Called in Every Factory That Creates a Parasite
+
+- `Parasite::eff_dpi()` returns `owner_frame->eff_dpi()` (zoom-aware) when `owner_frame != nullptr`,
+  and falls back to `GetDpiForWindow(h)` (zoom-unaware) otherwise. The fallback is silent --
+  no crash, but layout editing at zoom != 100% writes inflated/deflated coords to source.
+- Every site in FrameBox.cpp that does `new Parasite` must call `p->set_owner(this)` immediately
+  after `p->attach(wnd)`. Current sites: `finish_child`, `make_child`, `attach_external`,
+  `open_core` (self_layout). If a new factory is added without `set_owner`, zoom-aware editing
+  silently breaks for controls created by that factory.
+- `make_child` additionally propagates `child->zoom_pm = zoom_pm` so the new child FrameBox
+  shares the parent's effective DPI from the moment of creation.
+
 ### 3.8 Frame Self-Edit: Child Input Isolation
 
 - A `FrameBox` self-edit subclasses the FRAME's HWND, but the frame's child controls are separate HWNDs. The frame's `Parasite::dispatch` eats input only for the frame window, so children still hover-highlighted and stole focus, and arrow keys went to the focused child instead of moving the frame.
@@ -244,7 +256,7 @@ This file records project-specific pitfalls and implementation details that are 
   and calls `resize_sink` -> `ResizePseudoConsole`, the child shell RE-EMITS its visible screen
   (ConPTY reflow, see 4.6). Our terminal then appended it -> scrollback duplicated/grew on every
   monitor switch; an intermediate wrong-size recompute also truncated content (lost lines).
-- `make_font` runs BEFORE the window exists (set_efont/set_kfont via setup_from_ini, and the
+- `build_font` runs BEFORE the window exists (set_efont/set_kfont via setup_from_ini, and the
   pre-create font build in `open()`), so `GetDpiForWindow(NULL)` returns 0 there. Resolve DPI as:
   `GetDpiForWindow(m_hWnd)` if the window exists, else `box_dpi` (seeded from the parent monitor in
   `open()`), else primary-monitor `GetDeviceCaps`. Naively swapping in `GetDpiForWindow(m_hWnd)`
@@ -447,3 +459,47 @@ This file records project-specific pitfalls and implementation details that are 
   runs on an already-UTF-16 `wParam`. Verified working in BOTH MBCS and Unicode `Debug|x64` builds.
 - Do NOT re-post `WM_IME_STARTCOMPOSITION` to the EDIT: `SetFocus` already connected the IME, and an
   empty (0,0) re-start corrupts the composition (first jamo paints as `?`).
+
+## 6. Cross-Module Zoom (WM_JBZOOM)
+
+### 6.1 WM_JBZOOM Must Be Sent BEFORE rescale_children() / MoveWindow
+
+- ConBox needs `zoom_pm` set and `zoom_resize = true` BEFORE `MoveWindow` triggers `OnSize`.
+  `OnSize` reads `zoom_resize` at entry to decide between `relayout_for_dpi` (zoom/DPI path,
+  no PTY resize) and `update_metrics` (user-resize path, may resize PTY). If `WM_JBZOOM` arrives
+  after `MoveWindow`, `OnSize` already ran with `zoom_resize = false` and took the wrong path.
+- Same principle for TableBox: `build_font()` inside `WM_JBZOOM` uses the new `eff_dpi()` so the
+  font is correct when `OnSize` → `Invalidate` runs.
+- Rule: always send `WM_JBZOOM` to all children BEFORE calling `rescale_children()`.
+
+### 6.2 snap_to_grid Is Synchronous -- fit_to_children Reads the Final Size Immediately
+
+- ConBox's `snap_to_grid()` calls `SetWindowPos(m_hWnd, ...)` which, for a same-thread window,
+  runs synchronously and delivers `WM_SIZE` → `OnSize` before returning. This entire chain
+  executes INSIDE the single `MoveWindow(ConBox)` call in `rescale_children()`.
+- When `rescale_children()` returns, ConBox already has its final post-snap window size.
+  `fit_to_children()` (called at the end of `rescale_children`) can therefore read the actual
+  `GetWindowRect` of each child and compute the correct FrameBox size immediately -- no deferred
+  message, timer, or callback is needed.
+
+### 6.3 ConBox zoom_resize Flag: Why It Is Needed
+
+- A zoom-triggered `OnSize` has `cur == box_dpi` (no real monitor DPI change), so the existing
+  `cur != box_dpi` guard in `OnSize` would fall through to `update_metrics()` → potential PTY
+  resize and grid recompute.
+- `WM_JBZOOM` handler sets `zoom_resize = true` before the `MoveWindow` that fires `OnSize`.
+  `OnSize` checks `dpi_changed || zoom_resize`; if either is true, clears `zoom_resize` and
+  takes the `relayout_for_dpi` + `snap_to_grid` path (no PTY resize).
+
+### 6.4 apply_zoom Must Be virtual+protected for Subclass Title-Bar Hooks
+
+- Ctrl+Wheel calls `apply_zoom()` directly (not via a message), so subclasses cannot intercept
+  it through `WindowProc`. Making `apply_zoom` `virtual protected` lets a subclass override it:
+  call `FrameBox::apply_zoom(new_pm, anchor)` then update a title bar or status indicator.
+- `dpi` and `zoom_pm` are also `protected` (not `private`) so the override can read them.
+
+### 6.5 Naming Unification: ConBox build_font / to_px
+
+- ConBox previously used `make_font` (TableBox uses `build_font`) and `sbar_px` (TableBox uses
+  `to_px`) for the same concepts. Renamed to `build_font` / `to_px` in ConBox to match TableBox.
+- If divergence reappears in future sessions, the canonical names are `build_font` and `to_px`.

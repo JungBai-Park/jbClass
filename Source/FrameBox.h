@@ -24,6 +24,16 @@
          change, combo=selection/edit change, etc.); controls with no useful
          user-change signal get an empty list.
 
+    ZOOM-AWARE EDITING
+    ------------------
+    All phys<->logical conversions in Parasite (enter_edit, leave_edit ESC restore,
+    and commit/source rewrite) use eff_dpi() = MulDiv(real_dpi, zoom_pm, 1000) so
+    source rewrites are correct at any zoom level. Parasite holds owner_frame
+    (FrameBox*, set via set_owner()) and accesses FrameBox::eff_dpi() through the
+    friend class Parasite declaration in FrameBox. Every FrameBox factory that creates
+    a Parasite must call p->set_owner(this); omitting it silently falls back to
+    GetDpiForWindow (zoom-unaware). Compiled only in _DEBUG builds.
+
     DEPENDENCIES
     ------------
     Standard MFC (CWnd/CRect/CClientDC) + comctl32 SetWindowSubclass. No other
@@ -49,6 +59,7 @@
         // a stack local; ~FrameBox tears everything down at scope exit. Using a
         // member call (not a ctor) lets a FrameBox SUBCLASS override WindowProc etc.
         FrameBox  Top;  Top.OpenFrame(&theApp, 560,275, 1360,875);  // main + self live-edit
+        Top.set_margin(5);  // optional: auto-fit frame to children + 5 logical px padding
         CEdit*    e = Top.AddEdit  (10, 10,200, 30);
         CButton*  b = Top.AddButton(10, 50,100, 30, "OK");
         CComboBox*c = Top.AddCombo (10, 90,200, 60, "A,B,C");
@@ -58,6 +69,14 @@
         }
         // Modal sub-dialog: FrameBox Sub;  Sub.OpenFrame(&Top, ...); disables Top
         // until Sub goes out of scope (close() re-enables Top).
+        //
+        // Ctrl+Wheel zoom: FrameBox intercepts WM_MOUSEWHEEL+MK_CONTROL via
+        // PreTranslateMessage and calls apply_zoom(). Zoom is expressed as zoom_pm
+        // (integer x1000; 1000=1.0x; range [500,3000]). eff_dpi() = dpi*zoom_pm/1000
+        // is used by rescale_children() and sys_font build. WM_JBZOOM (WM_APP+100)
+        // is broadcast to all registry children before MoveWindow so they apply zoom
+        // before their OnSize fires. apply_zoom is virtual+protected so subclasses
+        // can hook it (e.g. update a title bar) by overriding and calling base first.
 
     HOST CONTRACT (message protocol; constants below are shared with any host)
     -------------------------------------------------------------------------
@@ -85,6 +104,8 @@
 
 #pragma once
 
+class FrameBox;   // forward decl for Parasite::set_owner / Parasite::eff_dpi
+
 #ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x0A00
 #endif
@@ -107,6 +128,12 @@ enum {
 
 // Subclass id used by SetWindowSubclass for the subclass procedure.
 #define ID_LAYOUT      0xCAFE
+
+// Zoom message: wParam = zoom_pm (zoom x1000; 1000=1.0x). Sent by FrameBox to all registry children
+// before rescale_children() so ConBox/TableBox update their internal zoom before MoveWindow fires OnSize.
+#ifndef WM_JBZOOM
+#define WM_JBZOOM  (WM_APP + 100)
+#endif
 
 
 class Parasite {
@@ -168,6 +195,11 @@ public:
     static HWND editing_hwnd() { return NULL; }
 #endif
 
+    // Set the owning FrameBox so Parasite can call eff_dpi() during layout edit,
+    // making phys<->logical conversion zoom-aware. Called by FrameBox factories.
+    // No-op in Release (edit machinery is compiled out).
+    void set_owner(FrameBox* fb);
+
 private:
     // non-copyable: it stores target identity and subclass state.
     Parasite(const Parasite&);
@@ -187,7 +219,9 @@ private:
     void    on_drag(HWND hWnd, LPARAM lParam);
     void    paint_frame(HWND hWnd);
     void    get_rect(HWND hWnd, CRect& out);
+    int     eff_dpi() const;   // owner_frame->eff_dpi(), zoom-aware phys<->logical
     static Parasite*& active();
+    FrameBox* owner_frame;     // set by set_owner(); null until a FrameBox factory attaches us
 #endif
 
     enum { MAX_SIGNAL_CODES = 12 };
@@ -305,6 +339,12 @@ public:
     // this. period <= 0: cancel. Returns 0 on success or GetLastError() on failure.
     int timer(int period);
 
+    // Auto-fit FrameBox size to its children after every rescale_children().
+    // margin_96: extra padding (96 DPI logical px, zoom-scaled) beyond the
+    // rightmost/bottommost child edge. Call before or after open().
+    // Default -1 = disabled (FrameBox keeps the size set by open/zoom/DPI change).
+    void set_margin(int margin_96) { snap_margin = margin_96; }
+
     // Modal wait until one of the listed controls signals. Returns its CWnd*
     // (or 0 if the window was closed, or this if the timer fired).
     template<class... Args>
@@ -354,6 +394,13 @@ protected:
     virtual void    PostNcDestroy() override {}
     DECLARE_MESSAGE_MAP()
 
+protected:
+    // Subclass-accessible: read-only DPI/zoom state, and apply_zoom for override hooks.
+    int       dpi;      // real monitor DPI; updated on WM_DPICHANGED
+    int       zoom_pm;  // zoom x1000 (1000=1.0x); range [500,3000]; Ctrl+Wheel adjusts
+    int       eff_dpi() const { return max(1, ::MulDiv(dpi, zoom_pm, 1000)); }
+    virtual void apply_zoom(int new_pm, bool cursor_anchor); // Ctrl+Wheel zoom: update zoom_pm, resize, rescale
+
 private:
     // Registry entry: wnd==nullptr means borrowed (add_asitis) -- destroy nothing.
     struct ChildEntry { CWnd* wnd; Parasite* layout; };
@@ -367,8 +414,10 @@ private:
     CWnd*     attach_external(CWnd* wnd, bool owned, int x0,int y0,int x1,int y1,const char* f,int ln);
     CWnd*     listen_core(int count, CWnd** list);
     void      surveil(int count, CWnd** list, bool on);
-    void      rescale_children();   // reposition WS_CHILD entries + reapply sys_font at current dpi
+    void      rescale_children();   // reposition WS_CHILD entries + reapply sys_font at eff_dpi()
+    void      fit_to_children();   // if snap_margin>=0: resize FrameBox to wrap all child rects + margin
 
+    friend class Parasite;   // Parasite::eff_dpi() calls protected FrameBox::eff_dpi()
     std::vector<ChildEntry> registry;     // children this frame owns
     int       next_id;                    // per-instance control id counter
     CWinApp*  app;                        // set by attach(); non-null only for the main window
@@ -378,8 +427,8 @@ private:
     bool      timer_fired;                // set by WM_TIMER while waiting, consumed by listen_core
     CWnd*     event;
     UINT_PTR  timer_id;                   // 0 = no active timer
-    int       dpi;                        // DPI at window creation; updated on WM_DPICHANGED (Step 3)
-    HFONT     sys_font;                   // DPI-correct message font; created in open()/make_child(), freed in close()
+    int       snap_margin;                // set_margin() value (96 DPI logical px); -1 = disabled
+    HFONT     sys_font;                   // DPI-correct message font at eff_dpi(); created in open()/make_child(), freed in close()
 };
 
 // ---- Factory macros: member-call form that injects __FILE__/__LINE__ ----

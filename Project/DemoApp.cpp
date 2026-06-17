@@ -9,12 +9,15 @@
     FALSE; DemoMain drives everything through listen() and ~FrameBox tears down
     all children + clears m_pMainWnd at scope exit.
 
-    cDemoBox overrides WindowProc to:
-      - WM_DPICHANGED: update title bar with current DPI + received count (verification).
-      - WM_SYSCOMMAND: handle custom system menu items (Save EMF/Text/PDF, Log).
+    cDemoBox overrides:
+      - WindowProc / WM_DPICHANGED: update title bar (DPI + zoom% + DPICHANGED count).
+      - WindowProc / WM_SYSCOMMAND: custom system menu items (Save EMF/Text/PDF, Log).
+      - apply_zoom (virtual override): call base then update_title() so Ctrl+Wheel zoom
+        also refreshes the title bar immediately.
 
-    cDemoSub (FrameBox subclass for the modal sub-dialog) overrides WindowProc to:
-      - WM_DPICHANGED: update title bar with current DPI + received count (verification).
+    cDemoSub (FrameBox subclass for the modal sub-dialog) overrides:
+      - WindowProc / WM_DPICHANGED: update title bar (DPI + zoom% + DPICHANGED count).
+      - apply_zoom: same as cDemoBox, for Ctrl+Wheel zoom on the sub-dialog.
 
     DemoSub() shows a modal sub-dialog: Sub.OpenFrame(owner,...) disables owner
     until the sub-frame goes out of scope (close() re-enables owner).
@@ -70,10 +73,15 @@ public:
     int dpi_changed_count = 0;
 
     void update_title() {
-        wchar_t buf[80];
-        swprintf_s(buf, _countof(buf), L"cParasite Demo [DPI: %d, DPICHANGED: %d]",
-                   ::GetDpiForWindow(m_hWnd), dpi_changed_count);
+        wchar_t buf[128];
+        swprintf_s(buf, _countof(buf), L"cParasite Demo [DPI: %d  zoom: %d%%  DPICHANGED: %d]",
+                   dpi, zoom_pm / 10, dpi_changed_count);
         ::SetWindowTextW(m_hWnd, buf);
+    }
+
+    void apply_zoom(int new_pm, bool cursor_anchor) override {
+        FrameBox::apply_zoom(new_pm, cursor_anchor);
+        update_title();
     }
 
     void setup_sysmenu() {
@@ -202,10 +210,15 @@ public:
     int dpi_changed_count = 0;
 
     void update_title() {
-        wchar_t buf[80];
-        swprintf_s(buf, _countof(buf), L"Modal Sub [DPI: %d, DPICHANGED: %d]",
-                   ::GetDpiForWindow(m_hWnd), dpi_changed_count);
+        wchar_t buf[128];
+        swprintf_s(buf, _countof(buf), L"Modal Sub [DPI: %d  zoom: %d%%  DPICHANGED: %d]",
+                   dpi, zoom_pm / 10, dpi_changed_count);
         ::SetWindowTextW(m_hWnd, buf);
+    }
+
+    void apply_zoom(int new_pm, bool cursor_anchor) override {
+        FrameBox::apply_zoom(new_pm, cursor_anchor);
+        update_title();
     }
 
     LRESULT WindowProc(UINT msg, WPARAM wp, LPARAM lp) override {
@@ -256,6 +269,7 @@ void DemoMain() {
     cDemoBox Top;
     Top.OpenFrame(&theApp, 510, -910, 1410, -170);   // main + self live-edit
     Top.CenterWindow();
+    Top.set_margin(5);
     Top.update_title();   // show initial DPI (count=0)
 
     ConBox* conBox = new ConBox;
@@ -291,9 +305,9 @@ void DemoMain() {
     table->set_align(5);
     table->set_edit_adjust(1, 4, 0, 0);
     table->open(&Top, 5, 5, 10, 8);
-    Top.AddNew(0, 0, 0, 0, table);    // attach-only; keep the size/position open() computed
+    Top.AddNew(5, 5, 805, 282, table);    // attach-only; keep the size/position open() computed
 
-    CEdit*     edit   = Top.AddEdit  (685, 365, 875, 405);
+    CEdit*     edit   = Top.AddEdit  (685, 359, 874, 399);
 
     CButton*   button = Top.AddButton(710, 330, 790, 355, "Close");
     CButton*   subBtn = Top.AddButton(795, 330, 875, 355, "Sub");
@@ -315,7 +329,8 @@ void DemoMain() {
 // owner (CWnd* overload); ~Sub at scope exit re-enables owner via close().
 void DemoSub(CWnd* owner) {
     cDemoSub Sub;
-    Sub.OpenFrame(owner, 929, -628, 1229, -408);   // centered on the top (secondary) monitor
+    Sub.OpenFrame(owner, 929, 100, 1229, 520);   // centered on the top (secondary) monitor
+    Sub.set_margin(5);
     Sub.update_title();   // show initial DPI (count=0)
     CStatic* msg = Sub.AddStatic(22, 124, 262, 148, "모달 서브 프레임");
     CButton* ok  = Sub.AddButton(155, 9, 275, 41, "OK");

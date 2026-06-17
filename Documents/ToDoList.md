@@ -87,31 +87,15 @@ Two later reworks (this stage's spec was redesigned mid-development):
   MFC CEdit), with the first stray `WM_IME_COMPOSITION` relayed CP949->UTF-16. Verified in BOTH
   MBCS and Unicode Debug|x64. See Learned.md 5.5, 5.9, 5.10.
 
-## Stage 6 - Clipboard (OPTIONAL)
+## Stage 6 - Clipboard (OPTIONAL) -- DROPPED
 
-- Ctrl+C: build a tab/newline-delimited UTF-8 string from the selection rect via `cell_text`
-  (Excel paste-compatible layout), convert to UTF-16 (`MultiByteToWideChar`), and place it on
-  the clipboard as `CF_UNICODETEXT` (`OpenClipboard`/`EmptyClipboard`/
-  `GlobalAlloc(GMEM_MOVEABLE)`/`SetClipboardData`).
-- Ctrl+V (only meaningful when `set_edit_callback` is registered): read `CF_UNICODETEXT`,
-  split rows on `\r\n`/`\n` and columns on `\t`, convert each piece to UTF-8
-  (`WideCharToMultiByte`), and call `edit_cb` for each target cell starting at `cur`,
-  advancing row/col per piece.
-- Lowest priority of the proposed stages; implement only when explicitly requested.
+Decided not to implement (user decision). Clipboard copy/paste is out of scope for TableBox.
 
-## Stage 7 - Polish (CORE)
+## Stage 7 - Polish (CORE) -- DONE
 
-- [DONE] Excel-style header highlighting: row/col headers matching cursor/selection get
-  RGB(224,221,200) background + RGB(128,128,128) inset line (implemented as user request).
-- Background-contrast pass: extend the body-background sampling already used for the overlay
-  scrollbar (Stage 2) to `draw_grid_lines` so grid lines stay visible against a `draw_cell`
-  override that paints something other than white (not just the scrollbar).
-- Visible-cell + clipping performance pass: audit `draw_block`/`last_visible_row`/
-  `last_visible_col` so the text callback is never invoked for off-screen cells, and avoid a
-  full back-buffer repaint on events that don't change pixels (e.g. scrollbar fade timer ticks
-  once alpha has settled, plain mouse-move hover with no visible change).
-- Demo integration: extend the `TableBox` section of `Project\DemoApp.cpp` to exercise
-  selection, resize, and in-place editing together (not just the static `[row:col]` text demo
-  from Stage 2).
-- DPI handling is intentionally NOT revisited here -- it was folded into Stage 2 and already
-  verified.
+- [DONE] Excel-style header highlighting.
+- [DONE] Grid line color: `set_grid_color(r,g,b)` added; default RGB(191,191,191) unchanged.
+  Background-contrast dynamic logic was evaluated and deferred (user controls color explicitly).
+- [DONE] Performance: `OnTimer` now skips `Invalidate` when alpha is unchanged (hold phase).
+  Other candidates (`last_visible_*` caching, SaveDC loop) reviewed and not worth the complexity.
+- [DONE] Demo integration: verified by user.

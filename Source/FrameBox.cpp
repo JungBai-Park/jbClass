@@ -11,13 +11,15 @@
     [UTIL]       AlignText
     [DETECT]     signal_map + set_default_signal_codes
     [PROC]       proc (static) -> dispatch (instance message router)
-    [EDIT]       cancel_edit, toggle/enter/leave edit, on_key, on_drag, paint_frame, get_rect
+    [EDIT]       cancel_edit, toggle/enter/leave edit, on_key, on_drag, paint_frame, get_rect,
+                 set_owner (inject owner FrameBox*), eff_dpi (zoom-aware phys<->logical)
     [SIGNAL]     signal()  (post WM_PARASITE_REPORT)
     [REWRITE]    find_char + LayOutRewrite  (rewrite OpenFrame/Add... literals)
     [HOST]       FrameBox: ctor/dtor/close, create_window, open, attach, timer,
                  add_* member factories + finish_child, WindowProc (incl. WM_DPICHANGED
-                 / WM_DPICHANGED_AFTERPARENT), rescale_children, PreTranslateMessage
-                 (ESC/Enter), surveil, listen_core
+                 / WM_DPICHANGED_AFTERPARENT / WM_JBZOOM), rescale_children,
+                 apply_zoom (Ctrl+Wheel zoom; virtual), fit_to_children (set_margin auto-fit),
+                 PreTranslateMessage (ESC/Enter/Ctrl+Wheel), surveil, listen_core
 
     BEHAVIOUR
     ---------
@@ -58,7 +60,7 @@
 Parasite::Parasite()
     : target(nullptr), signal_count(0), report(nullptr)
 #if defined(_DEBUG)
-    , file(nullptr), line(0), editing(false), drag_edge(0)
+    , file(nullptr), line(0), editing(false), drag_edge(0), owner_frame(nullptr)
 #endif
 {
     last_rect.SetRectEmpty();  // needed in release builds for DPI reposition (D4)
@@ -77,7 +79,22 @@ void Parasite::attach(CWnd* t) {
     target = t;
 }
 
+void Parasite::set_owner(FrameBox* fb) {
 #if defined(_DEBUG)
+    owner_frame = fb;
+#else
+    (void)fb;
+#endif
+}
+
+#if defined(_DEBUG)
+int Parasite::eff_dpi() const {
+    if (owner_frame) return owner_frame->eff_dpi();
+    HWND h = target ? target->m_hWnd : nullptr;
+    int d = (h && ::IsWindow(h)) ? (int)::GetDpiForWindow(h) : 96;
+    return d > 0 ? d : 96;
+}
+
 Parasite*& Parasite::active() {
     static Parasite* p = nullptr;
     return p;
@@ -546,8 +563,7 @@ void Parasite::enter_edit(HWND h) {
     // Capture current physical position as logical coords for ESC restore.
     CRect phys;
     get_rect(h, phys);
-    int tdpi = ::GetDpiForWindow(h);
-    if (tdpi <= 0) tdpi = 96;
+    int tdpi = eff_dpi();
     last_rect.SetRect(MulDiv(phys.left,   96, tdpi),
                       MulDiv(phys.top,    96, tdpi),
                       MulDiv(phys.right,  96, tdpi),
@@ -564,9 +580,8 @@ void Parasite::leave_edit(HWND h, bool commit) {
 
     if (!commit) {
         // Restore pre-edit position: last_rect holds 96 DPI logical coords,
-        // convert to physical at current DPI. WS_CHILD vs popup: same rule as get_rect.
-        int tdpi = ::GetDpiForWindow(h);
-        if (tdpi <= 0) tdpi = 96;
+        // convert to physical at current effective DPI (real DPI x zoom). WS_CHILD vs popup: same rule as get_rect.
+        int tdpi = eff_dpi();
         CRect phys(MulDiv(last_rect.left,   tdpi, 96),
                    MulDiv(last_rect.top,    tdpi, 96),
                    MulDiv(last_rect.right,  tdpi, 96),
@@ -582,11 +597,10 @@ void Parasite::leave_edit(HWND h, bool commit) {
     if (commit && file) {
         CRect phys;
         get_rect(h, phys);
-        int tdpi = ::GetDpiForWindow(h);
-        if (tdpi <= 0) tdpi = 96;
+        int tdpi = eff_dpi();
         // Convert physical to logical (96 DPI) for comparison, storage, AND the
         // source rewrite, so the file always stores DPI-invariant coords. Editing at
-        // a non-96 DPI monitor introduces integer rounding (prefer rewriting at 96 DPI).
+        // a non-96 DPI monitor or zoom != 1.0 introduces integer rounding.
         CRect logical(MulDiv(phys.left,   96, tdpi),
                       MulDiv(phys.top,    96, tdpi),
                       MulDiv(phys.right,  96, tdpi),
@@ -852,7 +866,7 @@ static const UINT_PTR MODAL_TIMER_ID = 1;
 FrameBox::FrameBox()
     : next_id(1001), app(nullptr), parent(nullptr), self_layout(nullptr),
       waiting(false), timer_fired(false), event(nullptr), timer_id(0),
-      dpi(96), sys_font(nullptr) {
+      dpi(96), zoom_pm(1000), snap_margin(-1), sys_font(nullptr) {
 }
 
 FrameBox::~FrameBox() { close(); }
@@ -978,6 +992,7 @@ bool FrameBox::open_core(CWnd* p, int x0, int y0, int x1, int y1, const char* fi
     if (!self_layout) {
         self_layout = new Parasite;
         self_layout->attach(this);
+        self_layout->set_owner(this);
         self_layout->layout(x0, y0, x1, y1, file, line);  // stores logical last_rect
     }
     ShowWindow(SW_SHOW);
@@ -998,12 +1013,14 @@ T* FrameBox::finish_child(T* wnd, BOOL ok, int x0, int y0, int x1, int y1,
     Parasite* p = new Parasite;
     registry.push_back({ wnd, p });
     p->attach(wnd);
+    p->set_owner(this);
     p->layout(x0, y0, x1, y1, f, ln);  // stores logical last_rect
     p->initialize(init);
-    // Scale from logical (96 DPI source coords) to physical pixels.
-    if (dpi != 96) {
-        wnd->MoveWindow(MulDiv(x0, dpi, 96), MulDiv(y0, dpi, 96),
-                        MulDiv(x1 - x0, dpi, 96), MulDiv(y1 - y0, dpi, 96), FALSE);
+    // Scale from logical (96 DPI source coords) to physical pixels at effective DPI (real DPI x zoom).
+    int edpi = eff_dpi();
+    if (edpi != 96) {
+        wnd->MoveWindow(MulDiv(x0, edpi, 96), MulDiv(y0, edpi, 96),
+                        MulDiv(x1 - x0, edpi, 96), MulDiv(y1 - y0, edpi, 96), FALSE);
     }
     return wnd;
 }
@@ -1148,18 +1165,21 @@ CHeaderCtrl* FrameBox::add_header(int x0,int y0,int x1,int y1,const char* f,int 
 FrameBox* FrameBox::make_child(DWORD exStyle, DWORD style,
                                int x0,int y0,int x1,int y1,const char* f,int ln) {
     FrameBox* child = new FrameBox;
-    // Create at physical pixels (parent DPI; child zones are on the same monitor).
-    CRect phys(MulDiv(x0,dpi,96), MulDiv(y0,dpi,96),
-               MulDiv(x1,dpi,96), MulDiv(y1,dpi,96));
+    int edpi = eff_dpi();
+    // Create at physical pixels at the parent's effective DPI (real DPI x zoom).
+    CRect phys(MulDiv(x0,edpi,96), MulDiv(y0,edpi,96),
+               MulDiv(x1,edpi,96), MulDiv(y1,edpi,96));
     if (!child->create_window(exStyle, style, this, phys)) {
         delete child;
         return nullptr;
     }
     child->dpi = dpi;
-    child->sys_font = make_dpi_font(dpi);
+    child->zoom_pm = zoom_pm;   // inherit parent zoom so child eff_dpi() is consistent
+    child->sys_font = make_dpi_font(edpi);
     Parasite* p = new Parasite;
     registry.push_back({ child, p });
     p->attach(child);
+    p->set_owner(this);
     p->layout(x0, y0, x1, y1, f, ln);  // stores logical last_rect
     child->ShowWindow(SW_SHOW);
     return child;
@@ -1186,20 +1206,22 @@ CWnd* FrameBox::attach_external(CWnd* wnd, bool owned,
     Parasite* p = new Parasite;
     registry.push_back({ owned ? wnd : nullptr, p });
     p->attach(wnd);
+    p->set_owner(this);
+    int edpi = eff_dpi();
     if (x0 == 0 && y0 == 0 && x1 == 0 && y1 == 0) {
         // Attach-only: read current physical rect and convert to logical for last_rect.
         CRect rc;
         wnd->GetWindowRect(&rc);
         CWnd* par = wnd->GetParent();
         if (par) par->ScreenToClient(&rc);
-        p->layout(MulDiv(rc.left,   96, dpi),
-                  MulDiv(rc.top,    96, dpi),
-                  MulDiv(rc.right,  96, dpi),
-                  MulDiv(rc.bottom, 96, dpi), f, ln);
+        p->layout(MulDiv(rc.left,   96, edpi),
+                  MulDiv(rc.top,    96, edpi),
+                  MulDiv(rc.right,  96, edpi),
+                  MulDiv(rc.bottom, 96, edpi), f, ln);
     } else {
         p->layout(x0, y0, x1, y1, f, ln);  // stores logical last_rect
-        wnd->MoveWindow(MulDiv(x0, dpi, 96), MulDiv(y0, dpi, 96),
-                        MulDiv(x1 - x0, dpi, 96), MulDiv(y1 - y0, dpi, 96));
+        wnd->MoveWindow(MulDiv(x0, edpi, 96), MulDiv(y0, edpi, 96),
+                        MulDiv(x1 - x0, edpi, 96), MulDiv(y1 - y0, edpi, 96));
     }
     wnd->ShowWindow(SW_SHOW);
     return wnd;
@@ -1255,6 +1277,7 @@ void FrameBox::surveil(int count, CWnd** list, bool on) {
 // they receive their own WM_DPICHANGED and rescale themselves. A WS_CHILD zone frame
 // is moved here by its parent, then rescales ITS OWN children in WM_DPICHANGED_AFTERPARENT.
 void FrameBox::rescale_children() {
+    int sdpi = eff_dpi();
     HFONT font = sys_font ? sys_font : default_ui_font();
     for (ChildEntry& e : registry) {
         if (!e.layout) continue;
@@ -1262,11 +1285,83 @@ void FrameBox::rescale_children() {
         if (!w || !::IsWindow(w->m_hWnd)) continue;
         if ((::GetWindowLongW(w->m_hWnd, GWL_STYLE) & WS_CHILD) == 0) continue;
         const CRect& lr = e.layout->logical_rect();
-        w->MoveWindow(MulDiv(lr.left, dpi, 96), MulDiv(lr.top, dpi, 96),
-                      MulDiv(lr.Width(), dpi, 96), MulDiv(lr.Height(), dpi, 96), TRUE);
+        w->MoveWindow(MulDiv(lr.left,    sdpi, 96), MulDiv(lr.top,     sdpi, 96),
+                      MulDiv(lr.Width(), sdpi, 96), MulDiv(lr.Height(), sdpi, 96), TRUE);
         ::SendMessageW(w->m_hWnd, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
     }
     Invalidate();
+    fit_to_children();
+}
+
+// Resize FrameBox so its client area wraps all WS_CHILD children plus snap_margin padding.
+// Called at the end of rescale_children() so it fires after every zoom/DPI rescale,
+// including after ConBox's snap_to_grid() has already adjusted ConBox's final size
+// (snap_to_grid runs synchronously inside MoveWindow above, before this point).
+void FrameBox::fit_to_children() {
+    if (snap_margin < 0 || !::IsWindow(m_hWnd)) return;
+
+    int phys_margin = ::MulDiv(snap_margin, eff_dpi(), 96);
+    int max_right = 0, max_bottom = 0;
+
+    for (ChildEntry& e : registry) {
+        if (!e.layout) continue;
+        CWnd* w = static_cast<CWnd*>(*e.layout);
+        if (!w || !::IsWindow(w->m_hWnd)) continue;
+        if ((::GetWindowLongW(w->m_hWnd, GWL_STYLE) & WS_CHILD) == 0) continue;
+        CRect wr;
+        w->GetWindowRect(&wr);
+        ScreenToClient(&wr);
+        if (wr.right  > max_right)  max_right  = wr.right;
+        if (wr.bottom > max_bottom) max_bottom = wr.bottom;
+    }
+
+    if (max_right <= 0 && max_bottom <= 0) return;
+
+    // Convert the desired client size to a window rect (accounts for title bar / borders).
+    CRect adj(0, 0, max_right + phys_margin, max_bottom + phys_margin);
+    DWORD style   = (DWORD)::GetWindowLongW(m_hWnd, GWL_STYLE);
+    DWORD exStyle = (DWORD)::GetWindowLongW(m_hWnd, GWL_EXSTYLE);
+    ::AdjustWindowRectEx(&adj, style, FALSE, exStyle);
+
+    ::SetWindowPos(m_hWnd, nullptr, 0, 0, adj.Width(), adj.Height(),
+                   SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+// Ctrl+Wheel zoom. cursor_anchor=true keeps the screen pixel under the cursor fixed;
+// false anchors to the top-left corner (used when the cursor is outside the frame).
+void FrameBox::apply_zoom(int new_pm, bool cursor_anchor) {
+    int old_eff = eff_dpi();
+    zoom_pm = new_pm < 500 ? 500 : new_pm > 3000 ? 3000 : new_pm;
+
+    // Notify all children BEFORE MoveWindow so ConBox/TableBox set zoom_pm + flags first.
+    for (ChildEntry& e : registry) {
+        if (!e.layout) continue;
+        CWnd* w = static_cast<CWnd*>(*e.layout);
+        if (w && ::IsWindow(w->m_hWnd))
+            ::SendMessageW(w->m_hWnd, WM_JBZOOM, (WPARAM)zoom_pm, 0);
+    }
+
+    if (sys_font) ::DeleteObject(sys_font);
+    sys_font = make_dpi_font(eff_dpi());
+
+    if (self_layout) {
+        const CRect& lr = self_layout->logical_rect();
+        int new_w = ::MulDiv(lr.Width(),  eff_dpi(), 96);
+        int new_h = ::MulDiv(lr.Height(), eff_dpi(), 96);
+        if (cursor_anchor && old_eff > 0) {
+            // Keep the screen pixel under the cursor at the same position.
+            POINT cs; ::GetCursorPos(&cs);
+            CRect wr; GetWindowRect(&wr);
+            int new_left = cs.x - ::MulDiv(cs.x - wr.left, eff_dpi(), old_eff);
+            int new_top  = cs.y - ::MulDiv(cs.y - wr.top,  eff_dpi(), old_eff);
+            ::SetWindowPos(m_hWnd, nullptr, new_left, new_top, new_w, new_h,
+                           SWP_NOZORDER | SWP_NOACTIVATE);
+        } else {
+            ::SetWindowPos(m_hWnd, nullptr, 0, 0, new_w, new_h,
+                           SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+    }
+    rescale_children();
 }
 
 LRESULT FrameBox::WindowProc(UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -1287,11 +1382,13 @@ LRESULT FrameBox::WindowProc(UINT msg, WPARAM wParam, LPARAM lParam) {
         Parasite::cancel_edit();
         dpi = static_cast<int>(LOWORD(wParam));
         const RECT* r = reinterpret_cast<const RECT*>(lParam);
-        ::SetWindowPos(m_hWnd, nullptr, r->left, r->top,
-                       r->right - r->left, r->bottom - r->top,
+        // Apply zoom_pm on top of the OS-suggested size (OS suggestion is real-DPI-only).
+        int new_w = ::MulDiv(r->right - r->left, zoom_pm, 1000);
+        int new_h = ::MulDiv(r->bottom - r->top, zoom_pm, 1000);
+        ::SetWindowPos(m_hWnd, nullptr, r->left, r->top, new_w, new_h,
                        SWP_NOZORDER | SWP_NOACTIVATE);
         if (sys_font) ::DeleteObject(sys_font);
-        sys_font = make_dpi_font(dpi);
+        sys_font = make_dpi_font(eff_dpi());
         rescale_children();
         return 0;
     }
@@ -1303,7 +1400,23 @@ LRESULT FrameBox::WindowProc(UINT msg, WPARAM wParam, LPARAM lParam) {
     if (msg == WM_DPICHANGED_AFTERPARENT) {
         dpi = static_cast<int>(::GetDpiForWindow(m_hWnd));
         if (sys_font) ::DeleteObject(sys_font);
-        sys_font = make_dpi_font(dpi);
+        sys_font = make_dpi_font(eff_dpi());
+        rescale_children();
+        return 0;
+    }
+
+    // Zoom propagation for child zone FrameBoxes: update zoom_pm, forward to own children,
+    // rebuild font, and rescale own children. No self-resize: parent's rescale_children() handles it.
+    if (msg == WM_JBZOOM) {
+        zoom_pm = static_cast<int>(wParam);
+        for (ChildEntry& e : registry) {
+            if (!e.layout) continue;
+            CWnd* w = static_cast<CWnd*>(*e.layout);
+            if (w && ::IsWindow(w->m_hWnd))
+                ::SendMessageW(w->m_hWnd, WM_JBZOOM, wParam, 0);
+        }
+        if (sys_font) ::DeleteObject(sys_font);
+        sys_font = make_dpi_font(eff_dpi());
         rescale_children();
         return 0;
     }
@@ -1390,6 +1503,18 @@ BOOL FrameBox::PreTranslateMessage(MSG* pMsg) {
         if (m >= WM_MOUSEFIRST && m <= WM_MOUSELAST &&
             m != WM_MBUTTONDOWN && pMsg->hwnd != edit)
             return TRUE;
+    }
+
+    // Ctrl+Wheel: zoom the whole frame. If the cursor is inside the frame, anchor to the
+    // cursor position (pixel under cursor stays fixed); otherwise anchor to the top-left corner.
+    if (pMsg->message == WM_MOUSEWHEEL &&
+        (GET_KEYSTATE_WPARAM(pMsg->wParam) & MK_CONTROL)) {
+        short delta = GET_WHEEL_DELTA_WPARAM(pMsg->wParam);
+        int step = (delta > 0 ? 1 : -1) * (abs((int)delta) / WHEEL_DELTA) * 100;
+        CPoint cursor(GET_X_LPARAM(pMsg->lParam), GET_Y_LPARAM(pMsg->lParam));
+        CRect wr; GetWindowRect(&wr);
+        apply_zoom(zoom_pm + step, wr.PtInRect(cursor) != 0);
+        return TRUE;
     }
 
     if (pMsg->message == WM_KEYDOWN) {
