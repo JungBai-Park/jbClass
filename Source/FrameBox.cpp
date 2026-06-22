@@ -16,8 +16,9 @@
     [SIGNAL]     signal()  (post WM_PARASITE_REPORT)
     [REWRITE]    find_char + LayOutRewrite  (rewrite OpenFrame/Add... literals)
     [HOST]       FrameBox: ctor/dtor/close, create_window, open, attach, timer,
-                 add_* member factories + finish_child, WindowProc (incl. WM_DPICHANGED
-                 / WM_DPICHANGED_AFTERPARENT / WM_JBZOOM), rescale_children,
+                 add_* member factories + finish_child, add_menu/modify_menu_label,
+                 WindowProc (incl. WM_DPICHANGED / WM_DPICHANGED_AFTERPARENT / WM_JBZOOM
+                 / WM_COMMAND menu dispatch), rescale_children,
                  apply_zoom (Ctrl+Wheel zoom; virtual), fit_to_children (set_margin auto-fit),
                  PreTranslateMessage (ESC/Enter/Ctrl+Wheel), surveil, listen_core
 
@@ -872,7 +873,8 @@ static const UINT_PTR MODAL_TIMER_ID = 1;
 FrameBox::FrameBox()
     : next_id(1001), app(nullptr), parent(nullptr), self_layout(nullptr),
       waiting(false), timer_fired(false), event(nullptr), timer_id(0),
-      dpi(96), zoom_pm(1000), snap_margin(-1), sys_font(nullptr) {
+      dpi(96), zoom_pm(1000), snap_margin(-1), sys_font(nullptr),
+      next_menu_id(1) {
 }
 
 FrameBox::~FrameBox() { close(); }
@@ -915,6 +917,19 @@ void FrameBox::close() {
             parent->SetActiveWindow();
         }
         parent = nullptr;
+    }
+    // Detach() is ASSERT-free (unlike GetSafeHmenu, which asserts IsMenu()).
+    // When the user closes the window, Windows destroys the menu on WM_DESTROY before
+    // close() runs, making the stored HMENU invalid. Detach() retrieves and nulls it
+    // without any validity check. We then:
+    //   - unlink from the window (SetMenu(nullptr)) only if both are still alive, and
+    //   - call DestroyMenu only if the handle is still a valid menu
+    //     (guards against the WM_DESTROY-already-freed case).
+    menu_popups.clear();   // release lambda closures while captured objects are still valid
+    HMENU hm = menu_bar.Detach();
+    if (hm) {
+        if (::IsWindow(m_hWnd)) ::SetMenu(m_hWnd, nullptr);
+        if (::IsMenu(hm)) ::DestroyMenu(hm);
     }
     if (::IsWindow(m_hWnd)) DestroyWindow();
 }
@@ -1241,6 +1256,83 @@ CWnd* FrameBox::add_asitis(int x0,int y0,int x1,int y1,const char* f,int ln, CWn
     return attach_external(wnd, false, x0,y0,x1,y1, f,ln);
 }
 
+// ---- dynamic menu bar -------------------------------------------------------
+// UTF-8 to wchar_t conversion for Win32 menu API calls.
+static std::wstring u8_to_w(const char* s) {
+    if (!s || !*s) return std::wstring();
+    int n = ::MultiByteToWideChar(CP_UTF8, 0, s, -1, nullptr, 0);
+    std::wstring w(static_cast<size_t>(n - 1), 0);
+    ::MultiByteToWideChar(CP_UTF8, 0, s, -1, &w[0], n);
+    return w;
+}
+
+int FrameBox::add_menu(const char* popup_label,
+    std::initializer_list<std::pair<const char*, std::function<void()>>> items)
+{
+    if (!menu_bar.GetSafeHmenu())
+        menu_bar.Attach(::CreateMenu());
+
+    CMenu popup;
+    popup.Attach(::CreatePopupMenu());
+
+    MenuPopup mp;
+    mp.label = popup_label ? popup_label : "";
+    int first_id = -1;
+
+    for (auto& kv : items) {
+        const char* lbl = kv.first;
+        if (!lbl || lbl[0] == '\0') {
+            popup.AppendMenuW(MF_SEPARATOR, 0, (LPCWSTR)nullptr);
+            MenuAction sep = { 0, "", std::function<void()>() };
+            mp.items.push_back(sep);
+        } else {
+            int id = next_menu_id++;
+            if (first_id < 0) first_id = id;
+            popup.AppendMenuW(MF_STRING, (UINT_PTR)id, u8_to_w(lbl).c_str());
+            MenuAction act = { id, lbl, kv.second };
+            mp.items.push_back(act);
+        }
+    }
+
+    menu_bar.AppendMenuW(MF_POPUP, (UINT_PTR)popup.Detach(), u8_to_w(popup_label).c_str());
+
+    // On the first add_menu call the menu bar is newly attached: the client area
+    // shrinks by the menu bar height. Measure the before/after delta and compensate
+    // by expanding the window height so existing children are not clipped.
+    bool first = menu_popups.empty();
+    CRect rc_before;
+    if (first && ::IsWindow(m_hWnd)) GetClientRect(&rc_before);
+
+    SetMenu(&menu_bar);
+    DrawMenuBar();
+
+    if (first && ::IsWindow(m_hWnd)) {
+        CRect rc_after;
+        GetClientRect(&rc_after);
+        int delta = rc_before.Height() - rc_after.Height();
+        if (delta > 0) {
+            CRect win;
+            GetWindowRect(&win);
+            SetWindowPos(nullptr, 0, 0, win.Width(), win.Height() + delta,
+                         SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+    }
+
+    menu_popups.push_back(mp);
+    return first_id;
+}
+
+void FrameBox::modify_menu_label(int id, const char* label) {
+    if (!menu_bar.GetSafeHmenu() || !label) return;
+    ::ModifyMenuW(menu_bar.GetSafeHmenu(), (UINT)id,
+                  MF_BYCOMMAND | MF_STRING, (UINT_PTR)id, u8_to_w(label).c_str());
+    DrawMenuBar();
+    // Update the cached label in menu_popups so the state stays consistent.
+    for (auto& pop : menu_popups)
+        for (auto& item : pop.items)
+            if (item.id == id) { item.label = label; return; }
+}
+
 // ---- listen / surveil / message routing ------------------------------------
 int FrameBox::timer(int period) {
     if (timer_id) { KillTimer(timer_id); timer_id = 0; }
@@ -1450,6 +1542,16 @@ LRESULT FrameBox::WindowProc(UINT msg, WPARAM wParam, LPARAM lParam) {
         event = reinterpret_cast<CWnd*>(wParam);
         m_nFlags &= ~WF_CONTINUEMODAL;
         return 0;
+    }
+
+    // Menu command: lParam==0 and HIWORD(wParam)==0. Look up the ID in menu_popups
+    // and invoke the associated action. Must be checked before the control-notification
+    // branch below (which also tests WM_COMMAND but requires lParam != 0).
+    if (msg == WM_COMMAND && lParam == 0 && HIWORD(wParam) == 0) {
+        int cmd = (int)LOWORD(wParam);
+        for (auto& pop : menu_popups)
+            for (auto& item : pop.items)
+                if (item.id == cmd && item.action) { item.action(); return 0; }
     }
 
     // Reflect control notifications to the control HWND (HWND-based, so the

@@ -32,7 +32,7 @@ This project adopts a modular architecture, with the PITFALLS.md files located a
 - Known x64 Debug build command:
 
 ```powershell
-& "C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Current\Bin\MSBuild.exe" "Project\jbClass.sln" /t:Build /p:Configuration=Debug /p:Platform=x64
+& "C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Current\Bin\MSBuild.exe" "Project\jbBox.sln" /t:Build /p:Configuration=Debug /p:Platform=x64
 ```
 
 - Build output uses configuration-specific suffix directories such as `Project\Debug.64\` and `Project\Debug.32\`.

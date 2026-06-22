@@ -11,9 +11,10 @@
 
     cDemoBox overrides:
       - WindowProc / WM_DPICHANGED: update title bar (DPI + zoom% + DPICHANGED count).
-      - WindowProc / WM_SYSCOMMAND: custom system menu items (Save EMF/Text/PDF, Log).
       - apply_zoom (virtual override): call base then update_title() so Ctrl+Wheel zoom
         also refreshes the title bar immediately.
+    Menu bar (no resource file): add_menu() adds "ConBox" and "Help" popups after open().
+    ConBox popup mirrors the former system-menu items (Save EMF/Text/PDF, Start/Stop Logging).
 
     cDemoSub (FrameBox subclass for the modal sub-dialog) overrides:
       - WindowProc / WM_DPICHANGED: update title bar (DPI + zoom% + DPICHANGED count).
@@ -44,11 +45,6 @@
 #include "..\Source\TableBox.h"
 #include <shlobj.h>    // SHBrowseForFolderW, SHGetPathFromIDListW
 
-// System menu IDs: must be multiples of 0x10, below 0xF000.
-static const UINT ID_SAVE_EMF  = 0xE010;
-static const UINT ID_SAVE_TEXT = 0xE020;
-static const UINT ID_SAVE_PDF  = 0xE030;
-static const UINT ID_LOG       = 0xE040;
 
 void DemoMain();
 void DemoSub(CWnd* owner);
@@ -84,17 +80,6 @@ public:
         update_title();
     }
 
-    void setup_sysmenu() {
-        HMENU hSys = ::GetSystemMenu(m_hWnd, FALSE);
-        if (!hSys) return;
-        ::AppendMenuW(hSys, MF_SEPARATOR, 0, nullptr);
-        ::AppendMenuW(hSys, MF_STRING, ID_SAVE_EMF,  L"Save EMF...");
-        ::AppendMenuW(hSys, MF_STRING, ID_SAVE_TEXT, L"Save Text...");
-        ::AppendMenuW(hSys, MF_STRING, ID_SAVE_PDF,  L"Save PDF...");
-        ::AppendMenuW(hSys, MF_SEPARATOR, 0, nullptr);
-        ::AppendMenuW(hSys, MF_STRING, ID_LOG,       L"Start Logging...");
-    }
-
     LRESULT WindowProc(UINT msg, WPARAM wp, LPARAM lp) override {
         if (msg == WM_DPICHANGED) {
             TRACE(L"[cDemoBox] WM_DPICHANGED received: DPI=%d\n", (int)LOWORD(wp));
@@ -102,104 +87,6 @@ public:
             LRESULT r = FrameBox::WindowProc(msg, wp, lp);
             update_title();
             return r;
-        }
-        if (msg == WM_SYSCOMMAND && con_box) {
-            UINT id = (UINT)(wp & 0xFFF0);
-            if (id == ID_SAVE_EMF) {
-                BROWSEINFOW bi = {};
-                bi.hwndOwner = m_hWnd;
-                bi.lpszTitle = L"Select folder to save EMF files";
-                bi.ulFlags   = BIF_RETURNONLYFSDIRS;
-                LPITEMIDLIST pidl = ::SHBrowseForFolderW(&bi);
-                if (pidl) {
-                    wchar_t path[MAX_PATH] = {};
-                    if (::SHGetPathFromIDListW(pidl, path)) {
-                        char utf8[MAX_PATH * 3] = {};
-                        ::WideCharToMultiByte(CP_UTF8, 0, path, -1, utf8, sizeof(utf8), NULL, NULL);
-                        if (con_box->save_emf(utf8))
-                            ::MessageBoxW(m_hWnd, L"EMF saved.", L"Info", MB_OK | MB_ICONINFORMATION);
-                        else
-                            ::MessageBoxW(m_hWnd, L"EMF save failed.", L"Error", MB_OK | MB_ICONERROR);
-                    }
-                    ::CoTaskMemFree(pidl);
-                }
-                return 0;
-            }
-            if (id == ID_SAVE_TEXT) {
-                wchar_t file[MAX_PATH] = L"ConBox";
-                OPENFILENAMEW ofn = {};
-                ofn.lStructSize = sizeof(ofn);
-                ofn.hwndOwner   = m_hWnd;
-                ofn.lpstrFilter = L"Text Files (*.txt)\0*.txt\0All Files (*.*)\0*.*\0";
-                ofn.lpstrFile   = file;
-                ofn.nMaxFile    = MAX_PATH;
-                ofn.Flags       = OFN_OVERWRITEPROMPT | OFN_HIDEREADONLY;
-                ofn.lpstrDefExt = L"txt";
-                if (::GetSaveFileNameW(&ofn)) {
-                    HANDLE hf = ::CreateFileW(file, GENERIC_WRITE, 0, NULL,
-                                              CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-                    if (hf != INVALID_HANDLE_VALUE) {
-                        std::vector<std::string> lines = con_box->get_text_lines();
-                        for (const std::string& line : lines) {
-                            DWORD written;
-                            ::WriteFile(hf, line.c_str(), (DWORD)line.size(), &written, NULL);
-                            ::WriteFile(hf, "\r\n", 2, &written, NULL);
-                        }
-                        ::CloseHandle(hf);
-                        ::MessageBoxW(m_hWnd, L"Text saved.", L"Info", MB_OK | MB_ICONINFORMATION);
-                    }
-                }
-                return 0;
-            }
-            if (id == ID_SAVE_PDF) {
-                wchar_t file[MAX_PATH] = L"ConBox";
-                OPENFILENAMEW ofn = {};
-                ofn.lStructSize = sizeof(ofn);
-                ofn.hwndOwner   = m_hWnd;
-                ofn.lpstrFilter = L"PDF Files (*.pdf)\0*.pdf\0\0";
-                ofn.lpstrFile   = file;
-                ofn.nMaxFile    = MAX_PATH;
-                ofn.Flags       = OFN_OVERWRITEPROMPT | OFN_HIDEREADONLY;
-                ofn.lpstrDefExt = L"pdf";
-                if (::GetSaveFileNameW(&ofn)) {
-                    char utf8[MAX_PATH * 3] = {};
-                    ::WideCharToMultiByte(CP_UTF8, 0, file, -1, utf8, sizeof(utf8), NULL, NULL);
-                    if (con_box->save_pdf(utf8))
-                        ::MessageBoxW(m_hWnd, L"PDF saved.", L"Info", MB_OK | MB_ICONINFORMATION);
-                    else
-                        ::MessageBoxW(m_hWnd, L"PDF save failed.\nNo PDF printer found or print job failed.",
-                                      L"Error", MB_OK | MB_ICONERROR);
-                }
-                return 0;
-            }
-            if (id == ID_LOG) {
-                if (con_box->is_logging()) {
-                    con_box->save_log(nullptr);
-                    HMENU hSys = ::GetSystemMenu(m_hWnd, FALSE);
-                    if (hSys) ::ModifyMenuW(hSys, ID_LOG, MF_BYCOMMAND | MF_STRING, ID_LOG, L"Start Logging...");
-                } else {
-                    wchar_t file[MAX_PATH] = L"ConBox";
-                    OPENFILENAMEW ofn = {};
-                    ofn.lStructSize = sizeof(ofn);
-                    ofn.hwndOwner   = m_hWnd;
-                    ofn.lpstrFilter = L"Log Files (*.log)\0*.log\0All Files (*.*)\0*.*\0";
-                    ofn.lpstrFile   = file;
-                    ofn.nMaxFile    = MAX_PATH;
-                    ofn.Flags       = OFN_OVERWRITEPROMPT | OFN_HIDEREADONLY;
-                    ofn.lpstrDefExt = L"log";
-                    if (::GetSaveFileNameW(&ofn)) {
-                        char utf8[MAX_PATH * 3] = {};
-                        ::WideCharToMultiByte(CP_UTF8, 0, file, -1, utf8, sizeof(utf8), NULL, NULL);
-                        if (con_box->save_log(utf8) == 0) {
-                            HMENU hSys = ::GetSystemMenu(m_hWnd, FALSE);
-                            if (hSys) ::ModifyMenuW(hSys, ID_LOG, MF_BYCOMMAND | MF_STRING, ID_LOG, L"Stop Logging");
-                        } else {
-                            ::MessageBoxW(m_hWnd, L"Failed to open log file.", L"Error", MB_OK | MB_ICONERROR);
-                        }
-                    }
-                }
-                return 0;
-            }
         }
         return FrameBox::WindowProc(msg, wp, lp);
     }
@@ -277,7 +164,113 @@ void DemoMain() {
     conBox->open(&Top, 5, 5);
     Top.AddNew(5, 300, 601, 695, conBox);   // coords-first; Top owns conBox
     Top.con_box = conBox;
-    Top.setup_sysmenu();
+
+    // Build menu bar: "ConBox" popup mirrors the former system-menu items.
+    // first_id is the WM_COMMAND ID of the first ConBox item (Save EMF).
+    // The Logging item is first_id+3 (EMF/Text/PDF occupy +0/+1/+2; separator skipped).
+    bool logging = false;
+    int first_id = Top.add_menu("ConBox", {
+        { "Save EMF...", [&]{
+            BROWSEINFOW bi = {};
+            bi.hwndOwner = Top.m_hWnd;
+            bi.lpszTitle = L"Select folder to save EMF files";
+            bi.ulFlags   = BIF_RETURNONLYFSDIRS;
+            LPITEMIDLIST pidl = ::SHBrowseForFolderW(&bi);
+            if (pidl) {
+                wchar_t path[MAX_PATH] = {};
+                if (::SHGetPathFromIDListW(pidl, path)) {
+                    char utf8[MAX_PATH * 3] = {};
+                    ::WideCharToMultiByte(CP_UTF8, 0, path, -1, utf8, sizeof(utf8), NULL, NULL);
+                    if (conBox->save_emf(utf8))
+                        ::MessageBoxW(Top.m_hWnd, L"EMF saved.", L"Info", MB_OK | MB_ICONINFORMATION);
+                    else
+                        ::MessageBoxW(Top.m_hWnd, L"EMF save failed.", L"Error", MB_OK | MB_ICONERROR);
+                }
+                ::CoTaskMemFree(pidl);
+            }
+        }},
+        { "Save Text...", [&]{
+            wchar_t file[MAX_PATH] = L"ConBox";
+            OPENFILENAMEW ofn = {};
+            ofn.lStructSize = sizeof(ofn);
+            ofn.hwndOwner   = Top.m_hWnd;
+            ofn.lpstrFilter = L"Text Files (*.txt)\0*.txt\0All Files (*.*)\0*.*\0";
+            ofn.lpstrFile   = file;
+            ofn.nMaxFile    = MAX_PATH;
+            ofn.Flags       = OFN_OVERWRITEPROMPT | OFN_HIDEREADONLY;
+            ofn.lpstrDefExt = L"txt";
+            if (::GetSaveFileNameW(&ofn)) {
+                HANDLE hf = ::CreateFileW(file, GENERIC_WRITE, 0, NULL,
+                                          CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+                if (hf != INVALID_HANDLE_VALUE) {
+                    std::vector<std::string> lines = conBox->get_text_lines();
+                    for (const std::string& ln : lines) {
+                        DWORD written;
+                        ::WriteFile(hf, ln.c_str(), (DWORD)ln.size(), &written, NULL);
+                        ::WriteFile(hf, "\r\n", 2, &written, NULL);
+                    }
+                    ::CloseHandle(hf);
+                    ::MessageBoxW(Top.m_hWnd, L"Text saved.", L"Info", MB_OK | MB_ICONINFORMATION);
+                }
+            }
+        }},
+        { "Save PDF...", [&]{
+            wchar_t file[MAX_PATH] = L"ConBox";
+            OPENFILENAMEW ofn = {};
+            ofn.lStructSize = sizeof(ofn);
+            ofn.hwndOwner   = Top.m_hWnd;
+            ofn.lpstrFilter = L"PDF Files (*.pdf)\0*.pdf\0\0";
+            ofn.lpstrFile   = file;
+            ofn.nMaxFile    = MAX_PATH;
+            ofn.Flags       = OFN_OVERWRITEPROMPT | OFN_HIDEREADONLY;
+            ofn.lpstrDefExt = L"pdf";
+            if (::GetSaveFileNameW(&ofn)) {
+                char utf8[MAX_PATH * 3] = {};
+                ::WideCharToMultiByte(CP_UTF8, 0, file, -1, utf8, sizeof(utf8), NULL, NULL);
+                if (conBox->save_pdf(utf8))
+                    ::MessageBoxW(Top.m_hWnd, L"PDF saved.", L"Info", MB_OK | MB_ICONINFORMATION);
+                else
+                    ::MessageBoxW(Top.m_hWnd, L"PDF save failed.\nNo PDF printer found or print job failed.",
+                                  L"Error", MB_OK | MB_ICONERROR);
+            }
+        }},
+        { "", nullptr },   // separator
+        { "Start Logging...", [&]{
+            int log_id = first_id + 3;
+            if (conBox->is_logging()) {
+                conBox->save_log(nullptr);
+                logging = false;
+                Top.modify_menu_label(log_id, "Start Logging...");
+            } else {
+                wchar_t file[MAX_PATH] = L"ConBox";
+                OPENFILENAMEW ofn = {};
+                ofn.lStructSize = sizeof(ofn);
+                ofn.hwndOwner   = Top.m_hWnd;
+                ofn.lpstrFilter = L"Log Files (*.log)\0*.log\0All Files (*.*)\0*.*\0";
+                ofn.lpstrFile   = file;
+                ofn.nMaxFile    = MAX_PATH;
+                ofn.Flags       = OFN_OVERWRITEPROMPT | OFN_HIDEREADONLY;
+                ofn.lpstrDefExt = L"log";
+                if (::GetSaveFileNameW(&ofn)) {
+                    char utf8[MAX_PATH * 3] = {};
+                    ::WideCharToMultiByte(CP_UTF8, 0, file, -1, utf8, sizeof(utf8), NULL, NULL);
+                    if (conBox->save_log(utf8) == 0) {
+                        logging = true;
+                        Top.modify_menu_label(log_id, "Stop Logging");
+                    } else {
+                        ::MessageBoxW(Top.m_hWnd, L"Failed to open log file.", L"Error", MB_OK | MB_ICONERROR);
+                    }
+                }
+            }
+        }},
+    });
+    Top.add_menu("Help", {
+        { "About...", [&]{
+            ::MessageBoxW(Top.m_hWnd,
+                L"jbClass Demo\nVersion 0.1",
+                L"About", MB_OK | MB_ICONINFORMATION);
+        }},
+    });
 
     std::vector<int> col_widths(50);
     for (size_t i = 0; i < col_widths.size(); ++i) col_widths[i] = (i % 2 == 0) ? 125 : 75;

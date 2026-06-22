@@ -71,3 +71,11 @@
 - `apply_zoom(int new_pm, bool cursor_anchor)` is `virtual protected` so subclasses can override it to add post-zoom actions (e.g. updating a title bar display) by calling `FrameBox::apply_zoom` then their own code.
 - `dpi`, `zoom_pm`, `eff_dpi()`, and `apply_zoom` are in the `protected` section to allow subclass access without `friend` declarations.
 - `set_margin(int margin_96)`: when `margin_96 >= 0`, after every `rescale_children()` call `fit_to_children()` reads each WS_CHILD's actual rect (`GetWindowRect` + `ScreenToClient`) to find the maximum right/bottom edge, then calls `SetWindowPos(SWP_NOMOVE)` to size FrameBox's client area to fit all children plus `MulDiv(margin_96, eff_dpi(), 96)` physical pixels of padding. `AdjustWindowRectEx` accounts for the non-client area. Default `-1` = disabled. Because `snap_to_grid()` inside ConBox runs synchronously within `MoveWindow`, `fit_to_children()` always sees the post-snap final child sizes.
+
+### 6 Dynamic Menu Bar
+
+- `add_menu(const char* popup_label, initializer_list<pair<const char*, function<void()>>> items)` adds a top-level popup to the menu bar at runtime without requiring a resource file. Labels are UTF-8. Pass `{"", nullptr}` for a separator. Returns the WM_COMMAND ID of the first non-separator item.
+- `modify_menu_label(int id, const char* label)` changes the display label of a menu item by its WM_COMMAND ID (e.g. toggle "Start/Stop Logging").
+- Menu actions are stored in `menu_popups` (vector of `MenuPopup`) and dispatched in `WindowProc` on `WM_COMMAND` with `lParam==0` and `HIWORD(wParam)==0`. No `BEGIN_MESSAGE_MAP` is needed in subclasses.
+- The first `add_menu` call automatically compensates the window height so existing children are not clipped (measures client height delta before/after `SetMenu`).
+- Menu bar DPI scaling (font, height) is handled automatically by Windows on `WM_DPICHANGED`.

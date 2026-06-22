@@ -116,7 +116,14 @@
 - `make_child` additionally propagates `child->zoom_pm = zoom_pm` so the new child FrameBox
   shares the parent's effective DPI from the moment of creation.
 
-### 12. Frame Self-Edit: Child Input Isolation
+### 12. CMenu Double-Free on WM_DESTROY (Dynamic Menu Bar)
+
+- When the user closes the window (X button), Windows destroys the window's menu during `WM_DESTROY`, before `close()` is called. If `CMenu` still holds the `HMENU`, its destructor calls `DestroyMenu` again on the already-freed handle.
+- `CMenu::GetSafeHmenu()` contains `ASSERT(this == NULL || IsMenu(m_hMenu))`. Calling it after `WM_DESTROY` fires the assert because `IsMenu(m_hMenu)` returns false for the dead handle.
+- Fix: in `close()`, call `menu_bar.Detach()` (assert-free) to retrieve the raw HMENU, then `::IsMenu(hm)` to guard `::DestroyMenu(hm)`. This handles both paths: normal close (menu still valid, destroyed here) and user-close (menu already dead, `DestroyMenu` skipped).
+- `CMenu::CreateMenu()` and `CMenu::CreatePopupMenu()` (no W suffix) must be used via `Attach(::CreateMenu())` in MBCS builds -- `CMenu::CreateMenuW` / `CMenu::CreatePopupMenuW` do not exist as MFC member functions.
+
+### 13. Frame Self-Edit: Child Input Isolation
 
 - A `FrameBox` self-edit subclasses the FRAME's HWND, but the frame's child controls are separate HWNDs. The frame's `Parasite::dispatch` eats input only for the frame window, so children still hover-highlighted and stole focus, and arrow keys went to the focused child instead of moving the frame.
 - `editing_hwnd() == pMsg->hwnd` is false when a child holds focus (target is the child), so the old `PreTranslateMessage` guard did not catch this case.

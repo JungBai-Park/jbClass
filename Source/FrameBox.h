@@ -114,6 +114,8 @@ class FrameBox;   // forward decl for Parasite::set_owner / Parasite::eff_dpi
 #include <afxdtctl.h>
 #include <CommCtrl.h>   // SetWindowSubclass / DefSubclassProc
 #include <vector>       // FrameBox per-instance child registry
+#include <functional>   // std::function for menu action callbacks
+#include <string>       // std::string for UTF-8 menu labels
 
 // ---- Shared message protocol (identical values to 05-box.c++ MainBox) -------
 // Keep these in sync with any real host (MainBox) so they interoperate.
@@ -287,6 +289,10 @@ bool LayOutRewrite(const char* file, int line, const RECT& rect);
 //     on close so CWnd teardown never leaves a dangling main window.
 //   - listen(): block in a modal loop until one surveilled control posts
 //     WM_PARASITE_REPORT (or the timer fires -> returns this, or window closed -> 0).
+//   - add_menu(label, items): appends a popup to the menu bar at runtime (no .rc
+//     resource needed). Actions stored in menu_popups; dispatched from WindowProc
+//     on WM_COMMAND (lParam==0). modify_menu_label(id, label) renames an item.
+//     First add_menu call auto-compensates window height for the new menu bar.
 //   - WindowProc reflects child notifications (WM_COMMAND/WM_NOTIFY/WM_HSCROLL/
 //     WM_VSCROLL) to the control HWND as WM_PARASITE_CALLBACK. This runs always, so a
 //     child frame reflects its own controls even while a parent runs listen().
@@ -344,6 +350,16 @@ public:
     // rightmost/bottommost child edge. Call before or after open().
     // Default -1 = disabled (FrameBox keeps the size set by open/zoom/DPI change).
     void set_margin(int margin_96) { snap_margin = margin_96; }
+
+    // Add a top-level popup to the menu bar (no resource file needed). Returns the
+    // WM_COMMAND ID assigned to the first non-separator item in this popup, which
+    // the caller can use with modify_menu_label() to change the label later.
+    // Pass { "", nullptr } as an item to insert a separator.
+    int  add_menu(const char* popup_label,
+                  std::initializer_list<std::pair<const char*, std::function<void()>>> items);
+
+    // Change the display label of a menu bar item identified by its WM_COMMAND ID.
+    void modify_menu_label(int id, const char* label);
 
     // Modal wait until one of the listed controls signals. Returns its CWnd*
     // (or 0 if the window was closed, or this if the timer fired).
@@ -429,6 +445,22 @@ private:
     UINT_PTR  timer_id;                   // 0 = no active timer
     int       snap_margin;                // set_margin() value (96 DPI logical px); -1 = disabled
     HFONT     sys_font;                   // DPI-correct message font at eff_dpi(); created in open()/make_child(), freed in close()
+
+    // Dynamic menu bar. Built by add_menu(); actions dispatched in WindowProc WM_COMMAND.
+    // menu_bar ownership: CMenu holds the HMENU. close() calls SetMenu(nullptr) before
+    // DestroyWindow so Windows does not double-free the handle on window destruction.
+    struct MenuAction {
+        int                   id;      // WM_COMMAND id (0 = separator)
+        std::string           label;   // UTF-8
+        std::function<void()> action;  // null for separator
+    };
+    struct MenuPopup {
+        std::string             label;
+        std::vector<MenuAction> items;
+    };
+    CMenu                   menu_bar;
+    std::vector<MenuPopup>  menu_popups;
+    int                     next_menu_id;
 };
 
 // ---- Factory macros: member-call form that injects __FILE__/__LINE__ ----
