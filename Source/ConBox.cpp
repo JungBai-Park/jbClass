@@ -647,7 +647,7 @@ static std::wstring ResolveIniPath(const char* utf8)
 {
     int n = ::MultiByteToWideChar(CP_UTF8, 0, utf8, -1, nullptr, 0);
     std::wstring w(n, 0);
-    ::MultiByteToWideChar(CP_UTF8, 0, utf8, -1, w.data(), n);
+    ::MultiByteToWideChar(CP_UTF8, 0, utf8, -1, &w[0], n);
     if (!w.empty() && w.back() == 0) w.pop_back();   // strip the null terminator
 
     // Absolute path: has a drive letter (x:\...) or starts with a UNC slash.

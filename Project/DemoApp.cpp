@@ -283,7 +283,6 @@ void DemoMain() {
     for (size_t i = 0; i < col_widths.size(); ++i) col_widths[i] = (i % 2 == 0) ? 125 : 75;
     std::vector<int> row_heights(50);
     for (size_t i = 0; i < row_heights.size(); ++i) row_heights[i] = (i % 2 == 0) ? 25 : 25;
-
     table_text.assign(50, std::vector<std::string>(50));
     char cell_buf[32];
     for (int row = 0; row < 50; ++row) {
@@ -293,8 +292,8 @@ void DemoMain() {
         }
     }
 
-    table_text[6][2] = "2";   // Stage 5 combo-cell demo
 
+    table_text[6][2] = "2";   // Stage 5 combo-cell demo
     TableBox* table = new TableBox;
     table->set_cols(col_widths);
     table->set_rows(row_heights);

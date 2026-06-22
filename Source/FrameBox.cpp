@@ -112,15 +112,21 @@ HWND Parasite::editing_hwnd() {
 
 namespace {
     // Fallback: process-wide 96 DPI UI font (Segoe UI 9pt). Used when sys_font
-    // is not yet set (e.g. before open() is called). Intentionally leaked.
+    // is not yet set (e.g. before open() is called). Freed by cleanup_default_font()
+    // when the root FrameBox (app != nullptr) closes.
+    HFONT g_default_font = nullptr;
+
     HFONT default_ui_font() {
-        static HFONT font = nullptr;
-        if (!font) {
+        if (!g_default_font) {
             NONCLIENTMETRICSW ncm = { sizeof(ncm) };
             ::SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0);
-            font = ::CreateFontIndirectW(&ncm.lfMessageFont);
+            g_default_font = ::CreateFontIndirectW(&ncm.lfMessageFont);
         }
-        return font;
+        return g_default_font;
+    }
+
+    void cleanup_default_font() {
+        if (g_default_font) { ::DeleteObject(g_default_font); g_default_font = nullptr; }
     }
 
     // Create a DPI-correct message font. Caller owns the returned HFONT.
@@ -882,7 +888,7 @@ void FrameBox::attach(CWinApp* a) {
 // self-edit subclass, then this window. A child-frame entry's `delete e.wnd`
 // re-enters ~FrameBox to tear down grandchildren. Idempotent.
 void FrameBox::close() {
-    if (app) { app->m_pMainWnd = nullptr; app = nullptr; }
+    if (app) { app->m_pMainWnd = nullptr; app = nullptr; cleanup_default_font(); }
     for (int i = static_cast<int>(registry.size()) - 1; i >= 0; i--) {
         ChildEntry& e = registry[static_cast<size_t>(i)];
         delete e.layout;                 // removes subclass (skips if HWND already gone)
@@ -1365,6 +1371,15 @@ void FrameBox::apply_zoom(int new_pm, bool cursor_anchor) {
 }
 
 LRESULT FrameBox::WindowProc(UINT msg, WPARAM wParam, LPARAM lParam) {
+    // Allow the window to grow beyond the default monitor-size cap (ptMaxTrackSize ≈
+    // SM_CXVIRTUALSCREEN) so fit_to_children() can resize to any zoom-scaled size.
+    if (msg == WM_GETMINMAXINFO) {
+        MINMAXINFO* mm = reinterpret_cast<MINMAXINFO*>(lParam);
+        mm->ptMaxTrackSize.x = 32767;
+        mm->ptMaxTrackSize.y = 32767;
+        return 0;
+    }
+
     // Paint background with the dialog face color instead of the CWnd default.
     if (msg == WM_ERASEBKGND) {
         RECT rc;
@@ -1510,7 +1525,7 @@ BOOL FrameBox::PreTranslateMessage(MSG* pMsg) {
     if (pMsg->message == WM_MOUSEWHEEL &&
         (GET_KEYSTATE_WPARAM(pMsg->wParam) & MK_CONTROL)) {
         short delta = GET_WHEEL_DELTA_WPARAM(pMsg->wParam);
-        int step = (delta > 0 ? 1 : -1) * (abs((int)delta) / WHEEL_DELTA) * 100;
+        int step = (delta > 0 ? 1 : -1) * (abs((int)delta) / WHEEL_DELTA) * 25;
         CPoint cursor(GET_X_LPARAM(pMsg->lParam), GET_Y_LPARAM(pMsg->lParam));
         CRect wr; GetWindowRect(&wr);
         apply_zoom(zoom_pm + step, wr.PtInRect(cursor) != 0);

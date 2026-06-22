@@ -73,7 +73,10 @@ project-root/
 ├── CLAUDE.md
 │
 ├── Documents/
-│    └── Requirements.md, Learned.md 등의 설계 참고 문서
+│    ├── REQUIREMENTS.md, PITFALLS.md, PROGRESS.md 등의 프로젝트 전체 공통 문서
+│    ├── 1. FrameBox/   (REQUIREMENTS.md, PITFALLS.md)
+│    ├── 2. ConBox/     (REQUIREMENTS.md, PITFALLS.md)
+│    └── 3. TableBox/   (REQUIREMENTS.md, PITFALLS.md)
 │
 ├── Project/
 │    └── Visual Studio의 프로젝트 폴더 : 비주얼 스튜디오가 생성한 파일들
@@ -92,39 +95,41 @@ project-root/
 
 # 주요 문서
 
-#### 1. 요구사양서 (Requirements.md)
+#### 1. 요구사양서 (REQUIREMENTS.md)
 
-@Documents/Requirements.md
+@Documents/REQUIREMENTS.md
 
 - /organize-docs 스킬 발동 시, 세션 내용 중에서 사용자가 추가 요청한 내용들을 정리하여 이 문서에 반영한다.
 - 사용자가 직접적으로 요청한 내용들을 이 문서에 반영하고, 요청한 내용에 따라 결정된 사항들은 소스 코드의 코멘트에 기록해 둔다.
 - 요구사양서는 사용자가 보기 위한 문서가 아니라 ...
   매 세션 마다 AI가 업무를 파악하기 위한 용도이므로, 군더더기 없이 (과하지 않게) 영어로 작성한다.
   (AI에게 도움되지 않는 것은 적지 않는다.)
+- 모듈별 요구사양은 Documents/[모듈명]/ 서브디렉토리의 REQUIREMENTS.md에 기록하며,
+  해당 세션에서 작업한 모듈의 것만 읽는다.
 
 #### 2. 설계명세서
 
 - 설계명세서는 별도로 만들지 않는다. (토큰 절약 목적)
 - /organize-docs 스킬 발동 시, 설계명세서에 적을 내용을 소스코드의 코멘트에 영어로 반영해 둔다. (세부 내용은 `코딩 규칙` 참조)
 
-#### 3. 개발 노트 (Learned.md)
+#### 3. 개발 노트 (PITFALLS.md)
 
-@Documents/Learned.md
+@Documents/PITFALLS.md
 
 - /organize-docs 스킬 발동 시, 세션 내용 중에서 기억해 두어야 할 내용들을 정리하여 이 문서에 반영한다.
   - 예 : 디버깅 과정 중 알게 된 특성, 시행착오 내용 (똑같은 실수를 반복하지 않기 위해)
-- 자료 관리의 편의를 위해  ~/.claude의 메모리 시스템을 절대 사용하지 말고 반드시 Documents/Learned.md 에 기록한다.
+- 자료 관리의 편의를 위해  ~/.claude의 메모리 시스템을 절대 사용하지 말고 반드시 Documents/PITFALLS.md 에 기록한다.
 - 개발 노트는 사용자가 보기 위한 문서가 아니라 ...
   매 세션 마다 AI가 잊지 말아야 할 내용을 상기시켜 주기 위한 용도이므로, 군더더기 없이 (과하지 않게) 영어로 작성한다.
   **즉, AI에게 도움 되지 않는 것은 적지 않는다.**
+- 모듈별 개발 노트는 Documents/[모듈명]/ 서브디렉토리의 PITFALLS.md에 기록하며,
+  해당 세션에서 작업한 모듈의 것만 읽는다.
 
-#### 4. 할일 목록 (ToDoList.md)
-
-@Documents/ToDoList.md
+#### 4. 진척 현황 (PROGRESS.md)
 
 - 최종 개발 목표를 한번에 완성 시키지 않고, 단계별로 계획을 세워 진행할 경우 이 문서를 작성한다.
-  (별도의 계획이 없는 경우, 이 문서는 존재하지 않는다.)
-- 최초에 ToDoList.md 문서를 만들 때는 모든 단계별 계획을 상세히 적는다. (단, 과하지 않게)
+- 최초에 PROGRESS.md 문서를 만들 때는 모든 단계별 계획을 상세히 적는다. (단, 과하지 않게)
+- @ 인클루드 없이, 현재 진행 단계 파악이 필요할 때만 읽는다. (Documents/PROGRESS.md)
 
 - /organize-docs 스킬 발동 시, 이 문서가 있다면 단계별 계획의 진척 상황을 문서에 반영한다.
   - 완료한 단계는 완료되었다고 표시한다.
