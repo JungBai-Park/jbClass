@@ -1,136 +1,10 @@
 ﻿// ConBox.cpp
+// Copyright (c) 2026 JungBai Park. All rights reserved.
 //
 // Implementation of ConBox. To only USE the control, ConBox.h is enough; read this file when
 // MODIFYING behavior. Use the table of contents below to Grep to one function instead of reading
 // the whole file.
 //
-// === File layout (roughly this order) ===
-//   helpers (static): IsWideChar, ParseFontOpts, DrawBlockElement, DrawBoxLine
-//   message map     : BEGIN_MESSAGE_MAP ... END_MESSAGE_MAP
-//   window/font     : open, build_font, apply_default_fonts, build_efont, build_kfont, calc_cell_size,
-//                     set_efont, set_kfont, relayout_for_dpi, set_builtin_glyphs
-//   color/cursor    : set_fg_color, set_bg_color, set_cursor_blend, set_cursor_blink, set_cursor, bump_cursor, remap_paper_color, OnTimer
-//   margin          : set_margin, grid_size
-//   config          : setup_from_ini, setup, CreateDefaultIni(static), ResolveIniPath(static), ParseIni(static), ParseColor(static)
-//   cursor geometry : blend_cursor_color, cursor_screen_pos, get_cursor_rect, is_hangul_mode
-//   grid/output     : update_metrics, recalc_origin, snap_to_grid, blank_row, reset_screen, line_at, clamp_cursor, erase_cells,
-//                     scroll_lines_up/down, scroll_up_region, scroll_down_region, line_feed,
-//                     insert_lines, delete_lines, insert_chars, delete_chars,
-//                     enter_alt_screen, leave_alt_screen, put_char, print, update_scrollbar
-//   VT parser       : Xterm256ToRgb(static), vt_feed, dispatch_csi
-//   window messages : OnEraseBkgnd, OnSize (also detects DPI change), OnGetDlgCode, OnMouseWheel, OnDpiChanged
-//   overlay scrollbar: sbar_geometry, sbar_show, draw_overlay_scrollbar, OnMouseLeave
-//   IME (Korean)    : OnImeStart, OnImeComp, OnImeEnd, OnImeNotify
-//   input           : set_input_sink, set_resize_sink, send_input_bytes, send_input_wide,
-//                     terminal_keydown, paste_clipboard, finalize_composition, OnChar, OnKeyDown
-//   focus           : OnSetFocus, OnKillFocus
-//   mouse selection : hit_test, copy_selection, clear_selection, OnLButtonDown, OnLButtonDblClk,
-//                     OnLButtonUp, OnMouseMove, OnRButtonDown, OnDropFiles
-//   painting        : ensure_back_buffer, OnPaint
-//   export          : save_emf, save_pdf, get_text_lines, save_log
-//   child (ConPTY)  : Utf8ToWide/CreatePtyPipes(static), start(no-arg)/start(cmdline), write, resize, stop, is_running,
-//                     set_exit_callback, pump, handle_child_exit, child_input_thunk/child_resize_thunk, OnDestroy
-//
-// ===== DESIGN OVERVIEW =====
-// The big picture, data model and extension points live here (no separate design doc). When reading
-// one function, its header note "(design: [TAG])" points to the matching [TAG] item below, so you
-// need not read the whole file. Per-member detail is in ConBox.h; per-function detail is each
-// function's own comment.
-//
-// [DM] Data model (cell grid)
-//   screen: vector<Row>      current screen, always rows lines x cols cells. Row = vector<CharInfo>.
-//   CharInfo{ wchar_t ch; uint8_t flags; COLORREF fg,bg; }  flags: CELL_WIDE|BOLD|ITALIC|UNDERLINE|STRIKE|BLINK|DOUBLE
-//     CELL_WIDE = lead cell of double-width glyph (trail has ch=0).
-//     CELL_DOUBLE (SGR 8/28) = glyph rendered at 2x size (always bold). English=2x2 cells, Korean=4x2 cells.
-//       Cursor auto-advances 2x (put_char advance=w*2) so no manual spacing needed between big chars.
-//       Bleed: upward (2x ascent) and rightward (2x width); OnPaint renders columns right-to-left so
-//       a double glyph's rightward bleed overwrites already-drawn cells (not later ones). No 2nd pass.
-//   scrollback: deque<Row>   lines pushed off the top (capped at max_scrollback, oldest dropped; deque for O(1) pop_front).
-//   main_saved: vector<Row>  main screen backed up on alt-screen entry (swapped back on leave).
-//   Key state: cur_row/cur_col (0-based screen cell cursor), view_top (top of view, unified index),
-//     cursor_visible (?25), saved_cur (DECSC/RC), scroll_top/bot (DECSTBM region),
-//     alt_active/saved_main_cur (alt screen), cols/rows, cell_w/h/base, margin_*, glyph_level,
-//     vt_state/params/priv/gtlt/space (parser; persists across chunked print()), cur_fg/bg/bold/italic/underline/strike/blink/reverse (SGR),
-//     app_cursor_keys/bracketed_paste (input encoding the child turned on via DEC modes),
-//     back_dc/bmp (double buffer). ConPTY: h_pc/in_write/out_read/child_proc/child_running/exit_cb
-//     (dormant when start() is unused).
-//
-// [COORD] Coordinate systems
-//   Cell grid (cur_row,cur_col): screen cells. A wide glyph is lead+trail (2 cells = 2 visual columns).
-//   Unified index idx: scrollback first, then screen. line_at(idx) returns the line. Total lines =
-//     scrollback.size() + rows.
-//   Screen/pixel: line relative to view_top, plus left/top margin.
-//
-// [VT] Output parser (print -> vt_feed -> dispatch_csi)
-//   print: UTF-8 -> UTF-16, each char fed to the vt_feed state machine; then scroll-to-bottom,
-//     bump cursor, repaint.
-//   vt_feed: GROUND (glyph -> put_char; C0: CR/LF/BS/TAB(mult of 8)/BEL ignored) / ESC (7,8=DECSC/RC,
-//     D=IND, E=NEL, M=RI, c=RIS, [=CSI, ]=OSC) / CSI (accumulate params, ?=priv, <=>=gtlt, ' '=space
-//     (DECSCUSR), final byte -> dispatch_csi) / OSC (discard up to BEL/ST).
-//   dispatch_csi: drops the whole sequence if gtlt (private <>= sequence; avoids final-byte misparse).
-//     Otherwise cursor moves (CUU/CUD/CUF/CUB/CUP/HVP/CHA/VPA/CNL/CPL), erase ED/EL/ECH, SGR (m), modes h/l
-//     (?25, ?1049/47, ?1048, ?1, ?2004), save/restore (s/u), full-screen (DECSTBM r, IL/DL, ICH/DCH,
-//     SU/SD), queries (DSR n -> CPR/status to input sink, DA c -> VT102).
-//   put_char: autowrap past width (advance=w*2 if cur_double), swap colors when reverse, wide glyph
-//     sets the next cell to trail. double mode (CELL_DOUBLE) stores the glyph in 1 cell but advances
-//     cur_col by w*2 so subsequent chars land past the 2x visual span without manual spacing.
-//     line_feed: scroll_up_region at the region bottom (scroll_bot), else advance one line.
-//   Scroll workers: scroll_lines_up/down (pure rotation within a range), scroll_up_region (preserves
-//     displaced lines into scrollback only on the main screen with top==0), enter/leave_alt_screen
-//     (swap with main_saved).
-//
-// [FONT] Font / cell size (calc_cell_size; full algorithm in that function's comment)
-//   Fixed cell_w/h/base from font metrics. cell_w = ceil(max(2*w_e, w_k)/2) where w_e/w_k are the
-//   width-ratio-adjusted English/Korean natural widths. English font is built to cell_w, Korean to
-//   2*cell_w for final rendering. Match mode (set_kfont size<=0, default): Korean height matched to
-//   English; off (size>0): Korean keeps its own height. adjust(l,t,r,b) then pads each cell side in px
-//   (cell_w+=l+r, cell_h+=t+b; left/top also shift the glyph; built-in block/box glyphs stay full-cell).
-//
-// [PAINT] Drawing (OnPaint, double buffered)
-//   Draw a whole frame into a memory DC then BitBlt (no flicker). Walk rows top-to-bottom, columns
-//   RIGHT-TO-LEFT within each row. right-to-left order: CELL_DOUBLE glyphs bleed rightward; by the
-//   time a double cell is drawn its right neighbors are already laid down, so the bleed overwrites
-//   them (not erased by later renders). Wide=2 cells in kfont; trail/blank cells skip glyph. TA_BASELINE.
-//   Block/box chars painted directly by DrawBlockElement/DrawBoxLine per glyph_level.
-//   CELL_DOUBLE: drawn inline (not a second pass) using efont_double/kfont_double (2x, always bold);
-//   underline/strike span the doubled width.
-//   Cursor: when cursor_on && cursor_visible, fill get_cursor_rect with blend_cursor_color (2 cells in
-//   Korean mode, 1 in English) and redraw the covered glyph(s) on top. child_caret (the child paints
-//   the cursor cell as reverse = its bg differs from neighbors) suppresses the ConBox block (avoids a
-//   double cursor).
-//   Overlay scrollbar: last, draw_overlay_scrollbar AlphaBlends a thumb over the right edge (no native
-//   WS_VSCROLL, so the client never shrinks). Auto-hide/fade via SBAR_TIMER; shown on user scroll/hover
-//   (sbar_show), dragged via the mouse handlers. sbar_geometry derives the track/thumb from view_top.
-//
-// [IME] Korean composition (OnImeStart/Comp/End/Notify + comp_str in OnPaint)
-//   Only the committed part (GCS_RESULTSTR) goes to the child via send_input_wide. The uncommitted
-//   part (GCS_COMPSTR) is held in comp_str and drawn by ConBox (hollow 1px outline, pinned to the
-//   cursor cell; OnImeComp returns 0 to suppress system inline + WM_CHAR duplication). Mid-line
-//   composition shifts the line right via ScrollDC to preview insertion (for insert-mode children like
-//   the Python REPL). Order guarantee: finalize_composition force-commits with ImmNotifyIME
-//   (CPS_COMPLETE) right before a trigger key -> [completed][trigger]. Cursor width: is_hangul_mode
-//   (ImmGetConversionStatus IME_CMODE_NATIVE); OnImeNotify reflects the Korean/English toggle at once.
-//   A commit advances the child cursor one glyph right, so OnKeyDown corrects a plain Left/Right after
-//   a commit (swallow Right / double Left), gated by the ime_committed flag (OnImeComp sets it; the MS
-//   IME pre-commits before the arrow's WM_KEYDOWN so finalize's return value can't be used).
-//
-// [PTY] Child runner (start/write/resize/stop/pump/handle_child_exit; "child (ConPTY)" section below)
-//   start: CreatePtyPipes (pipes + CreatePseudoConsole) -> STARTUPINFOEX+attr -> CreateProcessW ->
-//     close PTY-side ends -> wire itself via set_input_sink/set_resize_sink -> SetTimer(PUMP_TIMER).
-//     Input -> write -> child stdin; grid change -> resize -> ResizePseudoConsole. pump (PUMP_TIMER
-//     polling): PeekNamedPipe -> ReadFile -> print. Exit detection: ConPTY's conhost keeps the output
-//     pipe's write end open after the child exits, so EOF is never seen; poll the process handle
-//     (WaitForSingleObject) instead -> handle_child_exit (stop then exit_cb). Lifetime: OnDestroy
-//     (and the dtor) call stop(). With no start(), the ConPTY members stay dormant (pure view).
-//
-// [EXT] Extension points / limits
-//   A new VT sequence = add a branch in dispatch_csi/vt_feed (cells are COLORREF, so 16/256/truecolor
-//   are expressible). New helpers go in the static block atop this file (keep the portability unit two
-//   files). On font/window/margin/width changes the order is calc_cell_size (font) -> update_metrics
-//   (-> reset_screen). UTF-8 chunk-boundary split handled by utf8_tail carry-over in print(). Korean
-//   IME order / cursor width cannot be auto-captured -> verify by real typing (Learned.md).
-// ===== END DESIGN OVERVIEW =====
-
 #include "ConBox.h"         // must come first: pulls in afxwin.h / windows.h before imm.h/winspool.h
 #include <afxpriv.h>        // AfxHookWindowCreate / AfxUnhookWindowCreate (MFC window creation hook)
 #include <string>
@@ -976,7 +850,7 @@ void ConBox::open(CWnd* parent, int left, int top)
     // scrollbar (draw_overlay_scrollbar) is painted over the right edge and never reserves client space.
     // CreateWindowExW keeps the class name as wchar_t in both MBCS and Unicode builds.
     // AfxHookWindowCreate installs MFC's CBT hook so the HWND-to-CWnd mapping and message map
-    // are set up exactly as CWnd::CreateEx would — no SubclassWindow side-effects.
+    // are set up exactly as CWnd::CreateEx would ??no SubclassWindow side-effects.
     AfxHookWindowCreate(this);
     HWND hwnd = ::CreateWindowExW(0, L"ConBox", L"",
         WS_CHILD | WS_VISIBLE,
@@ -1067,7 +941,10 @@ void ConBox::apply_default_fonts()
     if (kfont_name.empty()) { kfont_name = "Malgun Gothic"; kfont_size = 0.0f;  kfont_opts.clear(); }
 }
 
-// (design: [FONT])
+// Font/cell size: cell_w/h/base derived from font metrics. cell_w = ceil(max(2*w_e, w_k)/2)
+// (w_e/w_k = width-ratio-adjusted English/Korean natural widths). English font built to cell_w,
+// Korean to 2*cell_w. Match mode (kfont size<=0): Korean height matches English. adjust(l,t,r,b)
+// pads each cell side in px; left/top also shift the glyph origin; built-in block/box glyphs stay full-cell.
 void ConBox::calc_cell_size()
 {
     BOOL has_wnd = ::IsWindow(m_hWnd);
@@ -1691,7 +1568,9 @@ void ConBox::reset_screen()
     if (scroll_top >= scroll_bot) { scroll_top = 0; scroll_bot = rows - 1; }
 }
 
-// (design: [COORD]/[DM])
+// Unified index: scrollback rows first (0..scrollback.size()-1), then screen rows.
+// Total lines = scrollback.size() + rows. All display/selection code uses this instead of
+// direct array access so scrollback and screen are treated as one contiguous logical buffer.
 const Row& ConBox::line_at(int idx) const
 {
     // Unified index: scrollback first, then the current screen.
@@ -1889,7 +1768,10 @@ void ConBox::leave_alt_screen()
     reset_screen();
 }
 
-// (design: [VT])
+// Writes one glyph at the cursor. Autowraps if it would exceed cols. CELL_DOUBLE stores the glyph
+// in 1 cell but advances cur_col by w*2; subsequent chars land past the 2x visual span without manual
+// spacing. Scroll workers: scroll_lines_up/down (pure rotation), scroll_up_region (pushes displaced
+// lines into scrollback on main screen top==0), enter/leave_alt_screen (swap with main_saved).
 void ConBox::put_char(wchar_t wc)
 {
     // Write one glyph at the cursor, autowrapping first if it would exceed cols. A wide glyph goes in
@@ -2015,7 +1897,11 @@ static COLORREF Xterm256ToRgb(int n, const COLORREF* pal)
     return RGB(v, v, v);
 }
 
-// (design: [VT])
+// VT state machine. State (vt_state/params/priv/gtlt/space) persists across print() chunks.
+// GROUND: glyph->put_char; C0: CR/LF/BS/TAB(x8)/BEL.
+// ESC: 7,8=DECSC/RC; D=IND, E=NEL, M=RI, c=RIS, [=CSI, ]=OSC.
+// CSI: accumulate params; ?=priv, <>=gtlt, ' '=space/DECSCUSR; final byte->dispatch_csi.
+// OSC: discard up to BEL/ST.
 void ConBox::vt_feed(wchar_t wc)
 {
     // Parser state machine. State (vt_state etc.) is a member, so a sequence survives print() chunks.
@@ -2125,7 +2011,10 @@ void ConBox::vt_feed(wchar_t wc)
     }
 }
 
-// (design: [VT])
+// CSI dispatch. Drops sequences with gtlt prefix (private <>=) to avoid final-byte misparse.
+// Cursor: CUU/CUD/CUF/CUB/CUP/HVP/CHA/VPA/CNL/CPL. Erase: ED/EL/ECH. SGR: m.
+// Modes h/l: ?25, ?1049/47, ?1048, ?1, ?2004. Save/restore: s/u.
+// Scroll: DECSTBM r, IL/DL, ICH/DCH, SU/SD. Queries: DSR->CPR, DA->VT102.
 void ConBox::dispatch_csi(wchar_t fin)
 {
     // Sequences prefixed with '<' '=' '>' (2nd DA, kitty keyboard protocol, XTMODKEYS...) are
@@ -2751,6 +2640,7 @@ void ConBox::OnSetFocus(CWnd*)
     if (get_cursor_rect(rc)) InvalidateRect(&rc, FALSE);
 }
 
+// Cursor is hidden on focus loss and restored on focus gain (repaint cursor rect only).
 void ConBox::OnKillFocus(CWnd*)
 {
     has_focus = false;
@@ -3008,6 +2898,11 @@ void ConBox::OnDropFiles(HDROP hdrop)
     DragFinish(hdrop);
 }
 
+// Korean IME: committed part (GCS_RESULTSTR) sent to child; uncommitted (GCS_COMPSTR) held in
+// comp_str, drawn by ConBox (hollow outline at cursor; return 0 suppresses system inline+WM_CHAR).
+// Mid-line: ScrollDC shifts line right to preview insertion. finalize_composition force-commits
+// before trigger keys (order: [committed][trigger]). ime_committed gates Left/Right correction
+// after a commit (MS IME pre-commits before the arrow WM_KEYDOWN; finalize return value unusable).
 LRESULT ConBox::OnImeStart(WPARAM w, LPARAM l)
 {
     // Move the composition/candidate windows to the cursor and set the composing font to Korean. We
@@ -3429,7 +3324,11 @@ void ConBox::ensure_back_buffer(CDC* ref, int w, int h)
     }
 }
 
-// (design: [PAINT]/[IME])
+// Double-buffered: draw whole frame into memory DC, then BitBlt. Columns RIGHT-TO-LEFT per row
+// (CELL_DOUBLE bleeds right; drawn first so bleed overwrites already-laid cells). Wide glyphs use
+// kfont (2 cells); trail cells skip. Block/box chars via DrawBlockElement/DrawBoxLine.
+// CELL_DOUBLE: efont_double/kfont_double (2x bold). Cursor: blend_cursor_color fill + redraw glyph;
+// child_caret suppresses ConBox block cursor. Overlay scrollbar: AlphaBlend last over right edge.
 void ConBox::OnPaint()
 {
     CPaintDC paintDC(this);
@@ -4287,7 +4186,11 @@ bool ConBox::start()
     return start(cfg_cmdline.c_str());
 }
 
-// (design: [PTY])
+// ConPTY child: CreatePtyPipes (pipes+CreatePseudoConsole) -> STARTUPINFOEX -> CreateProcessW ->
+// close PTY-side ends -> set_input_sink/set_resize_sink -> SetTimer(PUMP_TIMER).
+// pump: PeekNamedPipe -> ReadFile -> print. Exit detection: ConPTY keeps output pipe open after
+// child exits (no EOF); poll WaitForSingleObject instead -> handle_child_exit -> stop -> exit_cb.
+// OnDestroy calls stop(). With no start(), ConPTY members stay dormant (pure view mode).
 bool ConBox::start(const char* cmdline)
 {
     // Restart if already running.

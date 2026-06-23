@@ -168,9 +168,14 @@
     <ClInclude Include="..\Source\ConBox.h" />
     <ClInclude Include="..\Source\FrameBox.h" />
     <ClInclude Include="..\Source\TableBox.h" />
+    <ClInclude Include="resource.h" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="jbBox.rc" />
+  </ItemGroup>
+  <ItemGroup>
+    <Image Include="BackGround.png" />
+    <Image Include="jbBox.ico" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

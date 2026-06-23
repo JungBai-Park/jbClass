@@ -1,4 +1,5 @@
 ﻿// TableBox.h
+// Copyright (c) 2026 JungBai Park. All rights reserved.
 //
 // Self-contained, CWnd-derived Excel-like virtual grid control. It does NOT own any cell
 // data: the text callback is asked only for the currently visible cells and the result is
@@ -11,9 +12,8 @@
 //     the overlay scrollbar below is a from-scratch reimplementation of the ConBox style).
 //   - All coordinates passed to open()/set_cols/set_rows are 96 DPI logical px, scaled to
 //     physical px at the window's own DPI (GetDpiForWindow), same convention as ConBox/FrameBox.
-//   - Zoom (WM_JBZOOM from FrameBox): sets zoom_pm (x1000); eff_dpi()=box_dpi*zoom_pm/1000 drives
-//     build_font() and to_px() so fonts and cell geometry scale with zoom like a DPI change.
-//     build_font() and to_px() match ConBox's naming convention for the same operations.
+//   - Zoom (WM_JBZOOM from FrameBox): sets zoom_pm (x1000); fonts and cell geometry
+//     scale with zoom like a DPI change (see build_font in TableBox.cpp).
 //
 // --- Usage ---
 //     TableBox* table = new TableBox;

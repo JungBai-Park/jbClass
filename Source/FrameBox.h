@@ -1,106 +1,44 @@
-﻿/*
-    FrameBox.h - Parasite + FrameBox.
-
-    Parasite  : live layout editor by window subclassing.
-    FrameBox : CWnd-derived host window that OWNS its child controls (per-frame
-               registry) and implements the surveil/listen/report protocol.
-
-    PURPOSE (Parasite)
-    -------
-    Parasite "attaches to" an existing MFC control (CEdit/CStatic/CButton/
-    CComboBox/...) via SetWindowSubclass (comctl32) and overlays two features:
-
-      1) Live layout editing. While the app runs, toggle a control into edit
-         mode (middle button), then move/resize it with mouse + arrow keys.
-         On commit (Enter / left double-click) the new rectangle is written
-         back into the *source code* literal that produced it, using the
-         __FILE__/__LINE__ captured by the Add.../Open macro. Re-compile to make
-         it permanent. This is a DEVELOPMENT-time tool (needs the source file
-         present at its compile-time path).
-
-      2) Signal interop with a host (FrameBox) that follows the surveil/listen/
-         report protocol (see "HOST CONTRACT" below). Each control type gets a
-         default list of natural notifications (button=click, edit=text
-         change, combo=selection/edit change, etc.); controls with no useful
-         user-change signal get an empty list.
-
-    ZOOM-AWARE EDITING
-    ------------------
-    All phys<->logical conversions in Parasite (enter_edit, leave_edit ESC restore,
-    and commit/source rewrite) use eff_dpi() = MulDiv(real_dpi, zoom_pm, 1000) so
-    source rewrites are correct at any zoom level. Parasite holds owner_frame
-    (FrameBox*, set via set_owner()) and accesses FrameBox::eff_dpi() through the
-    friend class Parasite declaration in FrameBox. Every FrameBox factory that creates
-    a Parasite must call p->set_owner(this); omitting it silently falls back to
-    GetDpiForWindow (zoom-unaware). Compiled only in _DEBUG builds.
-
-    DEPENDENCIES
-    ------------
-    Standard MFC (CWnd/CRect/CClientDC) + comctl32 SetWindowSubclass. No other
-    libraries. Build: Unicode or MBCS (explicit W-API), x64.
-
-    OWNERSHIP / LIFETIME (read before use)
-    --------------------------------------
-    - A FrameBox owns the controls created through its Add* member factories:
-      each Add* registers { wnd, Parasite } in the frame's per-instance registry.
-      ~FrameBox() tears the registry down in reverse order (children first):
-      delete Parasite (removes subclass) -> DestroyWindow -> delete wnd.
-    - The ROOT frame is created with `new FrameBox`; the function that created it
-      must `delete` it (which closes everything). A child frame created by
-      add_zone()/add_frame() is owned by its parent's registry and is destroyed
-      recursively when the parent is deleted.
-    - Parasite itself does NOT own its target; attach() stores a borrowed CWnd*.
-    - If a parent window is destroyed first, Windows destroys the child HWND and
-      MFC detaches m_hWnd (=> NULL); ~Parasite then skips RemoveWindowSubclass.
-
-    MINIMAL USAGE
-    -------------
-        // Default-construct, then OpenFrame(app,...) to create + show. The frame is
-        // a stack local; ~FrameBox tears everything down at scope exit. Using a
-        // member call (not a ctor) lets a FrameBox SUBCLASS override WindowProc etc.
-        FrameBox  Top;  Top.OpenFrame(&theApp, 560,275, 1360,875);  // main + self live-edit
-        Top.set_margin(5);  // optional: auto-fit frame to children + 5 logical px padding
-        CEdit*    e = Top.AddEdit  (10, 10,200, 30);
-        CButton*  b = Top.AddButton(10, 50,100, 30, "OK");
-        CComboBox*c = Top.AddCombo (10, 90,200, 60, "A,B,C");
-        while (::IsWindow(Top)) {
-            CWnd* ev = Top.listen(e, b, c);
-            if (ev == 0 || ev == b) break;
-        }
-        // Modal sub-dialog: FrameBox Sub;  Sub.OpenFrame(&Top, ...); disables Top
-        // until Sub goes out of scope (close() re-enables Top).
-        //
-        // Ctrl+Wheel zoom: FrameBox intercepts WM_MOUSEWHEEL+MK_CONTROL via
-        // PreTranslateMessage and calls apply_zoom(). Zoom is expressed as zoom_pm
-        // (integer x1000; 1000=1.0x; range [500,3000]). eff_dpi() = dpi*zoom_pm/1000
-        // is used by rescale_children() and sys_font build. WM_JBZOOM (WM_APP+100)
-        // is broadcast to all registry children before MoveWindow so they apply zoom
-        // before their OnSize fires. apply_zoom is virtual+protected so subclasses
-        // can hook it (e.g. update a title bar) by overriding and calling base first.
-
-    HOST CONTRACT (message protocol; constants below are shared with any host)
-    -------------------------------------------------------------------------
-    A host (FrameBox / a real MainBox) must:
-      - reflect control notifications to the control HWND as WM_PARASITE_CALLBACK
-        via ::SendMessage (NOT a direct C++ WindowProc() call - that bypasses
-        the subclass chain and never reaches the subclass proc):
-            WM_COMMAND : SendMessage(ctrlHwnd, WM_PARASITE_CALLBACK, 0,
-                                     (LPARAM)(int)HIWORD(wParam))
-            WM_NOTIFY  : SendMessage(nmhdr.hwndFrom, WM_PARASITE_CALLBACK, 0,
-                                     (LPARAM)(int)nmhdr.code)
-            WM_HSCROLL/WM_VSCROLL when lParam is a control HWND:
-                         SendMessage(ctrlHwnd, WM_PARASITE_CALLBACK, 0,
-                                     (LPARAM)(int)LOWORD(wParam))
-        Reflection runs regardless of listen() state, so a child frame reflects
-        its own controls even while a parent frame is the one in listen().
-      - register/unregister reporting via WM_PARASITE_SURVEIL (wParam = host CWnd*,
-        or 0 to clear) sent to each control HWND at listen() entry/exit. The
-        report target is whichever frame called listen() - not necessarily the
-        control's parent - so a parent can listen() controls living in a child
-        zone with no relay.
-      - receive WM_PARASITE_REPORT (wParam = the signaling control's CWnd*) to end
-        its modal loop and return that pointer from listen().
-*/
+﻿// FrameBox.h
+// Copyright (c) 2026 JungBai Park. All rights reserved.
+//
+// Parasite: live layout editor via SetWindowSubclass (_DEBUG only).
+// FrameBox: CWnd-derived host window; owns child controls via per-instance registry;
+//           implements the surveil/listen/report event protocol.
+//
+// --- Requirements / dependencies ---
+//   - MFC (Unicode or MBCS), Windows only. comctl32 SetWindowSubclass. GDI+ for background images.
+//   - All Win32/MFC calls use explicit W-suffix; Unicode or MBCS, x64.
+//   - Zoom (WM_JBZOOM): zoom_pm (x1000); eff_dpi()=dpi*zoom_pm/1000 drives rescale_children().
+//     apply_zoom() is virtual+protected; subclasses override and call base first.
+//   - Parasite zoom: requires set_owner(this) from each Add* factory; else falls back to GetDpiForWindow.
+//
+// --- Ownership / Lifetime ---
+//   - FrameBox owns Add*-created controls (per-instance registry).
+//     ~FrameBox() tears down in reverse: delete Parasite -> DestroyWindow -> delete wnd.
+//   - Root frame: caller `new`s and must `delete` it.
+//   - Child frame (add_zone/add_frame): owned by parent registry, destroyed recursively.
+//   - Parasite does NOT own its target; attach() borrows a CWnd*.
+//
+// --- Host contract (message protocol) ---
+//   Host reflects control notifications to the control HWND as WM_PARASITE_CALLBACK:
+//     WM_COMMAND  -> SendMessage(ctrlHwnd, WM_PARASITE_CALLBACK, 0, (LPARAM)HIWORD(wParam))
+//     WM_NOTIFY   -> SendMessage(nmhdr.hwndFrom, WM_PARASITE_CALLBACK, 0, (LPARAM)nmhdr.code)
+//     WM_HSCROLL/VSCROLL (lParam=ctrl) -> SendMessage(ctrlHwnd, WM_PARASITE_CALLBACK, 0, LOWORD(wParam))
+//   WM_PARASITE_SURVEIL (wParam=CWnd* or 0): register/unregister report target at listen() entry/exit.
+//   WM_PARASITE_REPORT  (wParam=signaling CWnd*): signals listen() to return.
+//
+// --- Usage ---
+//     FrameBox Top;  Top.OpenFrame(&theApp, 560,275, 1360,875);
+//     Top.set_margin(5);                          // auto-fit frame to children + 5 px padding
+//     CEdit*     e = Top.AddEdit  (10, 10,200, 30);
+//     CButton*   b = Top.AddButton(10, 50,100, 30, "OK");
+//     CComboBox* c = Top.AddCombo (10, 90,200, 60, "A,B,C");
+//     while (::IsWindow(Top)) {
+//         CWnd* ev = Top.listen(e, b, c);
+//         if (ev == 0 || ev == b) break;
+//     }
+//     // Modal sub-dialog: FrameBox Sub; Sub.OpenFrame(&Top, ...); disables Top until Sub closes.
+//
 
 #pragma once
 
@@ -116,6 +54,9 @@ class FrameBox;   // forward decl for Parasite::set_owner / Parasite::eff_dpi
 #include <vector>       // FrameBox per-instance child registry
 #include <functional>   // std::function for menu action callbacks
 #include <string>       // std::string for UTF-8 menu labels
+
+// Forward-declare only; full <gdiplus.h> is in FrameBox.cpp to avoid polluting includers.
+namespace Gdiplus { class Image; }
 
 // ---- Shared message protocol (identical values to 05-box.c++ MainBox) -------
 // Keep these in sync with any real host (MainBox) so they interoperate.
@@ -293,29 +234,6 @@ bool LayOutRewrite(const char* file, int line, const RECT& rect);
 //     resource needed). Actions stored in menu_popups; dispatched from WindowProc
 //     on WM_COMMAND (lParam==0). modify_menu_label(id, label) renames an item.
 //     First add_menu call auto-compensates window height for the new menu bar.
-//   - WindowProc reflects child notifications (WM_COMMAND/WM_NOTIFY/WM_HSCROLL/
-//     WM_VSCROLL) to the control HWND as WM_PARASITE_CALLBACK. This runs always, so a
-//     child frame reflects its own controls even while a parent runs listen().
-//   - WindowProc handles live DPI changes: WM_DPICHANGED (top-level/popup) resizes the
-//     frame to the OS-suggested rect; WM_DPICHANGED_AFTERPARENT (WS_CHILD zone) reacts to
-//     the parent's DPI change. Both update `dpi`, rebuild `sys_font`, then call
-//     rescale_children() to reposition every WS_CHILD entry from its logical rect and
-//     reapply the font. Owned popup child frames (AddFrame) get their own WM_DPICHANGED.
-//   - PreTranslateMessage intercepts ESC (post WM_CLOSE) and Enter (click focused
-//     push button) in both normal and edit mode, matching CDialog. Exceptions:
-//       * focused window returns DLGC_WANTALLKEYS -> both keys pass through
-//         (e.g. a terminal/ConBox widget that needs raw Esc/Enter),
-//       * message target == editing_hwnd() -> returns FALSE so Parasite commits
-//         (Enter) / cancels (ESC) the repositioned control.
-//     TRAP: the editing_hwnd() guard does NOT restrict ESC/Enter to edit mode;
-//     in normal mode they are ALWAYS consumed (except DLGC_WANTALLKEYS).
-//
-// USAGE  (see MINIMAL USAGE in the file header for a full loop)
-//     FrameBox Top;  Top.OpenFrame(&theApp, 560,275, 1360,875);  // stack local
-//     CButton* b = Top.AddButton(10,10,100,30, "Close");
-//     CWnd* ev = Top.listen(b);
-//     ...
-//     // ~Top at scope exit: reverse order remove subclass -> DestroyWindow -> delete
 class FrameBox : public CWnd {
 public:
     FrameBox();
@@ -341,6 +259,11 @@ public:
     // window. Called by ~FrameBox; idempotent.
     void close();
 
+    // Show/hide the frame window. open() creates the window hidden; call show()
+    // explicitly when the UI is fully built and ready to be presented.
+    void show() { if (::IsWindow(m_hWnd)) ShowWindow(SW_SHOW); }
+    void hide() { if (::IsWindow(m_hWnd)) ShowWindow(SW_HIDE); }
+
     // Set a repeating timer. period > 0: fire every period ms, listen() returns
     // this. period <= 0: cancel. Returns 0 on success or GetLastError() on failure.
     int timer(int period);
@@ -361,13 +284,50 @@ public:
     // Change the display label of a menu bar item identified by its WM_COMMAND ID.
     void modify_menu_label(int id, const char* label);
 
-    // Modal wait until one of the listed controls signals. Returns its CWnd*
-    // (or 0 if the window was closed, or this if the timer fired).
-    template<class... Args>
-    CWnd* listen(Args*... controls) {
-        CWnd* list[] = { static_cast<CWnd*>(controls)... };
-        return listen_core(static_cast<int>(sizeof...(controls)), list);
+    // Open a window whose client area exactly matches an RCDATA image resource
+    // (JPEG/PNG/BMP auto-detected via GDI+). x0,y0 are 96 DPI logical screen coords.
+    // The window size is derived from the image pixel dimensions (no x1,y1 needed).
+    // Two overloads mirror open(): CWinApp* for main window, CWnd* for modal sub-dialog.
+    // Returns false if the resource cannot be loaded or the image format is invalid.
+    bool open_image(CWinApp* app,   int x0, int y0, int id);
+    bool open_image(CWnd*    owner, int x0, int y0, int id);
+
+    // Remove the OS title bar and draw owner-drawn Ubuntu-style round caption
+    // buttons in the top-right of the client area. Must be called AFTER open()/
+    // open_image() (requires a valid m_hWnd). Empty client area becomes draggable
+    // (WM_NCHITTEST -> HTCAPTION). Button geometry scales with eff_dpi() from a
+    // 96 DPI baseline, so it tracks Ctrl+Wheel zoom and DPI changes automatically.
+    //   option 0: frameless, no buttons
+    //   option 1: close only (right slot)
+    //   option 2: close + minimize (minimize takes the middle/maximize slot)
+    //   option 3: close + minimize + maximize (all three slots)
+    //   other   : no-op, returns -1
+    // Returns 0 on success, -1 on invalid option, -2 if the window is not created.
+    int  frameless(int option);
+
+    // Manage the surveil set. listen() and wait() are decoupled:
+    //   listen()            - clear all surveilled controls (sends WM_PARASITE_SURVEIL=0 to each)
+    //   listen(a, b, ...)   - ADD controls to the current surveil set (does not replace)
+    //   wait()              - block until any surveilled control signals; returns its CWnd*
+    //                         (nullptr if window closed, this if timer fired)
+    // Typical loop:
+    //   Top.listen(edit, button, combo);   // set once before loop
+    //   while (::IsWindow(Top)) {
+    //       CWnd* ev = Top.wait();
+    //       if (!ev || ev == button) break;
+    //   }
+    // listen() with no args is also called by close() to clean up surveil state.
+    void listen() {
+        surveil_all(false);
+        surveil_list.clear();
     }
+    template<class... Args>
+    void listen(Args*... controls) {
+        CWnd* add[] = { static_cast<CWnd*>(controls)... };
+        for (CWnd* w : add) surveil_one(w, true);
+        for (CWnd* w : add) surveil_list.push_back(w);
+    }
+    CWnd* wait();
 
     // ---- child-control factories (use the Add* macros, which inject file/line)
     // Each creates the control as a child of THIS frame and registers it.
@@ -428,8 +388,8 @@ private:
     template<class T> T* finish_child(T* wnd, BOOL ok, int x0,int y0,int x1,int y1,
                                       const char* f,int ln,const char* init);
     CWnd*     attach_external(CWnd* wnd, bool owned, int x0,int y0,int x1,int y1,const char* f,int ln);
-    CWnd*     listen_core(int count, CWnd** list);
-    void      surveil(int count, CWnd** list, bool on);
+    void      surveil_one(CWnd* w, bool on);   // send WM_PARASITE_SURVEIL to one control
+    void      surveil_all(bool on);            // send to all controls in surveil_list
     void      rescale_children();   // reposition WS_CHILD entries + reapply sys_font at eff_dpi()
     void      fit_to_children();   // if snap_margin>=0: resize FrameBox to wrap all child rects + margin
 
@@ -439,8 +399,9 @@ private:
     CWinApp*  app;                        // set by attach(); non-null only for the main window
     CWnd*     parent;                     // owner to re-enable in close() (modal sub-frame only)
     Parasite*  self_layout;                // root self-edit subclass (null for child frames)
+    std::vector<CWnd*> surveil_list;       // controls currently registered for WM_PARASITE_SURVEIL
     bool      waiting;
-    bool      timer_fired;                // set by WM_TIMER while waiting, consumed by listen_core
+    bool      timer_fired;                // set by WM_TIMER while waiting, consumed by wait()
     CWnd*     event;
     UINT_PTR  timer_id;                   // 0 = no active timer
     int       snap_margin;                // set_margin() value (96 DPI logical px); -1 = disabled
@@ -461,6 +422,39 @@ private:
     CMenu                   menu_bar;
     std::vector<MenuPopup>  menu_popups;
     int                     next_menu_id;
+
+    // Background image (open_image). bg_image is a GDI+ Image* painted in WM_ERASEBKGND.
+    // bg_stream keeps the raw bytes alive (Gdiplus::Image::FromStream does NOT copy them).
+    // Both freed in close(). nullptr = solid COLOR_BTNFACE fill (default).
+    bool            load_bg_image(int id);    // loads resource into bg_image/bg_stream
+    Gdiplus::Image* bg_image;
+    IStream*        bg_stream;
+
+    // Cached, pre-scaled background. WM_ERASEBKGND would otherwise re-stretch the
+    // GDI+ image (slow JPEG resample) on every paint; during a zoom that runs many
+    // times and stalls the redraw 1-2 s. We stretch once into a screen-compatible
+    // bitmap sized to the client, then BitBlt it on every erase. Rebuilt only when
+    // the client size changes. Freed in close() / load_bg_image().
+    void    rebuild_bg_cache(HDC ref, int w, int h);
+    HBITMAP bg_cache;
+    int     bg_cache_w;
+    int     bg_cache_h;
+
+    // Frameless mode (frameless()). fless_opt: -1 = normal window (OS title bar);
+    // 0-3 = frameless with that many caption buttons. All caption-button handling
+    // in WindowProc (WM_NCHITTEST/PAINT/MOUSEMOVE/MOUSELEAVE/LBUTTONUP) is gated on
+    // fless_opt >= 0, so a normal window is byte-for-byte unaffected.
+    // fless_gdip: true if frameless() raised the GDI+ refcount (so close() releases it).
+    int   fless_opt;          // -1 = not frameless; 0..3 = button count
+    bool  fless_gdip;         // frameless() called gdip_addref()
+    bool  fless_hover_close;  // hover state per button (drives the brighten effect)
+    bool  fless_hover_max;
+    bool  fless_hover_min;
+    bool  fless_tracking;     // TrackMouseEvent(TME_LEAVE) is armed
+    CRect fless_btn_rect(int from_right) const;  // circle rect in client coords; 0=rightmost(close)
+    CRect fless_strip() const;                   // bounding rect of all buttons (+pad) for draw/invalidate
+    int   fless_hit(POINT pt) const;             // 1=close,2=minimize,3=maximize,0=none (pt in client coords)
+    void  fless_draw(HDC hdc) const;             // double-buffered button paint (WM_PAINT)
 };
 
 // ---- Factory macros: member-call form that injects __FILE__/__LINE__ ----
@@ -510,3 +504,9 @@ private:
 //   FrameBox Top;  Top.OpenFrame(&theApp, 393, -955, 1168, -280);
 //   FrameBox Sub;  Sub.OpenFrame(&Top,    10, 10, 100, 100);
 #define OpenFrame(p,x0,y0,x1,y1)    open((p), (x0),(y0),(x1),(y1), LAYOUT_SRC)
+
+// Like OpenFrame but sizes the window to an RCDATA image resource (JPEG/PNG/BMP).
+// Only 2 coords (x0,y0); the window size is determined from the image dimensions.
+// Parasite source-rewriter does NOT apply to this macro (only 2 coords, not 4).
+//   FrameBox Top;  Top.OpenImage(&theApp, 510, -910, IDR_BACKGROUND);
+#define OpenImage(p,x0,y0,id)        open_image((p), (x0),(y0),(id))

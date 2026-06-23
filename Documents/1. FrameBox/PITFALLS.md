@@ -82,8 +82,10 @@
   ```
   The `.manifest` file is merged and embedded into the EXE at link time (`RT_MANIFEST`, type 24, ID 1).
   No separate file is needed at runtime.
-- The manifest file itself only contains the DPI awareness declaration. Common Controls 6.0
-  dependency stays in source code via `#pragma comment(linker, "/manifestdependency:...")`.
+- The manifest file (`jbBox.manifest`) declares BOTH the `PerMonitorV2` DPI awareness and the
+  Common Controls 6.0 `<dependency>` (`processorArchitecture="*"`). The old
+  `#pragma comment(linker, "/manifestdependency:...")` in source was removed in favor of the
+  manifest entry.
 - Diagnostic: log `GetThreadDpiAwarenessContext()` result at startup; `SYS=1` confirms the
   CRT initializer already set System-aware before the code-based API call.
 
@@ -128,3 +130,23 @@
 - A `FrameBox` self-edit subclasses the FRAME's HWND, but the frame's child controls are separate HWNDs. The frame's `Parasite::dispatch` eats input only for the frame window, so children still hover-highlighted and stole focus, and arrow keys went to the focused child instead of moving the frame.
 - `editing_hwnd() == pMsg->hwnd` is false when a child holds focus (target is the child), so the old `PreTranslateMessage` guard did not catch this case.
 - Fix (in `FrameBox::PreTranslateMessage`, only while `editing_hwnd()` is non-NULL): route edit keys (arrows/Enter/Esc) to the editing window via `SendMessageW(edit, WM_KEYDOWN, ...)` regardless of focus and consume them; swallow non-editing controls' mouse messages (`WM_MOUSEFIRST..WM_MOUSELAST`) so they stay inert. Let `WM_MBUTTONDOWN` pass so edit can still be toggled on another control. When the editing window itself is focused (`pMsg->hwnd == edit`), return FALSE to let its own subclass proc handle the key.
+
+### 14. Background Image Re-Stretch Stalls Zoom (open_image)
+
+- Drawing the GDI+ background `Image` directly in `WM_ERASEBKGND` (`Graphics::DrawImage(img, clientRect)`) re-runs the JPEG/PNG resample on EVERY erase. A Ctrl+Wheel zoom triggers many full-client erases (child `MoveWindow`, `Invalidate()`, `fit_to_children` resize, `CS_HREDRAW|CS_VREDRAW`), so the visible result was: background repainted instantly but the whole frame took 1-2 s to settle. `OpenFrame` (solid `FillRect`) had no lag, which isolated the cause to the image resample.
+- Fix: cache the scaled background in a screen-compatible `HBITMAP` (`rebuild_bg_cache`) sized to the client; `WM_ERASEBKGND` `BitBlt`s the cache. Rebuild only when the client size changes (`bg_cache_w/h` mismatch) and free in `close()` / `load_bg_image()`. `frameless`'s `fless_draw` also blits the cache slice instead of re-stretching the full image.
+- Note: a small-output `DrawImage` clipped to the button strip is NOT cheap -- GDI+ still transforms the entire source. Always source button-strip background from the cache, not a fresh stretch.
+- Do NOT add `WS_CLIPCHILDREN` to speed this up: transparent `AddStatic` controls (`WM_CTLCOLORSTATIC` -> `NULL_BRUSH`) rely on the parent painting the background under them; clipping children would leave those rects unpainted.
+
+### 15. Gdiplus::Graphics::DrawImage Overload Ambiguity with LONG
+
+- `Graphics::DrawImage(Image*, x, y)` has both `(INT,INT)` and `(REAL,REAL)` overloads. Passing
+  `CRect::left/top` (type `LONG`) is ambiguous (C2668). Cast explicitly: `DrawImage(&buf, (INT)x, (INT)y)`.
+
+### 16. Frameless Mode (Custom Caption Buttons)
+
+- `frameless()` strips `WS_CAPTION|WS_SYSMENU|WS_THICKFRAME|WS_MINIMIZEBOX|WS_MAXIMIZEBOX|WS_BORDER|WS_DLGFRAME`, adds `WS_POPUP`, then `SetWindowPos(SWP_FRAMECHANGED)`. Must run after the window exists.
+- Removing `WS_CAPTION` enlarges the client area (no title bar), so an `open_image` window's client grows by the former caption height and the cached background stretches to fill it -- acceptable, not corrected.
+- GDI+ must be initialized even when no background image is used: `frameless()` calls `gdip_addref()` once (guarded by the `fless_opt < 0` -> first-call transition) and `close()` releases it via the `fless_gdip` flag. Without this, a frameless `OpenFrame` (no `open_image`) window would create GDI+ objects in `fless_draw` with GDI+ not started.
+- `WM_NCHITTEST` returns `HTCAPTION` for empty client area (OS drag-move) and `HTCLIENT` over a button circle (so `WM_MOUSEMOVE`/`WM_LBUTTONUP` reach the frame). Hit test is circular (distance <= radius), not the bounding rect.
+- All caption-button handling is gated on `fless_opt >= 0`; a normal titled window keeps its original `WindowProc` behavior untouched.

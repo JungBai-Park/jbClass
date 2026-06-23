@@ -1,4 +1,5 @@
 ﻿// ConBox.h
+// Copyright (c) 2026 JungBai Park. All rights reserved.
 //
 // Portable terminal control (CWnd-derived). Like wt.exe it displays the console
 // output of a terminal child program and forwards keystrokes to it. Internally a
@@ -9,26 +10,16 @@
 // contents lets you find one function without reading the whole file).
 //
 // --- Requirements / dependencies ---
-//   - MFC (Unicode or MBCS), Windows only. Depends on afxwin.h. All Win32/MFC calls in the
-//     portability unit use explicit W-suffix functions so both character-set settings compile.
+//   - MFC (Unicode or MBCS), Windows only. Depends on afxwin.h. All Win32/MFC calls use explicit W-suffix.
 //   - start() (ConPTY child) needs Windows 10 1809 (build 17763)+. Pure-view use does not.
 //   - imm32.lib (Korean IME) is auto-linked by ConBox.cpp via #pragma comment (no host setup).
-//   - For crisp glyphs the HOST app enables DPI awareness at startup (DPI awareness is a process-wide
-//     property, so the host sets it, not this control; PerMonitorV2 via the app manifest is preferred).
-//     ConBox itself is per-monitor aware: fonts/cell metrics use the window's own DPI (GetDpiForWindow)
-//     and it rebuilds them on a DPI change (WM_DPICHANGED_AFTERPARENT), so text stays correctly sized
-//     when the host window moves between monitors of different DPI.
-//   - Zoom (WM_JBZOOM from FrameBox): sets zoom_pm (x1000) and zoom_resize=true; next OnSize takes
-//     the relayout_for_dpi+snap_to_grid path (no PTY resize). eff_dpi()=box_dpi*zoom_pm/1000 drives
-//     build_font() and to_px() so fonts and scrollbar geometry scale with zoom like a DPI change.
+//   - Host app must enable DPI awareness (PerMonitorV2 via manifest). ConBox is per-monitor aware:
+//     fonts/cell metrics use GetDpiForWindow, rebuilt automatically on monitor DPI change.
+//   - Zoom (WM_JBZOOM from FrameBox): sets zoom_pm (x1000); eff_dpi()=box_dpi*zoom_pm/1000 drives
+//     build_font() and to_px() so fonts/geometry scale with zoom like a DPI change.
 //   - Every string API takes UTF-8 (const char*) so C++ string literals pass directly.
 //   - Self-contained: includes its own headers, does not depend on a precompiled header.
 //   - Save .h/.cpp as ASCII (comments are ASCII-only) so encoding is unambiguous.
-//   - SGR text attributes: bold/italic use font variants (efont/kfont _bold/_italic/_bold_italic),
-//     underline/strike are drawn as 1px decoration lines, blink toggled by BLINK_TIMER (500ms).
-//     SGR 8/28 = double-size (CELL_DOUBLE): 2x glyph, always bold, bleeds up+right; cursor auto-
-//     advances 2x so no manual spaces needed between big chars. Stored in CharInfo::flags.
-//   - Text cursor is hidden when the window loses focus (WM_KILLFOCUS) and restored on WM_SETFOCUS.
 //
 // --- Usage (inside the host parent window) ---
 //     ConBox box;                            // usually held as a member
@@ -44,7 +35,7 @@
 //      and auto-wires its console I/O (console size taken from grid_size(); internally
 //      reuses the input/resize sinks). Child output is polled by an internal timer into print().
 // With no sink and no start(), it is a read-only viewer of print() output.
-
+//
 #pragma once
 
 // Zoom message shared with FrameBox/TableBox (same numeric value in each module header).

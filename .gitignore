@@ -1,0 +1,50 @@
+# General -------------------------------------------------
+desktop.ini
+desktop.ico
+.git
+*.lnk
+*.bak
+*.tmp
+~*.*
+
+# Visual Studio Files -------------------------------------
+Debug.32
+Debug.64
+Release.32
+Release.64
+Inline.32
+Inline.64
+*.aps
+ipch
+.vs
+*.sdf
+*.obj
+*.tlog
+*.log
+*.lastbuildstate
+*.ilk
+*.pdb
+*.idb
+*.pch
+*.suo
+*.opensdf
+/Build/JungBai.lib
+/Library/Deploy
+/Library/Build/Output
+/Library/Build/Input/code
+/Library/Build/Input/header
+/Library/Tools/C++Divider/Build/Output
+
+# Code Composer -------------------------------------------
+.DB
+.metadata
+.platformWizard
+dvt
+Debug
+Release
+*.dep
+*.ae66e
+
+# Project Specific ----------------------------------------
+Temp/
+/Reference

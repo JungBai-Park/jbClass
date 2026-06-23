@@ -33,34 +33,28 @@
     (OpenFrame coords start at arg 2; member-call coords at arg 1).
 */
 
-#if defined _M_IX86
-#pragma comment(linker,"/manifestdependency:\"type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='x86' publicKeyToken='6595b64144ccf1df' language='*'\"")
-#elif defined _M_X64
-#pragma comment(linker,"/manifestdependency:\"type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='amd64' publicKeyToken='6595b64144ccf1df' language='*'\"")
-#else
-#pragma comment(linker,"/manifestdependency:\"type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
-#endif
 #include "..\Source\FrameBox.h"
 #include "..\Source\ConBox.h"
 #include "..\Source\TableBox.h"
+#include "resource.h"  // IDR_BACKGROUND
 #include <shlobj.h>    // SHBrowseForFolderW, SHGetPathFromIDListW
 
 
-void DemoMain();
+int  DemoMain(int argc, const char* argv[]);
 void DemoSub(CWnd* owner);
 
 class cDemoApp : public CWinApp {
+    int exit_code = 0;
 public:
     virtual BOOL InitInstance() {
         INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_WIN95_CLASSES };
         InitCommonControlsEx(&icc);
         CWinApp::InitInstance();
-        DemoMain();          // drives its own listen() loop and deletes the root frame
+        // __argc/__argv are CRT globals (system ANSI codepage, not UTF-8).
+        exit_code = DemoMain(__argc, const_cast<const char**>(__argv));
         return FALSE;        // DemoMain ran its own loop; exit the app
     }
-    // ExitInstance normally returns AfxGetCurrentMessage()->wParam (the last pumped message's
-    // wParam), which is meaningless when InitInstance drives its own modal loop and returns FALSE.
-    virtual int ExitInstance() { return 0; }
+    virtual int ExitInstance() { return exit_code; }
 };
 
 class cDemoBox : public FrameBox {
@@ -152,9 +146,11 @@ static const char* DefaultTableEdit(int row, int col, const char* text, void* us
     return nullptr;
 }
 
-void DemoMain() {
+int DemoMain(int argc, const char* argv[]) {
     cDemoBox Top;
-    Top.OpenFrame(&theApp, 510, -910, 1410, -170);   // main + self live-edit
+    // Top.OpenFrame(&theApp, 510, -910, 510 + 900, -910 + 750);   // main window sized to background image
+    Top.OpenImage(&theApp, 510, -910, IDR_BACKGROUND);   // main window sized to background image
+    Top.frameless(2);                                    // borderless + close/min/max caption buttons
     Top.CenterWindow();
     Top.set_margin(5);
     Top.update_title();   // show initial DPI (count=0)
@@ -162,115 +158,8 @@ void DemoMain() {
     ConBox* conBox = new ConBox;
     conBox->setup_from_ini("..\\..\\Documents\\ConBox.ini");
     conBox->open(&Top, 5, 5);
-    Top.AddNew(5, 300, 601, 695, conBox);   // coords-first; Top owns conBox
+    Top.AddNew(5, 340, 601, 735, conBox);   // coords-first; Top owns conBox
     Top.con_box = conBox;
-
-    // Build menu bar: "ConBox" popup mirrors the former system-menu items.
-    // first_id is the WM_COMMAND ID of the first ConBox item (Save EMF).
-    // The Logging item is first_id+3 (EMF/Text/PDF occupy +0/+1/+2; separator skipped).
-    bool logging = false;
-    int first_id = Top.add_menu("ConBox", {
-        { "Save EMF...", [&]{
-            BROWSEINFOW bi = {};
-            bi.hwndOwner = Top.m_hWnd;
-            bi.lpszTitle = L"Select folder to save EMF files";
-            bi.ulFlags   = BIF_RETURNONLYFSDIRS;
-            LPITEMIDLIST pidl = ::SHBrowseForFolderW(&bi);
-            if (pidl) {
-                wchar_t path[MAX_PATH] = {};
-                if (::SHGetPathFromIDListW(pidl, path)) {
-                    char utf8[MAX_PATH * 3] = {};
-                    ::WideCharToMultiByte(CP_UTF8, 0, path, -1, utf8, sizeof(utf8), NULL, NULL);
-                    if (conBox->save_emf(utf8))
-                        ::MessageBoxW(Top.m_hWnd, L"EMF saved.", L"Info", MB_OK | MB_ICONINFORMATION);
-                    else
-                        ::MessageBoxW(Top.m_hWnd, L"EMF save failed.", L"Error", MB_OK | MB_ICONERROR);
-                }
-                ::CoTaskMemFree(pidl);
-            }
-        }},
-        { "Save Text...", [&]{
-            wchar_t file[MAX_PATH] = L"ConBox";
-            OPENFILENAMEW ofn = {};
-            ofn.lStructSize = sizeof(ofn);
-            ofn.hwndOwner   = Top.m_hWnd;
-            ofn.lpstrFilter = L"Text Files (*.txt)\0*.txt\0All Files (*.*)\0*.*\0";
-            ofn.lpstrFile   = file;
-            ofn.nMaxFile    = MAX_PATH;
-            ofn.Flags       = OFN_OVERWRITEPROMPT | OFN_HIDEREADONLY;
-            ofn.lpstrDefExt = L"txt";
-            if (::GetSaveFileNameW(&ofn)) {
-                HANDLE hf = ::CreateFileW(file, GENERIC_WRITE, 0, NULL,
-                                          CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-                if (hf != INVALID_HANDLE_VALUE) {
-                    std::vector<std::string> lines = conBox->get_text_lines();
-                    for (const std::string& ln : lines) {
-                        DWORD written;
-                        ::WriteFile(hf, ln.c_str(), (DWORD)ln.size(), &written, NULL);
-                        ::WriteFile(hf, "\r\n", 2, &written, NULL);
-                    }
-                    ::CloseHandle(hf);
-                    ::MessageBoxW(Top.m_hWnd, L"Text saved.", L"Info", MB_OK | MB_ICONINFORMATION);
-                }
-            }
-        }},
-        { "Save PDF...", [&]{
-            wchar_t file[MAX_PATH] = L"ConBox";
-            OPENFILENAMEW ofn = {};
-            ofn.lStructSize = sizeof(ofn);
-            ofn.hwndOwner   = Top.m_hWnd;
-            ofn.lpstrFilter = L"PDF Files (*.pdf)\0*.pdf\0\0";
-            ofn.lpstrFile   = file;
-            ofn.nMaxFile    = MAX_PATH;
-            ofn.Flags       = OFN_OVERWRITEPROMPT | OFN_HIDEREADONLY;
-            ofn.lpstrDefExt = L"pdf";
-            if (::GetSaveFileNameW(&ofn)) {
-                char utf8[MAX_PATH * 3] = {};
-                ::WideCharToMultiByte(CP_UTF8, 0, file, -1, utf8, sizeof(utf8), NULL, NULL);
-                if (conBox->save_pdf(utf8))
-                    ::MessageBoxW(Top.m_hWnd, L"PDF saved.", L"Info", MB_OK | MB_ICONINFORMATION);
-                else
-                    ::MessageBoxW(Top.m_hWnd, L"PDF save failed.\nNo PDF printer found or print job failed.",
-                                  L"Error", MB_OK | MB_ICONERROR);
-            }
-        }},
-        { "", nullptr },   // separator
-        { "Start Logging...", [&]{
-            int log_id = first_id + 3;
-            if (conBox->is_logging()) {
-                conBox->save_log(nullptr);
-                logging = false;
-                Top.modify_menu_label(log_id, "Start Logging...");
-            } else {
-                wchar_t file[MAX_PATH] = L"ConBox";
-                OPENFILENAMEW ofn = {};
-                ofn.lStructSize = sizeof(ofn);
-                ofn.hwndOwner   = Top.m_hWnd;
-                ofn.lpstrFilter = L"Log Files (*.log)\0*.log\0All Files (*.*)\0*.*\0";
-                ofn.lpstrFile   = file;
-                ofn.nMaxFile    = MAX_PATH;
-                ofn.Flags       = OFN_OVERWRITEPROMPT | OFN_HIDEREADONLY;
-                ofn.lpstrDefExt = L"log";
-                if (::GetSaveFileNameW(&ofn)) {
-                    char utf8[MAX_PATH * 3] = {};
-                    ::WideCharToMultiByte(CP_UTF8, 0, file, -1, utf8, sizeof(utf8), NULL, NULL);
-                    if (conBox->save_log(utf8) == 0) {
-                        logging = true;
-                        Top.modify_menu_label(log_id, "Stop Logging");
-                    } else {
-                        ::MessageBoxW(Top.m_hWnd, L"Failed to open log file.", L"Error", MB_OK | MB_ICONERROR);
-                    }
-                }
-            }
-        }},
-    });
-    Top.add_menu("Help", {
-        { "About...", [&]{
-            ::MessageBoxW(Top.m_hWnd,
-                L"jbClass Demo\nVersion 0.1",
-                L"About", MB_OK | MB_ICONINFORMATION);
-        }},
-    });
 
     std::vector<int> col_widths(50);
     for (size_t i = 0; i < col_widths.size(); ++i) col_widths[i] = (i % 2 == 0) ? 125 : 75;
@@ -285,7 +174,6 @@ void DemoMain() {
         }
     }
 
-
     table_text[6][2] = "2";   // Stage 5 combo-cell demo
     TableBox* table = new TableBox;
     table->set_cols(col_widths);
@@ -297,24 +185,26 @@ void DemoMain() {
     table->set_align(5);
     table->set_edit_adjust(1, 4, 0, 0);
     table->open(&Top, 5, 5, 10, 8);
-    Top.AddNew(5, 5, 805, 282, table);    // attach-only; keep the size/position open() computed
+    Top.AddNew(5, 50, 805, 327, table);    // attach-only; keep the size/position open() computed
 
-    CEdit*     edit   = Top.AddEdit  (685, 359, 874, 399);
+    CEdit*     edit   = Top.AddEdit  (685, 405, 874, 445);
 
-    CButton*   button = Top.AddButton(710, 330, 790, 355, "Close");
-    CButton*   subBtn = Top.AddButton(795, 330, 875, 355, "Sub");
-    CStatic*   label  = Top.AddStatic(665, 415, 875, 435, "강누리 만세");
-    CComboBox* combo  = Top.AddCombo (685, 300, 875, 323, "Left,Center,Right");
+    CButton*   button = Top.AddButton(710, 370, 790, 395, "Close");
+    CButton*   subBtn = Top.AddButton(795, 370, 875, 395, "Sub");
+    CStatic*   label  = Top.AddStatic(665, 455, 875, 475, "강누리 만세");
+    CComboBox* combo  = Top.AddCombo (685, 340, 875, 363, "Left,Center,Right");
 
     AlignText(edit, 5);
     AlignText(label, 3);
 
+    Top.listen(edit, button, subBtn, label, combo);
     while (::IsWindow(Top)) {
-        CWnd* ev = Top.listen(edit, button, subBtn, label, combo);
+        CWnd* ev = Top.wait();
         if (ev == 0)      break;          // window closed
         if (ev == button) break;          // Close button -> quit
         if (ev == subBtn) DemoSub(&Top);  // open the modal sub-dialog
     }
+    return 0;
 }
 
 // Modal sub-dialog: Sub.OpenFrame(owner,...) opens an owned popup and disables
@@ -327,8 +217,9 @@ void DemoSub(CWnd* owner) {
     CStatic* msg = Sub.AddStatic(22, 124, 262, 148, "모달 서브 프레임");
     CButton* ok  = Sub.AddButton(155, 9, 275, 41, "OK");
     AlignText(msg, 5);
+    Sub.listen(ok);
     while (::IsWindow(Sub)) {
-        CWnd* ev = Sub.listen(ok);
+        CWnd* ev = Sub.wait();
         if (ev == 0 || ev == ok) break;   // closed or OK -> leave (re-enables owner)
     }
 }

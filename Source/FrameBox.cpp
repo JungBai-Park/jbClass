@@ -1,49 +1,9 @@
-﻿/*
-    FrameBox.cpp - Parasite implementation.
-
-    See FrameBox.h for the public contract, ownership rules and the host
-    protocol. This file is the subclass procedure plus the live
-    layout editor and the source-code rewriter.
-
-    SECTION INDEX (grep these)
-    --------------------------
-    [LIFETIME]   ctor / dtor / attach / open / initialize / active()
-    [UTIL]       AlignText
-    [DETECT]     signal_map + set_default_signal_codes
-    [PROC]       proc (static) -> dispatch (instance message router)
-    [EDIT]       cancel_edit, toggle/enter/leave edit, on_key, on_drag, paint_frame, get_rect,
-                 set_owner (inject owner FrameBox*), eff_dpi (zoom-aware phys<->logical)
-    [SIGNAL]     signal()  (post WM_PARASITE_REPORT)
-    [REWRITE]    find_char + LayOutRewrite  (rewrite OpenFrame/Add... literals)
-    [HOST]       FrameBox: ctor/dtor/close, create_window, open, attach, timer,
-                 add_* member factories + finish_child, add_menu/modify_menu_label,
-                 WindowProc (incl. WM_DPICHANGED / WM_DPICHANGED_AFTERPARENT / WM_JBZOOM
-                 / WM_COMMAND menu dispatch), rescale_children,
-                 apply_zoom (Ctrl+Wheel zoom; virtual), fit_to_children (set_margin auto-fit),
-                 PreTranslateMessage (ESC/Enter/Ctrl+Wheel), surveil, listen_core
-
-    BEHAVIOUR
-    ---------
-    - Middle button toggles edit mode. In edit mode ALL native mouse/keyboard
-      behavior of the control is suppressed; only move/resize gestures work.
-    - Exiting via middle button does NOT commit. Enter or left double-click
-      commits (rewrites source). ESC cancels and restores the pre-edit rect
-      stored in last_rect (no source rewrite).
-    - On Enter commit and ESC cancel, PeekMessageW discards the trailing
-      WM_CHAR ('\r' or '\x1b') that TranslateMessage posts before DispatchMessage
-      runs, so the key does not leak to the child window as input.
-    - Only one control is in edit mode at a time (active()). Entering edit on
-      another control silently drops the previous one (no commit).
-    - Arrow = move snapping left/top to a 5px grid; Ctrl+Arrow = 1px move;
-      Shift+Arrow = resize (right/bottom edge) snapping to grid;
-      Ctrl+Shift+Arrow = 1px resize. Right/Down snap to the next multiple,
-      Left/Up to the previous multiple.
-    - Left-drag: proximity-based hit_zone(8px margin from edge) determines
-      action. Interior (HTCAPTION) = move; near edge/corner = resize that
-      side/corner. WM_SETCURSOR shows IDC_HAND (move) or directional resize
-      arrows accordingly. For top-level windows the OS handles drag via
-      WM_NCLBUTTONDOWN; for child windows SetCapture + WM_MOUSEMOVE is used.
-*/
+﻿// FrameBox.cpp
+// Copyright (c) 2026 JungBai Park. All rights reserved.
+//
+// Implementation of Parasite and FrameBox. See FrameBox.h for public contract,
+// ownership rules, and host protocol. Read this file only when modifying behavior.
+//
 
 #include "FrameBox.h"  // must come first: defines _WIN32_WINNT before pulling in afxwin.h
 #include <afxpriv.h>   // AfxHookWindowCreate / AfxUnhookWindowCreate (MFC window creation hook).
@@ -51,6 +11,11 @@
                        // they do NOT collide with MFC's own Open(...) members; order is free now.
 #include <shellscalingapi.h>  // GetDpiForMonitor
 #pragma comment(lib, "Shcore.lib")
+#include <gdiplus.h>          // Gdiplus::Image / Graphics (background image support)
+#pragma comment(lib, "gdiplus.lib")
+#include <shlwapi.h>          // SHCreateMemStream
+#pragma comment(lib, "shlwapi.lib")
+#include <windowsx.h>         // GET_X_LPARAM / GET_Y_LPARAM (frameless hit-testing)
 #include <vector>
 #include <string>
 
@@ -623,6 +588,10 @@ void Parasite::leave_edit(HWND h, bool commit) {
     ::InvalidateRect(h, NULL, TRUE);
 }
 
+// Arrow = move, snapping left/top to 5px grid. Ctrl+Arrow = 1px move.
+// Shift+Arrow = resize (right/bottom edge), snapping to 5px grid. Ctrl+Shift+Arrow = 1px resize.
+// Right/Down snap to the next multiple; Left/Up to the previous multiple.
+// Enter commits (rewrites source) + discards trailing WM_CHAR '\r'. ESC cancels (restores last_rect).
 void Parasite::on_key(HWND h, UINT vk) {
     if (vk == VK_RETURN) {
         leave_edit(h, true);
@@ -862,6 +831,40 @@ bool LayOutRewrite(const char* file, int line, const RECT& rect) {
 #endif // _DEBUG
 
 // ======================================================================
+// [GDIP]   GDI+ reference-counted lifecycle (shared across all FrameBox instances)
+// ======================================================================
+
+static ULONG_PTR s_gdip_token = 0;
+static int       s_gdip_refs  = 0;
+
+static void gdip_addref() {
+    if (++s_gdip_refs == 1) {
+        Gdiplus::GdiplusStartupInput si;
+        Gdiplus::GdiplusStartup(&s_gdip_token, &si, nullptr);
+    }
+}
+static void gdip_release() {
+    if (--s_gdip_refs == 0 && s_gdip_token) {
+        Gdiplus::GdiplusShutdown(s_gdip_token);
+        s_gdip_token = 0;
+    }
+}
+
+// Wrap RCDATA bytes into an IStream (SHCreateMemStream copies them internally).
+// The module memory (LockResource) is valid for the process lifetime; no FreeResource needed.
+static IStream* resource_to_stream(int id) {
+    HINSTANCE hi = AfxGetInstanceHandle();
+    HRSRC  hr = ::FindResourceW(hi, MAKEINTRESOURCEW(id), RT_RCDATA);
+    if (!hr) return nullptr;
+    HGLOBAL hg = ::LoadResource(hi, hr);
+    if (!hg) return nullptr;
+    void* ptr = ::LockResource(hg);
+    DWORD sz  = ::SizeofResource(hi, hr);
+    if (!ptr || sz == 0) return nullptr;
+    return ::SHCreateMemStream(static_cast<const BYTE*>(ptr), sz);
+}
+
+// ======================================================================
 // [HOST]   FrameBox -- CWnd host: per-frame registry + surveil/listen/report
 // ======================================================================
 
@@ -874,7 +877,10 @@ FrameBox::FrameBox()
     : next_id(1001), app(nullptr), parent(nullptr), self_layout(nullptr),
       waiting(false), timer_fired(false), event(nullptr), timer_id(0),
       dpi(96), zoom_pm(1000), snap_margin(-1), sys_font(nullptr),
-      next_menu_id(1) {
+      next_menu_id(1), bg_image(nullptr), bg_stream(nullptr),
+      bg_cache(nullptr), bg_cache_w(0), bg_cache_h(0),
+      fless_opt(-1), fless_gdip(false), fless_hover_close(false),
+      fless_hover_max(false), fless_hover_min(false), fless_tracking(false) {
 }
 
 FrameBox::~FrameBox() { close(); }
@@ -925,12 +931,18 @@ void FrameBox::close() {
     //   - unlink from the window (SetMenu(nullptr)) only if both are still alive, and
     //   - call DestroyMenu only if the handle is still a valid menu
     //     (guards against the WM_DESTROY-already-freed case).
+    surveil_all(false);    // un-surveil any still-registered controls before teardown
+    surveil_list.clear();
     menu_popups.clear();   // release lambda closures while captured objects are still valid
     HMENU hm = menu_bar.Detach();
     if (hm) {
         if (::IsWindow(m_hWnd)) ::SetMenu(m_hWnd, nullptr);
         if (::IsMenu(hm)) ::DestroyMenu(hm);
     }
+    if (bg_cache)  { ::DeleteObject(bg_cache); bg_cache = nullptr; bg_cache_w = bg_cache_h = 0; }
+    if (bg_image)  { delete bg_image;  bg_image  = nullptr; gdip_release(); }
+    if (bg_stream) { bg_stream->Release(); bg_stream = nullptr; }
+    if (fless_gdip) { gdip_release(); fless_gdip = false; }  // GDI+ ref taken by frameless()
     if (::IsWindow(m_hWnd)) DestroyWindow();
 }
 
@@ -1016,7 +1028,7 @@ bool FrameBox::open_core(CWnd* p, int x0, int y0, int x1, int y1, const char* fi
         self_layout->set_owner(this);
         self_layout->layout(x0, y0, x1, y1, file, line);  // stores logical last_rect
     }
-    ShowWindow(SW_SHOW);
+    ShowWindow(SW_HIDE);   // caller must call show() explicitly
     return ::IsWindow(m_hWnd) != 0;
 }
 
@@ -1333,6 +1345,230 @@ void FrameBox::modify_menu_label(int id, const char* label) {
             if (item.id == id) { item.label = label; return; }
 }
 
+// ---- background image (open_image / load_bg_image) ------------------------
+
+// Load RCDATA resource image into bg_image/bg_stream. Frees any prior image first.
+// Returns true on success; bg_image is non-null after a successful call.
+bool FrameBox::load_bg_image(int id) {
+    IStream* stm = resource_to_stream(id);
+    if (!stm) return false;
+    gdip_addref();
+    Gdiplus::Image* img = Gdiplus::Image::FromStream(stm);
+    if (!img || img->GetLastStatus() != Gdiplus::Ok) {
+        delete img;
+        stm->Release();
+        gdip_release();
+        return false;
+    }
+    // Replace any previously loaded image.
+    if (bg_image)  { delete bg_image;  gdip_release(); }
+    if (bg_stream) { bg_stream->Release(); }
+    bg_image  = img;
+    bg_stream = stm;   // kept alive; GDI+ reads it lazily for JPEG/PNG
+    if (bg_cache) { ::DeleteObject(bg_cache); bg_cache = nullptr; bg_cache_w = bg_cache_h = 0; }  // stale
+    return true;
+}
+
+// Stretch bg_image once into a screen-compatible bitmap sized w x h. Subsequent
+// WM_ERASEBKGND calls BitBlt this cache instead of re-running the GDI+ resample.
+void FrameBox::rebuild_bg_cache(HDC ref, int w, int h) {
+    if (bg_cache) { ::DeleteObject(bg_cache); bg_cache = nullptr; }
+    bg_cache_w = w;
+    bg_cache_h = h;
+    if (w <= 0 || h <= 0 || !bg_image) return;
+    bg_cache = ::CreateCompatibleBitmap(ref, w, h);
+    if (!bg_cache) return;
+    HDC mem = ::CreateCompatibleDC(ref);
+    HGDIOBJ old = ::SelectObject(mem, bg_cache);
+    {
+        Gdiplus::Graphics g(mem);
+        g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+        g.DrawImage(bg_image, Gdiplus::Rect(0, 0, w, h));
+    }
+    ::SelectObject(mem, old);
+    ::DeleteDC(mem);
+}
+
+bool FrameBox::open_image(CWinApp* a, int x0, int y0, int id) {
+    if (!load_bg_image(id)) return false;
+    int w = (int)bg_image->GetWidth();
+    int h = (int)bg_image->GetHeight();
+    return open(a, x0, y0, x0 + w, y0 + h, nullptr, 0);
+}
+
+bool FrameBox::open_image(CWnd* owner, int x0, int y0, int id) {
+    if (!load_bg_image(id)) return false;
+    int w = (int)bg_image->GetWidth();
+    int h = (int)bg_image->GetHeight();
+    return open(owner, x0, y0, x0 + w, y0 + h, nullptr, 0);
+}
+
+// ---- frameless mode (custom caption buttons) -------------------------------
+//
+// Layout model: buttons are right-aligned; the rightmost (from_right index 0) is
+// always Close. Indices grow leftward. Per option:
+//   opt 1: close@0
+//   opt 2: close@0, minimize@1            (minimize sits in what would be the maximize slot)
+//   opt 3: close@0, maximize@1, minimize@2
+// So the leftmost present button is always at from_right == opt-1.
+// All sizes are 96 DPI logical, scaled by eff_dpi() at draw/hit time (no cached px).
+
+// Draw one Ubuntu-style round button into g, using client coordinates (the caller
+// has set a translate transform). icon: 1=close(X) 2=minimize(-) 3=maximize([]).
+static void draw_round_btn(Gdiplus::Graphics& g, const CRect& r,
+                           Gdiplus::Color base, bool hover, int icon, float pen_w) {
+    using namespace Gdiplus;
+    RectF rf((REAL)r.left, (REAL)r.top, (REAL)r.Width(), (REAL)r.Height());
+
+    Color fill = base;
+    if (hover) {   // brighten the circle on mouse-over
+        fill = Color(255,
+                     (BYTE)min(255, base.GetR() + 32),
+                     (BYTE)min(255, base.GetG() + 32),
+                     (BYTE)min(255, base.GetB() + 32));
+    }
+    SolidBrush body(fill);
+    g.FillEllipse(&body, rf);
+
+    // Top gloss: a path gradient bright near the top, fading to transparent at the
+    // rim, giving a 3D bump. The highlight sits in the upper part of the circle.
+    GraphicsPath path;
+    path.AddEllipse(rf);
+    PathGradientBrush pgb(&path);
+    pgb.SetCenterPoint(PointF(rf.X + rf.Width * 0.5f, rf.Y + rf.Height * 0.28f));
+    pgb.SetCenterColor(Color(130, 255, 255, 255));
+    Color edge(0, 255, 255, 255); int cnt = 1;
+    pgb.SetSurroundColors(&edge, &cnt);
+    // Focus scale: keep the bright core small (upper portion) and fade out fast.
+    REAL fx = 0.35f, fy = 0.30f;
+    pgb.SetFocusScales(fx, fy);
+    g.FillPath(&pgb, &path);
+
+    // Sharp specular highlight: a small bright ellipse near the top for a glossy pop.
+    RectF spec(rf.X + rf.Width * 0.26f, rf.Y + rf.Height * 0.12f,
+               rf.Width * 0.48f, rf.Height * 0.34f);
+    GraphicsPath spath;
+    spath.AddEllipse(spec);
+    PathGradientBrush spb(&spath);
+    spb.SetCenterPoint(PointF(spec.X + spec.Width * 0.5f, spec.Y + spec.Height * 0.5f));
+    spb.SetCenterColor(Color(110, 255, 255, 255));
+    Color sedge(0, 255, 255, 255); int scnt = 1;
+    spb.SetSurroundColors(&sedge, &scnt);
+    g.FillPath(&spb, &spath);
+
+    Pen ip(Color(235, 0, 0, 0), max(1.0f, pen_w));
+    float ins = rf.Width * 0.32f;
+    REAL l = rf.X + ins, t = rf.Y + ins;
+    REAL rr = rf.GetRight() - ins, b = rf.GetBottom() - ins;
+    REAL cy = rf.Y + rf.Height * 0.5f;
+    if (icon == 1) {            // close: X
+        g.DrawLine(&ip, l, t, rr, b);
+        g.DrawLine(&ip, rr, t, l, b);
+    } else if (icon == 2) {     // minimize: horizontal bar
+        g.DrawLine(&ip, l, cy, rr, cy);
+    } else if (icon == 3) {     // maximize: square outline
+        g.DrawRectangle(&ip, l, t, rr - l, b - t);
+    }
+}
+
+CRect FrameBox::fless_btn_rect(int from_right) const {
+    int s = eff_dpi();
+    int d  = ::MulDiv(17, s, 96);   // circle diameter
+    int g  = ::MulDiv(6,  s, 96);   // inter-button gap
+    int rm = ::MulDiv(8,  s, 96);   // right margin
+    int tm = ::MulDiv(8,  s, 96);   // top margin
+    int pitch = d + g;
+    RECT cl; ::GetClientRect(m_hWnd, &cl);
+    int right = cl.right - rm - from_right * pitch;
+    int left  = right - d;
+    return CRect(left, tm, right, tm + d);
+}
+
+CRect FrameBox::fless_strip() const {
+    if (fless_opt <= 0) return CRect(0, 0, 0, 0);
+    int pad = ::MulDiv(4, eff_dpi(), 96);   // room for anti-aliased border + gloss
+    CRect lft = fless_btn_rect(fless_opt - 1);
+    CRect rgt = fless_btn_rect(0);
+    return CRect(lft.left - pad, lft.top - pad, rgt.right + pad, rgt.bottom + pad);
+}
+
+int FrameBox::fless_hit(POINT pt) const {
+    if (fless_opt <= 0) return 0;
+    int btn[3], fr[3], n = 0;
+    btn[n] = 1; fr[n] = 0; n++;                                  // close (rightmost)
+    if (fless_opt >= 2) { btn[n] = 2; fr[n] = (fless_opt == 2) ? 1 : 2; n++; }  // minimize
+    if (fless_opt >= 3) { btn[n] = 3; fr[n] = 1; n++; }          // maximize
+    for (int i = 0; i < n; i++) {
+        CRect r = fless_btn_rect(fr[i]);
+        int cx = (r.left + r.right) / 2, cy = (r.top + r.bottom) / 2, rad = r.Width() / 2;
+        int dx = pt.x - cx, dy = pt.y - cy;
+        if (dx * dx + dy * dy <= rad * rad) return btn[i];   // circular hit test
+    }
+    return 0;
+}
+
+void FrameBox::fless_draw(HDC hdc) const {
+    using namespace Gdiplus;
+    if (fless_opt <= 0) return;
+    CRect strip = fless_strip();
+    int bw = strip.Width(), bh = strip.Height();
+    if (bw <= 0 || bh <= 0) return;
+
+    // Double-buffer in a GDI memory DC: copy the matching background slice from
+    // bg_cache (fast BitBlt, no per-paint resample), then draw the buttons on top
+    // with GDI+ so their anti-aliased rims blend with the real background.
+    HDC mem = ::CreateCompatibleDC(hdc);
+    HBITMAP bmp = ::CreateCompatibleBitmap(hdc, bw, bh);
+    HGDIOBJ oldb = ::SelectObject(mem, bmp);
+
+    if (bg_cache) {
+        HDC src = ::CreateCompatibleDC(hdc);
+        HGDIOBJ olds = ::SelectObject(src, bg_cache);
+        ::BitBlt(mem, 0, 0, bw, bh, src, strip.left, strip.top, SRCCOPY);
+        ::SelectObject(src, olds);
+        ::DeleteDC(src);
+    } else {
+        RECT fr = { 0, 0, bw, bh };
+        ::FillRect(mem, &fr, ::GetSysColorBrush(COLOR_BTNFACE));
+    }
+
+    Graphics g(mem);
+    g.SetSmoothingMode(SmoothingModeAntiAlias);
+    g.TranslateTransform((REAL)(-strip.left), (REAL)(-strip.top));
+
+    float pen_w = max(1.0f, eff_dpi() / 96.0f * 1.8f);
+    draw_round_btn(g, fless_btn_rect(0),
+                   Color(255, 234, 87, 0), fless_hover_close, 1, pen_w);     // close: orange RGB(234,87,0)
+    if (fless_opt >= 2)
+        draw_round_btn(g, fless_btn_rect((fless_opt == 2) ? 1 : 2),
+                       Color(255, 119, 117, 111), fless_hover_min, 2, pen_w); // minimize: gray RGB(119,117,111)
+    if (fless_opt >= 3)
+        draw_round_btn(g, fless_btn_rect(1),
+                       Color(255, 119, 117, 111), fless_hover_max, 3, pen_w); // maximize: gray RGB(119,117,111)
+
+    ::BitBlt(hdc, strip.left, strip.top, bw, bh, mem, 0, 0, SRCCOPY);
+    ::SelectObject(mem, oldb);
+    ::DeleteObject(bmp);
+    ::DeleteDC(mem);
+}
+
+int FrameBox::frameless(int option) {
+    if (option < 0 || option > 3) return -1;
+    if (!::IsWindow(m_hWnd)) return -2;
+    if (fless_opt < 0) { gdip_addref(); fless_gdip = true; }   // ensure GDI+ is up (open(), not open_image())
+
+    LONG_PTR st = ::GetWindowLongPtrW(m_hWnd, GWL_STYLE);
+    st &= ~(LONG_PTR)(WS_CAPTION | WS_SYSMENU | WS_THICKFRAME |
+                      WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_BORDER | WS_DLGFRAME);
+    st |= WS_POPUP;
+    ::SetWindowLongPtrW(m_hWnd, GWL_STYLE, st);
+    fless_opt = option;
+    ::SetWindowPos(m_hWnd, nullptr, 0, 0, 0, 0,
+                   SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    ::InvalidateRect(m_hWnd, nullptr, TRUE);
+    return 0;
+}
+
 // ---- listen / surveil / message routing ------------------------------------
 int FrameBox::timer(int period) {
     if (timer_id) { KillTimer(timer_id); timer_id = 0; }
@@ -1342,31 +1578,31 @@ int FrameBox::timer(int period) {
     return 0;
 }
 
-CWnd* FrameBox::listen_core(int count, CWnd** list) {
+// Block until any surveilled control signals. Returns its CWnd* (nullptr if window
+// closed, this if timer fired). The surveil set is NOT modified; it persists across
+// multiple wait() calls. Call listen() with no args to clear it when done.
+CWnd* FrameBox::wait() {
     if (!::IsWindow(m_hWnd)) return nullptr;
-
+    show();   // ensure visible in case the caller forgot to call show()
     event = nullptr;
     timer_fired = false;
-    surveil(count, list, true);
     waiting = true;
-
     RunModalLoop();          // pumps messages until WF_CONTINUEMODAL is cleared
-
     waiting = false;
-    surveil(count, list, false);
     if (timer_fired) return this;
     return event;
 }
 
-void FrameBox::surveil(int count, CWnd** list, bool on) {
-    // Token = this frame, regardless of where the control physically lives. A
-    // control reports to whoever surveilled it, so a parent can listen() controls
-    // that live inside a child zone with no relay.
-    WPARAM token = on ? reinterpret_cast<WPARAM>(this) : 0;
-    for (int i = 0; i < count; i++) {
-        if (list[i] && ::IsWindow(list[i]->m_hWnd))
-            ::SendMessage(list[i]->m_hWnd, WM_PARASITE_SURVEIL, token, 0);
-    }
+// Send WM_PARASITE_SURVEIL to a single control. Token = this frame (on=true) or 0 (off).
+// Controls report to whoever surveilled them, so a parent can listen to controls in a child zone.
+void FrameBox::surveil_one(CWnd* w, bool on) {
+    if (w && ::IsWindow(w->m_hWnd))
+        ::SendMessage(w->m_hWnd, WM_PARASITE_SURVEIL,
+                      on ? reinterpret_cast<WPARAM>(this) : 0, 0);
+}
+
+void FrameBox::surveil_all(bool on) {
+    for (CWnd* w : surveil_list) surveil_one(w, on);
 }
 
 // Reposition every WS_CHILD registry entry from its 96 DPI logical rect to physical
@@ -1462,8 +1698,14 @@ void FrameBox::apply_zoom(int new_pm, bool cursor_anchor) {
     rescale_children();
 }
 
+// WM_COMMAND/WM_NOTIFY/WM_HSCROLL/WM_VSCROLL: reflected to the control HWND as
+// WM_PARASITE_CALLBACK (runs always, so a child frame reflects its own controls even
+// while a parent runs listen() -- see HOST CONTRACT in FrameBox.h).
+// DPI: WM_DPICHANGED (top-level) resizes to OS-suggested rect; WM_DPICHANGED_AFTERPARENT
+// (WS_CHILD zone) reacts to parent. Both update dpi, rebuild sys_font, call rescale_children().
+// Owned popup child frames (add_frame) get their own WM_DPICHANGED.
 LRESULT FrameBox::WindowProc(UINT msg, WPARAM wParam, LPARAM lParam) {
-    // Allow the window to grow beyond the default monitor-size cap (ptMaxTrackSize ≈
+    // Allow the window to grow beyond the default monitor-size cap (ptMaxTrackSize ??
     // SM_CXVIRTUALSCREEN) so fit_to_children() can resize to any zoom-scaled size.
     if (msg == WM_GETMINMAXINFO) {
         MINMAXINFO* mm = reinterpret_cast<MINMAXINFO*>(lParam);
@@ -1472,13 +1714,89 @@ LRESULT FrameBox::WindowProc(UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
     }
 
-    // Paint background with the dialog face color instead of the CWnd default.
+    // Make CStatic controls transparent so the frame background (image or color) shows through.
+    // SetBkMode(TRANSPARENT) prevents the text background rect from being filled.
+    // Returning NULL_BRUSH tells Windows not to fill the control's client area before painting.
+    if (msg == WM_CTLCOLORSTATIC) {
+        ::SetBkMode(reinterpret_cast<HDC>(wParam), TRANSPARENT);
+        return reinterpret_cast<LRESULT>(::GetStockObject(NULL_BRUSH));
+    }
+
+    // Paint background: cached bg image (fast BitBlt) or the dialog face color.
     if (msg == WM_ERASEBKGND) {
+        HDC dst = reinterpret_cast<HDC>(wParam);
         RECT rc;
         ::GetClientRect(m_hWnd, &rc);
-        ::FillRect(reinterpret_cast<HDC>(wParam), &rc,
-                   ::GetSysColorBrush(COLOR_BTNFACE));
+        if (bg_image) {
+            int w = rc.right - rc.left, h = rc.bottom - rc.top;
+            if (!bg_cache || bg_cache_w != w || bg_cache_h != h)
+                rebuild_bg_cache(dst, w, h);   // one GDI+ resample per size change
+            if (bg_cache) {
+                HDC mem = ::CreateCompatibleDC(dst);
+                HGDIOBJ old = ::SelectObject(mem, bg_cache);
+                ::BitBlt(dst, 0, 0, w, h, mem, 0, 0, SRCCOPY);
+                ::SelectObject(mem, old);
+                ::DeleteDC(mem);
+            }
+        } else {
+            ::FillRect(dst, &rc, ::GetSysColorBrush(COLOR_BTNFACE));
+        }
         return 1;
+    }
+
+    // ---- Frameless mode: custom caption buttons + drag-anywhere ----
+    // All branches gated on fless_opt >= 0 so a normal (titled) window is unaffected.
+    if (fless_opt >= 0) {
+        if (msg == WM_NCHITTEST) {
+            POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+            ::ScreenToClient(m_hWnd, &pt);
+            RECT cl; ::GetClientRect(m_hWnd, &cl);
+            if (::PtInRect(&cl, pt))
+                return fless_hit(pt) ? HTCLIENT   // a button: we handle the click
+                                     : HTCAPTION; // empty client: OS drag-move
+            // else fall through to default NC hit testing (edges/corners)
+        }
+        else if (msg == WM_PAINT) {
+            PAINTSTRUCT ps;
+            HDC hdc = ::BeginPaint(m_hWnd, &ps);
+            fless_draw(hdc);
+            ::EndPaint(m_hWnd, &ps);
+            return 0;
+        }
+        else if (msg == WM_MOUSEMOVE) {
+            POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+            int hit = fless_hit(pt);
+            bool hc = (hit == 1), hm = (hit == 2), hx = (hit == 3);
+            if (hc != fless_hover_close || hm != fless_hover_min || hx != fless_hover_max) {
+                fless_hover_close = hc; fless_hover_min = hm; fless_hover_max = hx;
+                CRect inv = fless_strip();
+                ::InvalidateRect(m_hWnd, &inv, FALSE);
+            }
+            if (!fless_tracking) {   // arm WM_MOUSELEAVE so hover clears when the cursor exits
+                TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, m_hWnd, 0 };
+                ::TrackMouseEvent(&tme);
+                fless_tracking = true;
+            }
+            return 0;
+        }
+        else if (msg == WM_MOUSELEAVE) {
+            fless_tracking = false;
+            if (fless_hover_close || fless_hover_min || fless_hover_max) {
+                fless_hover_close = fless_hover_min = fless_hover_max = false;
+                CRect inv = fless_strip();
+                ::InvalidateRect(m_hWnd, &inv, FALSE);
+            }
+            return 0;
+        }
+        else if (msg == WM_LBUTTONUP) {
+            POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+            switch (fless_hit(pt)) {
+            case 1: ::PostMessageW(m_hWnd, WM_CLOSE, 0, 0);           return 0;
+            case 2: ::ShowWindow(m_hWnd, SW_MINIMIZE);               return 0;
+            case 3: ::ShowWindow(m_hWnd, ::IsZoomed(m_hWnd) ? SW_RESTORE : SW_MAXIMIZE);
+                    return 0;
+            }
+        }
     }
 
     // Live DPI change for a top-level / owned-popup frame. Cancel any active

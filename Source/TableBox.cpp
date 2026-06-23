@@ -1,34 +1,10 @@
 ﻿// TableBox.cpp
+// Copyright (c) 2026 JungBai Park. All rights reserved.
 //
 // Implementation of TableBox. See TableBox.h for the public contract; read this file only
 // when modifying behavior.
 //
-// === File layout ===
-//   helpers (static) : ParseFontOpts, SbarColors, DrawAA, DrawRoundedThumb, DrawTriangle,
-//                       FillTranslucent, ParseComboItems, ComboIndex
-//   message map       : BEGIN_MESSAGE_MAP ... END_MESSAGE_MAP
-//   ctor/dtor         : TableBox, ~TableBox
-//   window/font       : open, build_font
-//   grid definition   : set_cols x2, set_rows x2, set_fixed, set_text_callback, set_font,
-//                        set_align, set_pad, set_grid_color, set_edit_callback, set_edit_adjust
-//   layout            : to_px, corner_w, corner_h, last_visible_row/col, max_scroll_row/col,
-//                        clamp_scroll
-//   painting          : ensure_back_buffer, draw_text_aligned, draw_block, draw_grid_lines,
-//                        draw_cell, cell_text, combo_arrow_rect, OnPaint
-//   overlay scrollbar : vsbar_geometry, hsbar_geometry, resolve_sbar_corner, show_sbar,
-//                        draw_sbar_axis, draw_overlay_scrollbars
-//   selection         : hit_test, last_row_index/col_index, select_range, move_current,
-//                        ensure_visible, clamp_cursor, cell_status, is_current, cell_rect,
-//                        draw_focus_border
-//   resize (Stage 4)  : hit_col_border, hit_row_border, col_selection_span, row_selection_span,
-//                        autofit_col, autofit_row
-//   editing (Stage 5) : TableComboPopup class, edit_cell, start_text_edit, EditSubclassProc,
-//                        end_text_edit, start_combo_edit, end_combo_edit, cancel_edit
-//   input             : OnSetFocus, OnKillFocus, OnGetDlgCode, OnKeyDown, OnChar, OnMouseWheel,
-//                        OnLButtonDown, OnMouseMove, OnLButtonUp, OnLButtonDblClk, OnSetCursor,
-//                        OnMouseLeave, OnTimer, WindowProc (IME)
-//   window messages   : OnSize, OnEraseBkgnd
-//
+
 #include "TableBox.h"
 #include <afxpriv.h>   // AfxHookWindowCreate / AfxUnhookWindowCreate (MFC window creation hook)
 #include <cmath>
@@ -388,8 +364,9 @@ void TableBox::open(CWnd* parent, int x0, int y0, int rows, int cols)
     clamp_scroll();
 }
 
-// (Re)build the font + cached TEXTMETRICW from the stored spec at the current box_dpi. Called by
-// open(), set_font() (if the window already exists), and OnSize on a DPI change.
+// (Re)build the font + cached TEXTMETRICW at eff_dpi() (= box_dpi * zoom_pm / 1000), so both
+// monitor DPI changes and Ctrl+Wheel zoom produce identical scaling. Called by open(), set_font()
+// (window already exists), and OnSize on a DPI change. Named build_font/to_px to match ConBox.
 void TableBox::build_font()
 {
     int dpi = eff_dpi();
@@ -1184,7 +1161,7 @@ void TableBox::start_text_edit(int row, int col, wchar_t initial_char)
     // CEdit. In an MBCS MFC build, ANY MFC creation/subclass path (CEdit::Create, or even
     // AfxHookWindowCreate + CreateWindowExW) re-binds the window to the ANSI AfxWndProc, so
     // IsWindowUnicode becomes 0; an ANSI EDIT renders WM_IME_COMPOSITION through CP949, and an
-    // incomplete Hangul jamo (e.g. the lead 'ㄱ', U+3131, not a precomposed syllable) cannot be
+    // incomplete Hangul jamo (e.g. the lead '??, U+3131, not a precomposed syllable) cannot be
     // converted and shows as '?'. A plain CreateWindowExW with no MFC hook keeps the EDIT Unicode,
     // so IME composition (including mid-composition jamo) renders correctly. EditSubclassProc
     // (dwRefData = this) replaces the former TableEditBox message handlers.
@@ -1489,7 +1466,7 @@ void TableBox::draw_cell(CDC& dc, int row, int col, int x0, int y0, int x1, int 
     if (edit_cb != nullptr) {
         const char* combo_str = edit_cb(row, col, nullptr, edit_cb_user);
         if (ParseComboItems(combo_str, combo_items)) {
-            // Combo cell: display the currently selected item label, then draw "▼" on top.
+            // Combo cell: display the currently selected item label, then draw "?? on top.
             int idx = ComboIndex(cell_text(row, col), (int)combo_items.size());
             CRect arrow_rc = combo_arrow_rect(rc);
             CFont* old_font = dc.SelectObject(&font);
@@ -2085,7 +2062,7 @@ BOOL TableBox::OnSetCursor(CWnd* pWnd, UINT nHitTest, UINT message)
             return TRUE;
         }
         // Show IDC_HAND over editable cells unless a scrollbar is in its hold phase (active but
-        // not yet fading -- the user says "무조건 기본 커서, 단 천천히 사라지고 있을 때는 예외").
+        // not yet fading -- the user says "臾댁“嫄?湲곕낯 而ㅼ꽌, ??泥쒖쿇???щ씪吏怨??덉쓣 ?뚮뒗 ?덉쇅").
         if (edit_cb != nullptr) {
             bool sbar_blocking =
                 (vsbar.alpha > 0 && (int)(::GetTickCount() - vsbar.hold_until) < 0) ||
@@ -2163,7 +2140,7 @@ void TableBox::OnTimer(UINT_PTR id)
 // EDIT. We must relay that one stray first message to the EDIT, else its leading jamo never shows
 // (the syllable still lives in the IME engine, so it appears only once the syllable completes).
 // In an MBCS build TableBox's message pump is ANSI (AfxWndProc), so wParam arrives as an ANSI
-// (CP949) code (e.g. lead 'ㄱ' = 0xA4A1, carried because lParam has CS_INSERTCHAR). Forwarding it
+// (CP949) code (e.g. lead '?? = 0xA4A1, carried because lParam has CS_INSERTCHAR). Forwarding it
 // verbatim to the Unicode EDIT makes the EDIT's first paint read 0xA4A1 as U+A4A1 (a wrong glyph);
 // the syllable still lives in the HIMC as real Unicode, so a later repaint corrects it -- but to
 // paint right the first time we convert wParam from the ANSI codepage to UTF-16 (0xA4A1 -> U+3131)
