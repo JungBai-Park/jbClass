@@ -1435,16 +1435,18 @@ void FrameBox::rebuild_bg_cache(HDC ref, int w, int h) {
     ::DeleteDC(mem);
 }
 
-void FrameBox::set_image(int id) {
-    load_bg_image(id);
+bool FrameBox::set_image(int id) {
+    if (!load_bg_image(id)) { set_bg_color(RGB(255, 0, 0)); return false; }
     bg_color_set = false;
     if (::IsWindow(m_hWnd)) Invalidate();
+    return true;
 }
 
-void FrameBox::set_image(const char* file) {
-    load_bg_file(file);
+bool FrameBox::set_image(const char* file) {
+    if (!load_bg_file(file)) { set_bg_color(RGB(255, 0, 0)); return false; }
     bg_color_set = false;
     if (::IsWindow(m_hWnd)) Invalidate();
+    return true;
 }
 
 void FrameBox::set_bg_color(COLORREF color) {

@@ -85,33 +85,23 @@ public:
 
 cDemoApp App;
 
-// TableBox demo data: 50x50 cell text, filled by DemoMain before open().
-static std::vector<std::vector<std::string>> table_text;
-
-// TableBox demo callback: text source for every cell, served from table_text.
-static const char* DefaultTableText(int row, int col, void* user) {
-    if (row < 0 || row >= (int)table_text.size() || col < 0 || col >= (int)table_text[row].size())
-        return "";
-    return table_text[row][col].c_str();
-}
-
-// TableBox edit callback: dual-purpose (query and commit).
+// TableBox edit callback: dual-purpose (query and commit). The table runs in OWNED data mode
+// (alloc_text), so no text callback is needed. context defaults to the TableBox* (set_edit_callback
+// stores `this` when context is omitted), so the commit path writes back via cell().
 // Query (text == nullptr): return cell type.
 //   [6][2]               -> combo "하나, 둘, 셋, 넷, 다섯, 여섯"
 //   even col (except 0)  -> (const char*)(-1) = CEdit-editable
 //   otherwise            -> nullptr = read-only
-// Commit (text != nullptr): store the new value into table_text.
+// Commit (text != nullptr): store the new value into the owned buffer via cell().
 //   For combo cells, text is the selected index string ("0","1",...).
 //   For CEdit cells, text is the user-typed UTF-8 string.
-static const char* DefaultTableEdit(int row, int col, const char* text, void* user) {
+static const char* DemoTableEdit(int row, int col, const char* text, void* context) {
     if (text == nullptr) {
         if (row == 6 && col == 2) return "하나, 둘, 셋, 넷, 다섯, 여섯";
         if (col > 0 && col % 2 == 0) return (const char*)(-1);
         return nullptr;
     }
-    if (row >= 0 && row < (int)table_text.size() &&
-        col >= 0 && col < (int)table_text[row].size())
-        table_text[row][col] = text;
+    static_cast<TableBox*>(context)->cell(row, col) = text;
     return nullptr;
 }
 
@@ -119,9 +109,9 @@ cDemoBox Top;
 void DemoSub(CWnd *owner);
 
 int main(int argc, const char* argv[]) {
-    Top.OpenFrame(&App, 306, -942, 1222, -103);
+    Top.OpenFrame(&App, 502, -942, 1402, -142);
     Top.set_image(IDR_BACKGROUND);
-    // Top.frameless(2);                                    // borderless + close/min/max caption buttons
+    Top.frameless(2);                                    // borderless + close/min/max caption buttons
     Top.CenterWindow();
     Top.set_margin(5);
     Top.update_title();   // show initial DPI (count=0)
@@ -131,22 +121,13 @@ int main(int argc, const char* argv[]) {
     conBox->open(&Top, 5, 5);
     Top.AddNew(5, 340, 601, 735, conBox);   // coords-first; Top owns conBox
 
-    table_text.assign(50, std::vector<std::string>(50));
-    char cell_buf[32];
-    for (int row = 0; row < 50; ++row) {
-        for (int col = 0; col < 50; ++col) {
-            sprintf_s(cell_buf, sizeof(cell_buf), "자료(%d:%d)", row, col);
-            table_text[row][col] = cell_buf;
-        }
-    }
-
-    table_text[6][2] = "2";   // Stage 5 combo-cell demo
     TableBox* table = new TableBox;
     table->set_cols({125, 75}, 25);   // 50 cols: 125/75 pattern x25
     table->set_rows({25}, 50);        // 50 rows: uniform 25px
     table->set_fixed(1, 1);
-    table->set_text_callback(DefaultTableText, nullptr);
-    table->set_edit_callback(DefaultTableEdit, nullptr);
+    table->alloc_text();              // owned mode: A..Z / 1.. headers auto-filled, body blank
+    table->cell(6, 2) = "2";          // combo-cell demo: preselect item index 2
+    table->set_edit_callback(DemoTableEdit);
     table->set_font("Malgun Gothic", 10);
     table->set_align(5);
     table->set_edit_adjust(1, 4, 0, 0);

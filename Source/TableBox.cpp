@@ -284,11 +284,13 @@ TableBox::TableBox()
     selecting = false;
     has_focus = false;
 
+    cell_data = nullptr;
+
     text_cb = nullptr;
-    text_cb_user = nullptr;
+    text_cb_context = nullptr;
 
     edit_cb = nullptr;
-    edit_cb_user = nullptr;
+    edit_cb_context = nullptr;
     edit_box = nullptr;
     combo_popup = nullptr;
     edit_row = -1;
@@ -317,6 +319,7 @@ TableBox::TableBox()
 
 TableBox::~TableBox()
 {
+    delete[] cell_data;
 }
 
 void TableBox::open(CWnd* parent, int x0, int y0, int rows, int cols)
@@ -384,6 +387,7 @@ void TableBox::set_cols(int width, int limit)
     col_widths.clear();
     col_uniform_w = width;  col_count = limit;
     clamp_cursor();
+    if (cell_data) alloc_text();   // owned mode: resize buffer to the new grid size
     if (::IsWindow(m_hWnd)) { clamp_scroll(); Invalidate(); }
 }
 
@@ -395,6 +399,7 @@ void TableBox::set_cols(std::initializer_list<int> pattern, int count)
         for (int w : pattern) col_widths.push_back(w);
     col_count = (int)col_widths.size();
     clamp_cursor();
+    if (cell_data) alloc_text();   // owned mode: resize buffer to the new grid size
     if (::IsWindow(m_hWnd)) { clamp_scroll(); Invalidate(); }
 }
 
@@ -403,6 +408,7 @@ void TableBox::set_rows(int height, int limit)
     row_heights.clear();
     row_uniform_h = height;  row_count = limit;
     clamp_cursor();
+    if (cell_data) alloc_text();   // owned mode: resize buffer to the new grid size
     if (::IsWindow(m_hWnd)) { clamp_scroll(); Invalidate(); }
 }
 
@@ -414,7 +420,34 @@ void TableBox::set_rows(std::initializer_list<int> pattern, int count)
         for (int h : pattern) row_heights.push_back(h);
     row_count = (int)row_heights.size();
     clamp_cursor();
+    if (cell_data) alloc_text();   // owned mode: resize buffer to the new grid size
     if (::IsWindow(m_hWnd)) { clamp_scroll(); Invalidate(); }
+}
+
+// Enter/refresh owned mode: (re)allocate the col_count*row_count string buffer and pre-fill the
+// header band. See the header for the data layout and mode semantics.
+std::string* TableBox::alloc_text()
+{
+    delete[] cell_data;
+    cell_data = new std::string[(size_t)col_count * row_count];   // all empty strings
+
+    for (int c = 1; c <= 26 && c < col_count; ++c)
+        cell_data[c] = std::string(1, char('A' + c - 1));         // row 0: A..Z column headers
+    for (int r = 1; r < row_count; ++r) {
+        char b[16]; sprintf_s(b, sizeof(b), "%d", r);
+        cell_data[(size_t)r * col_count] = b;                     // col 0: 1.. row numbers
+    }
+    if (::IsWindow(m_hWnd)) Invalidate();
+    return cell_data;
+}
+
+std::string& TableBox::cell(int row, int col)
+{
+    ASSERT(cell_data != nullptr);
+    ASSERT(row >= 0 && row < row_count && col >= 0 && col < col_count);
+    if (row < 0) row = 0; else if (row >= row_count) row = row_count - 1;
+    if (col < 0) col = 0; else if (col >= col_count) col = col_count - 1;
+    return cell_data[(size_t)row * col_count + col];
 }
 
 void TableBox::set_fixed(int rows, int cols)
@@ -427,17 +460,17 @@ void TableBox::set_fixed(int rows, int cols)
     if (::IsWindow(m_hWnd)) { clamp_scroll(); Invalidate(); }
 }
 
-void TableBox::set_text_callback(const char* (*cb)(int row, int col, void* user), void* user)
+void TableBox::set_text_callback(const char* (*cb)(int row, int col, void* context), void* context)
 {
     text_cb = cb;
-    text_cb_user = user;
+    text_cb_context = context ? context : this;   // default context to this when omitted
     if (::IsWindow(m_hWnd)) Invalidate();
 }
 
-void TableBox::set_edit_callback(const char* (*cb)(int row, int col, const char* text, void* user), void* user)
+void TableBox::set_edit_callback(const char* (*cb)(int row, int col, const char* text, void* context), void* context)
 {
     edit_cb = cb;
-    edit_cb_user = user;
+    edit_cb_context = context ? context : this;   // default context to this when omitted
 }
 
 void TableBox::set_font(const char* name, float size, const char* option)
@@ -841,7 +874,7 @@ void TableBox::autofit_col(int idx)
             std::string disp;
             if (edit_cb != nullptr) {
                 std::vector<std::string> items;
-                if (ParseComboItems(edit_cb(r, idx, nullptr, edit_cb_user), items))
+                if (ParseComboItems(edit_cb(r, idx, nullptr, edit_cb_context), items))
                     disp = items[ComboIndex(cell_text(r, idx), (int)items.size())];
                 else {
                     const char* raw = cell_text(r, idx);
@@ -897,7 +930,7 @@ void TableBox::autofit_row(int idx)
             std::string disp;
             if (edit_cb != nullptr) {
                 std::vector<std::string> items;
-                if (ParseComboItems(edit_cb(idx, c, nullptr, edit_cb_user), items))
+                if (ParseComboItems(edit_cb(idx, c, nullptr, edit_cb_context), items))
                     disp = items[ComboIndex(cell_text(idx, c), (int)items.size())];
                 else {
                     const char* raw = cell_text(idx, c);
@@ -1138,7 +1171,7 @@ void TableBox::edit_cell(int row, int col)
     if (edit_box != nullptr || combo_popup != nullptr)
         return;
 
-    const char* type = edit_cb(row, col, nullptr, edit_cb_user);
+    const char* type = edit_cb(row, col, nullptr, edit_cb_context);
     std::vector<std::string> combo_items;
     if (ParseComboItems(type, combo_items))
         start_combo_edit(row, col);
@@ -1244,7 +1277,7 @@ void TableBox::end_text_edit(bool commit, int move_dr, int move_dc)
         ::GetWindowTextW(edit_box, wbuf, _countof(wbuf));
         char utf8[1024 * 3];
         ::WideCharToMultiByte(CP_UTF8, 0, wbuf, -1, utf8, sizeof(utf8), NULL, NULL);
-        edit_cb(edit_row, edit_col, utf8, edit_cb_user);
+        edit_cb(edit_row, edit_col, utf8, edit_cb_context);
     }
 
     HWND eh = edit_box;
@@ -1271,7 +1304,7 @@ void TableBox::start_combo_edit(int row, int col)
         return;
 
     std::vector<std::string> items;
-    const char* combo_str = edit_cb(row, col, nullptr, edit_cb_user);
+    const char* combo_str = edit_cb(row, col, nullptr, edit_cb_context);
     if (!ParseComboItems(combo_str, items))
         return;
     int sel_idx = ComboIndex(cell_text(row, col), (int)items.size());
@@ -1303,7 +1336,7 @@ void TableBox::end_combo_edit(bool commit, int new_index)
     if (commit && edit_cb) {
         char idx_buf[16];
         sprintf_s(idx_buf, sizeof(idx_buf), "%d", new_index >= 0 ? new_index : 0);
-        edit_cb(edit_row, edit_col, idx_buf, edit_cb_user);
+        edit_cb(edit_row, edit_col, idx_buf, edit_cb_context);
     }
 
     combo_popup = nullptr;
@@ -1395,7 +1428,11 @@ void TableBox::draw_grid_lines(CDC& dc, int r0, int r1, int c0, int c1, int x0, 
 
 const char* TableBox::cell_text(int row, int col) const
 {
-    return text_cb ? text_cb(row, col, text_cb_user) : nullptr;
+    if (cell_data) {   // owned mode: serve directly, bypassing text_cb (OOB -> empty)
+        if (row < 0 || row >= row_count || col < 0 || col >= col_count) return "";
+        return cell_data[(size_t)row * col_count + col].c_str();
+    }
+    return text_cb ? text_cb(row, col, text_cb_context) : nullptr;
 }
 
 // Square icon flush with the cell's right edge, side length = cell height (clamped to the
@@ -1468,7 +1505,7 @@ void TableBox::draw_cell(CDC& dc, int row, int col, int x0, int y0, int x1, int 
     // Check if this is a combo cell via edit_cb query (text==nullptr -> query mode).
     std::vector<std::string> combo_items;
     if (edit_cb != nullptr) {
-        const char* combo_str = edit_cb(row, col, nullptr, edit_cb_user);
+        const char* combo_str = edit_cb(row, col, nullptr, edit_cb_context);
         if (ParseComboItems(combo_str, combo_items)) {
             // Combo cell: display the currently selected item label, then draw "?? on top.
             int idx = ComboIndex(cell_text(row, col), (int)combo_items.size());
@@ -1762,7 +1799,7 @@ void TableBox::OnChar(UINT nChar, UINT nRepCnt, UINT nFlags)
         cur_row >= fixed_rows && cur_col >= fixed_cols &&
         edit_cb != nullptr && edit_box == nullptr && combo_popup == nullptr) {
         // Only CEdit-type cells accept a typed character as a text-overwrite trigger.
-        const char* type = edit_cb(cur_row, cur_col, nullptr, edit_cb_user);
+        const char* type = edit_cb(cur_row, cur_col, nullptr, edit_cb_context);
         if (type == (const char*)(intptr_t)-1) {
             start_text_edit(cur_row, cur_col, (wchar_t)nChar);
             return;
@@ -1910,7 +1947,7 @@ void TableBox::OnLButtonDown(UINT flags, CPoint pt)
             CRect cell_rc;
             if (!extend && edit_cb != nullptr && cell_rect(row, col, cell_rc)) {
                 std::vector<std::string> combo_items;
-                if (ParseComboItems(edit_cb(row, col, nullptr, edit_cb_user), combo_items) &&
+                if (ParseComboItems(edit_cb(row, col, nullptr, edit_cb_context), combo_items) &&
                     combo_arrow_rect(cell_rc).PtInRect(pt)) {
                     edit_cell(row, col);
                     return;
@@ -2074,7 +2111,7 @@ BOOL TableBox::OnSetCursor(CWnd* pWnd, UINT nHitTest, UINT message)
             if (!sbar_blocking) {
                 int row, col;
                 if (hit_test(pt, row, col) && row >= fixed_rows && col >= fixed_cols) {
-                    const char* type = edit_cb(row, col, nullptr, edit_cb_user);
+                    const char* type = edit_cb(row, col, nullptr, edit_cb_context);
                     std::vector<std::string> combo_items;
                     if (ParseComboItems(type, combo_items)) {
                         // Hand cursor only over the dropdown arrow icon.
@@ -2172,7 +2209,7 @@ LRESULT TableBox::WindowProc(UINT message, WPARAM wParam, LPARAM lParam)
     if (message == WM_IME_STARTCOMPOSITION &&
         edit_cb != nullptr && edit_box == nullptr && combo_popup == nullptr &&
         cur_row >= fixed_rows && cur_col >= fixed_cols) {
-        const char* type = edit_cb(cur_row, cur_col, nullptr, edit_cb_user);
+        const char* type = edit_cb(cur_row, cur_col, nullptr, edit_cb_context);
         if (type == (const char*)(intptr_t)-1) {
             start_text_edit(cur_row, cur_col, 0);   // empty seed; the IME text fills it
             if (edit_box != nullptr)

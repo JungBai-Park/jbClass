@@ -2,8 +2,9 @@
 
 ### 1. Purpose
 
-- `TableBox` is a `CWnd`-derived, Excel-like virtual grid control.
-- It does NOT own its data. It requests only the currently visible cells through a `(row, col)` callback and draws them (virtual grid).
+- `TableBox` is a `CWnd`-derived, Excel-like grid control supporting two data modes:
+  - Virtual mode (default): owns no data; requests only the visible cells through a `(row, col)` callback. Suited to large/dynamic data.
+  - Owned mode (`alloc_text`): the table stores every cell's UTF-8 string itself, for small fixed tables (intended for < 100 cols x < 27 rows). Lower entry barrier -- no text callback required.
 - Designed for reuse and customization by arbitrary projects (maximum flexibility), not project-specific.
 - Self-contained portability unit: `TableBox.h` + `TableBox.cpp`. It must NOT reference `ConBox` / `FrameBox` members; duplicate the needed logic in-module even if code repeats (overlay scrollbar, font argument parsing).
 
@@ -15,7 +16,11 @@
 - `set_rows(int height, int limit)` / `set_rows(std::initializer_list<int> pattern, int count = 1)`: same for rows.
 - Before any `set_cols`/`set_rows` call, the grid defaults to uniform 75x20 (96 DPI logical) cells, 5 columns x 20 rows, so `open()` works even if the host never calls them.
 - `set_fixed(int rows, int cols)`: frozen header rows/cols (default `1, 1`), Excel-style (stay fixed while the body scrolls).
-- `set_text_callback(const char* (*cb)(int row, int col, void* user), void* user = nullptr)`: text source for ALL cells (fixed and normal alike). `row`/`col` are 0-based. The returned `const char*` is UTF-8 and is consumed (copied) immediately during drawing, never stored, so a reused static buffer is allowed. `user` is the opaque context registered here and passed back on every call. For a combo (dropdown) cell the value is just the selected index as a decimal string (`"0"`, `"1"`, ...); the item labels come from `set_edit_callback` (see 3.8).
+- `set_text_callback(const char* (*cb)(int row, int col, void* context), void* context = nullptr)`: text source for ALL cells (fixed and normal alike). `row`/`col` are 0-based. The returned `const char*` is UTF-8 and is consumed (copied) immediately during drawing, never stored, so a reused static buffer is allowed. `context` is the opaque pointer registered here and passed back on every call; when omitted (nullptr) it defaults to `this`. For a combo (dropdown) cell the value is just the selected index as a decimal string (`"0"`, `"1"`, ...); the item labels come from `set_edit_callback` (see 3.8).
+- Owned data mode (alternative to `set_text_callback`):
+  - `col_count` / `row_count` are public (single source of truth for both modes); set them via `set_cols`/`set_rows`, not by direct assignment.
+  - `std::string* alloc_text()`: enters owned mode. (Re)allocates a `col_count*row_count` 1-D string array (index = `row*col_count + col`), pre-fills the header band (row 0 = `"","A".."Z"` for cols 1..26, col >= 27 blank; col 0 = `"","1","2",...`), and returns the buffer start. Call `set_cols`/`set_rows` first so the size is known. In owned mode `text_cb` is ignored; `edit_cb` is still the caller's responsibility (no `edit_cb` -> read-only). Resizing the grid (`set_cols`/`set_rows`) in owned mode reallocates the buffer and re-fills headers (old content discarded).
+  - `std::string& cell(int row, int col)`: owned-mode read/write access. Out-of-range index asserts (Debug) then clamps into range -- an out-of-range write deliberately hits the wrong cell so the mistake surfaces. Must not be called in virtual mode.
 - `set_font(const char* name, float size, const char* option = nullptr)`: single `CFont`. Borrows ONLY ConBox's argument grammar (name / size in points / option attribute string such as B/I/U). No English/Korean split and no height matching (TableBox cell widths are explicit, so the monospace cell logic does not apply).
 - `set_align(int num)`: body-cell text alignment, numpad layout (1=top-left ... 5=center ... 9=bot-right); does not affect fixed/header cells. Default 4 (mid-left). Combo labels follow it too.
 - `set_pad(int logical_px)`: inner left/right text padding (96 DPI logical px) inside every cell, and the gap before a combo cell's arrow. Default 4.
@@ -69,7 +74,7 @@
 
 ### 8. In-Place Cell Editing
 
-- `set_edit_callback(const char* (*cb)(int row, int col, const char* text, void* user), void* user = nullptr)`: optional, dual-purpose, separate from the read-only `set_text_callback`. Editing is unavailable (Enter/double-click/typed-char are no-ops on a body cell) until this is called.
+- `set_edit_callback(const char* (*cb)(int row, int col, const char* text, void* context), void* context = nullptr)`: optional, dual-purpose, separate from the read-only `set_text_callback`. `context`, when omitted (nullptr), defaults to `this`. Editing is unavailable (Enter/double-click/typed-char are no-ops on a body cell) until this is called.
   - QUERY mode (`text == nullptr`): TableBox asks the cell's type. Return `nullptr` (read-only, no editing), `(const char*)(-1)` (plain-text CEdit cell), or a comma-separated item list `"item0, item1, ..."` (combo/dropdown cell). Items are trimmed of surrounding spaces; `'\b'` (0x08) inside an item stands for a literal comma. The query is called per cell during draw, mouse-over, and edit entry, so it must be cheap.
   - COMMIT mode (`text != nullptr`): the user finished editing; store the new value. For a combo cell `text` is the selected index as a decimal string (`"0"`, `"1"`, ...); for a CEdit cell it is the raw UTF-8 string. The return value is ignored in commit mode.
   - The cell's CURRENT value comes from `set_text_callback`, not from `edit_cb`: a combo cell's `text_cb` returns just the index string. TableBox caches nothing; the host's `text_cb` source must reflect the committed value on the next call.

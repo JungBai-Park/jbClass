@@ -289,8 +289,10 @@ public:
     // Set a background image painted stretched to the client area (GDI+ cached resample).
     // Safe to call before or after open(). resource_id: RCDATA (JPEG/PNG/BMP).
     // file: UTF-8 path; image bytes are copied so the file is not locked after return.
-    void set_image(int resource_id);
-    void set_image(const char* file);
+    // Returns true on success. On failure (bad id / path / non-image data) the background is
+    // set to solid red via set_bg_color so the error is visible, and false is returned.
+    bool set_image(int resource_id);
+    bool set_image(const char* file);
 
     // Set a solid background color, replacing any background image.
     // set_bg_color() with no argument restores the default dialog face color (COLOR_BTNFACE).

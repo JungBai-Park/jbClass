@@ -91,8 +91,9 @@ public:
 
     // Text source for ALL cells (fixed and normal alike). row/col are 0-based. The returned
     // const char* is UTF-8 and is consumed (copied) immediately during drawing, never stored,
-    // so a reused static buffer is allowed. user is an opaque context passed back on every call.
-    void set_text_callback(const char* (*cb)(int row, int col, void* user), void* user = nullptr);
+    // so a reused static buffer is allowed. context is an opaque pointer passed back on every call;
+    // when omitted (nullptr) it defaults to `this`, so the callback can recover the TableBox*.
+    void set_text_callback(const char* (*cb)(int row, int col, void* context), void* context = nullptr);
 
     // Dual-purpose write-back path for in-place editing. Optional: editing is unavailable if never called.
     // text == nullptr : QUERY mode -- TableBox asks "what kind of cell is this?". Return:
@@ -106,7 +107,8 @@ public:
     //   The return value in commit mode is ignored by TableBox.
     // For combo cells, set_text_callback must return just the current index string ("0","1",...);
     // TableBox reads this in query/draw to know which item to display.
-    void set_edit_callback(const char* (*cb)(int row, int col, const char* text, void* user), void* user = nullptr);
+    // context, when omitted (nullptr), defaults to `this`, so the callback can recover the TableBox*.
+    void set_edit_callback(const char* (*cb)(int row, int col, const char* text, void* context), void* context = nullptr);
 
     // Inset offsets (96 DPI logical px, scaled to physical at the window DPI) for the in-place CEdit:
     //   CEdit rect = (x0+dx0, y0+dy0, x1-dx1, y1-dy1)
@@ -133,6 +135,30 @@ public:
 
     // Grid line color (RGB). Default is RGB(191,191,191). Can be called before or after open().
     void set_grid_color(int red, int green, int blue);
+
+    // === Owned (non-virtual) data mode ===
+    // By default TableBox holds no cell text: set_text_callback supplies each cell on demand
+    // (virtual mode, suited to large/dynamic data). For a small fixed table (intended for
+    // < 100 cols x < 27 rows) call alloc_text() once to switch to OWNED mode: TableBox then
+    // stores every cell's UTF-8 string itself and cell() gives direct read/write access.
+    //
+    // Total grid dimensions, the single source of truth for both modes. Public so owned-mode
+    // callers can compute the cell() index range. Set by set_cols/set_rows; do not assign directly.
+    int col_count;       // total column count
+    int row_count;       // total row count
+
+    // Enter owned mode. Frees any previous owned buffer and allocates col_count*row_count empty
+    // strings (index = row*col_count + col). Pre-fills the header band: row 0 = "","A","B",..."Z"
+    // (cols 1..26; col >= 27 left blank for the caller to fill), col 0 = "","1","2",... .
+    // Call set_cols/set_rows BEFORE this so the size is known (else the ctor default 5x20 is used).
+    // Returns the buffer start pointer. In owned mode text_cb is ignored; edit_cb is still the
+    // caller's responsibility (no edit_cb -> read-only).
+    std::string* alloc_text();
+
+    // Owned-mode cell access (read/write). Out-of-range index asserts (Debug) then clamps into
+    // [0,col_count-1] x [0,row_count-1] -- an out-of-range write hits the wrong cell on purpose so
+    // the mistake surfaces. Must not be called in virtual mode (no owned buffer exists).
+    std::string& cell(int row, int col);
 
 protected:
     // Default rendering: normal body-cell white + text aligned per set_align(); fixed cell an
@@ -371,10 +397,10 @@ private:
     // col_uniform_w / row_uniform_h serve two roles:
     //   - uniform path : the single fixed cell size used for every cell.
     //   - non-uniform path : out-of-range fallback (c >= col_widths.size() returns col_uniform_w).
+    // NOTE: col_count / row_count are declared in the public section (owned-mode callers need
+    // them); they remain the single source of truth for both paths per the INVARIANT above.
     int col_uniform_w;   // 96 DPI logical px column width (uniform path / OOB fallback)
-    int col_count;       // total column count -- single source of truth for both paths
     int row_uniform_h;   // 96 DPI logical px row height (uniform path / OOB fallback)
-    int row_count;       // total row count   -- single source of truth for both paths
 
     // Per-cell sizes for the non-uniform path.
     // MUST remain empty when the axis is uniform (see INVARIANT above -- do NOT resize/assign here
@@ -416,11 +442,16 @@ private:
                                      // draws while true, but cur_row/cur_col are remembered
                                      // regardless so the border reappears where it was on refocus
 
-    const char* (*text_cb)(int row, int col, void* user);
-    void* text_cb_user;
+    // Owned-mode storage: nullptr == virtual mode (use text_cb); non-null == owned col_count*
+    // row_count array, index = row*col_count + col. Allocated/reset by alloc_text(); when the grid
+    // is resized in owned mode (set_cols/set_rows) it is reallocated to the new size.
+    std::string* cell_data;
 
-    const char* (*edit_cb)(int row, int col, const char* text, void* user);
-    void* edit_cb_user;
+    const char* (*text_cb)(int row, int col, void* context);
+    void* text_cb_context;
+
+    const char* (*edit_cb)(int row, int col, const char* text, void* context);
+    void* edit_cb_context;
 
     // In-place edit session state. edit_box (a raw Unicode EDIT HWND, see start_text_edit) and
     // combo_popup are mutually exclusive and non-null only while their respective session is open.

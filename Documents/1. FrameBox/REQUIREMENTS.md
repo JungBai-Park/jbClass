@@ -85,6 +85,7 @@
 
 - `set_image(int resource_id)`: loads an `RT_RCDATA` image resource (JPEG/PNG/BMP auto-detected via GDI+) as the background. Safe to call before or after `open()`.
 - `set_image(const char* file)`: loads an image from a UTF-8 file path. Relative paths are resolved against the exe directory (not CWD). Image bytes are copied into memory so the file is not locked after return.
+- Both `set_image` overloads return `bool`. On failure (bad resource id / path / non-image data) the background is set to solid red via `set_bg_color(RGB(255,0,0))` so the error is visible, and `false` is returned.
 - `set_bg_color(COLORREF color)`: sets a solid background color, replacing any background image.
 - `set_bg_color()`: no-arg form; clears any image or color and restores the default dialog face color (`COLOR_BTNFACE`).
 - The background image is **cached as a screen-compatible bitmap** pre-scaled to the current client size; `WM_ERASEBKGND` BitBlts the cache instead of re-running the GDI+ resample each paint (the per-paint resample stalled zoom 1-2 s — see PITFALLS). The cache is rebuilt only when the client size changes (zoom/DPI/resize) and freed in `close()` / on reload.
