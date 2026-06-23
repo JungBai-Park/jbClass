@@ -18,7 +18,8 @@
 ### 3 Layout Editing Gestures
 
 - Clicking the middle mouse button toggles edit mode.
-- While edit mode is active, the target control's native mouse and keyboard input is suppressed. When the edited target is a `FrameBox` itself (self-edit), its child controls are also kept inert: `PreTranslateMessage` swallows their mouse input (no hover/focus steal, except `WM_MBUTTONDOWN` so edit can be toggled elsewhere) and routes edit keys (arrows/Enter/Esc) to the editing window regardless of which child holds focus.
+- Middle-button **double-click** on empty client area (DEBUG only): if a background image is set, resizes the window to the image's natural pixel dimensions (treated as 96 DPI logical, scaled by `eff_dpi()`), keeping the Top/Left position. Because `WM_MBUTTONDOWN` fires first, the window enters edit mode before the resize, so the result is: resize + stay in edit mode. In frameless mode, `WM_NCMBUTTONDBLCLK` is forwarded as `WM_MBUTTONDBLCLK` (same pattern as `WM_NCMBUTTONDOWN` → `WM_MBUTTONDOWN`).
+- While edit mode is active, the target control's native mouse and keyboard input is suppressed. When the edited target is a `FrameBox` itself (self-edit), its child controls are also kept inert: `PreTranslateMessage` swallows their mouse input (no hover/focus steal, except `WM_MBUTTONDOWN` and `WM_MBUTTONDBLCLK` so edit can be toggled and image resize triggered) and routes edit keys (arrows/Enter/Esc) to the editing window regardless of which child holds focus.
 - Keyboard movement rules:
   - Arrow key: move by 5 px.
   - Ctrl + Arrow key: move by 1 px.
@@ -82,7 +83,10 @@
 
 ### 7 Background Image and Frameless Mode
 
-- `open_image(app/owner, x0, y0, id)` (macro `OpenImage`) opens a frame whose client area matches an `RT_RCDATA` image resource (JPEG/PNG/BMP auto-detected via GDI+ `Image::FromStream`). Window size is derived from the image pixel dimensions; only `x0,y0` (96 DPI logical screen coords) are given. Returns false if the resource is missing or the image format is invalid. The image is painted in `WM_ERASEBKGND`.
+- `set_image(int resource_id)`: loads an `RT_RCDATA` image resource (JPEG/PNG/BMP auto-detected via GDI+) as the background. Safe to call before or after `open()`.
+- `set_image(const char* file)`: loads an image from a UTF-8 file path. Relative paths are resolved against the exe directory (not CWD). Image bytes are copied into memory so the file is not locked after return.
+- `set_bg_color(COLORREF color)`: sets a solid background color, replacing any background image.
+- `set_bg_color()`: no-arg form; clears any image or color and restores the default dialog face color (`COLOR_BTNFACE`).
 - The background image is **cached as a screen-compatible bitmap** pre-scaled to the current client size; `WM_ERASEBKGND` BitBlts the cache instead of re-running the GDI+ resample each paint (the per-paint resample stalled zoom 1-2 s — see PITFALLS). The cache is rebuilt only when the client size changes (zoom/DPI/resize) and freed in `close()` / on reload.
 - `AddStatic` controls are transparent by default (`WM_CTLCOLORSTATIC` returns `NULL_BRUSH` + `SetBkMode(TRANSPARENT)`) so the background image/color shows through. (Therefore the frame must NOT use `WS_CLIPCHILDREN`, which would leave transparent-static rects unpainted.)
 - `frameless(int option)` (macro `Frameless`) removes the OS title bar and draws owner-drawn Ubuntu-style round caption buttons in the top-right of the client area. Must be called AFTER `open()`/`open_image()` (requires a valid `m_hWnd`). Empty client area becomes draggable (`WM_NCHITTEST` -> `HTCAPTION`); button circles return `HTCLIENT` so clicks reach the frame. Returns 0 on success, -1 on invalid option, -2 if not yet created.

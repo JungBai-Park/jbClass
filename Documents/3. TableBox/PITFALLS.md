@@ -1,6 +1,23 @@
 ﻿## TableBox
 
-### 1. std::min/std::max Break Under windows.h
+### 1. Grid Axis Invariant: col_widths.empty() == Uniform, col_count Is Always Valid
+
+Two invariant rules govern `col_widths`/`row_heights` and `col_count`/`row_count` -- breaking
+either corrupts all cell geometry silently:
+
+1. `col_widths.empty()` signals the uniform column axis (set by `set_cols(int,int)` or ctor);
+   `row_heights.empty()` signals the uniform row axis. Do NOT push/assign to the vector without
+   also switching the axis to non-uniform; do NOT clear the vector without intending to restore
+   the uniform path.
+2. `col_count` is the single source of truth for the total column count in ALL cases (both paths).
+   `set_cols(initializer_list)` must update `col_count = col_widths.size()` after building the
+   vector; the uniform overload must update `col_count = limit`. Same rule for `row_count`.
+
+Cell-size access pattern (enforced throughout the code):
+  `c < (int)col_widths.size() ? col_widths[c] : col_uniform_w`
+Out-of-range index returns `col_uniform_w` as a soft fallback (intentional, not a bug guard).
+
+### 2. std::min/std::max Break Under windows.h
 
 - `afxwin.h` pulls in `windows.h`, which (without `NOMINMAX`) defines `min`/`max` as macros.
   `std::min(...)`/`std::max(...)` then fail to compile (`std::` followed by an expanded macro

@@ -10,10 +10,10 @@
 ### 2. Grid Definition (public API)
 
 - `open(CWnd* parent, int x0, int y0, int rows, int cols)`: creates the child window at `(x0,y0)`. `rows`/`cols` are the INITIAL VISIBLE cell count, not the grid's total row/col count, and are clamped to it. Call `set_cols`/`set_rows`/`set_fixed`/`set_text_callback`/`set_font` before `open()` so the first paint already has metrics ready.
-- `set_cols(int width, int limit)`: uniform column width with `limit` columns. `width` is 96 DPI logical px.
-- `set_cols(const std::vector<int>& widths)`: per-column widths; column count = vector size.
-- `set_rows(int height, int limit)` / `set_rows(const std::vector<int>& heights)`: same for rows.
-- Before any `set_cols`/`set_rows` call, the grid defaults to uniform 75x20 (96 DPI logical) cells, 10000 columns x 10000 rows, so `open()` works even if the host never calls them.
+- `set_cols(int width, int limit)`: uniform column width with `limit` columns. No vector allocation; `limit` can be very large (thousands).
+- `set_cols(std::initializer_list<int> pattern, int count = 1)`: repeats `pattern` `count` times to build the column-width vector. `count=1` (default) uses the pattern as-is.
+- `set_rows(int height, int limit)` / `set_rows(std::initializer_list<int> pattern, int count = 1)`: same for rows.
+- Before any `set_cols`/`set_rows` call, the grid defaults to uniform 75x20 (96 DPI logical) cells, 5 columns x 20 rows, so `open()` works even if the host never calls them.
 - `set_fixed(int rows, int cols)`: frozen header rows/cols (default `1, 1`), Excel-style (stay fixed while the body scrolls).
 - `set_text_callback(const char* (*cb)(int row, int col, void* user), void* user = nullptr)`: text source for ALL cells (fixed and normal alike). `row`/`col` are 0-based. The returned `const char*` is UTF-8 and is consumed (copied) immediately during drawing, never stored, so a reused static buffer is allowed. `user` is the opaque context registered here and passed back on every call. For a combo (dropdown) cell the value is just the selected index as a decimal string (`"0"`, `"1"`, ...); the item labels come from `set_edit_callback` (see 3.8).
 - `set_font(const char* name, float size, const char* option = nullptr)`: single `CFont`. Borrows ONLY ConBox's argument grammar (name / size in points / option attribute string such as B/I/U). No English/Korean split and no height matching (TableBox cell widths are explicit, so the monospace cell logic does not apply).

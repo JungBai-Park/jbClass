@@ -1,65 +1,34 @@
 /*
     DemoApp.cpp - CWinApp entry + DemoMain() exercising FrameBox.
-
-    A listen() modal loop dispatching on the returned pointer. The root window is
-    a cDemoBox (FrameBox subclass, stack local) that OWNS its controls (Add*
-    member factories), a ConBox attached via AddNew, and a TableBox attached the
-    same way (AddNew with all-zero coords = attach-only, keeping the size/position
-    TableBox::open() already computed). InitInstance runs DemoMain() then returns
-    FALSE; DemoMain drives everything through listen() and ~FrameBox tears down
-    all children + clears m_pMainWnd at scope exit.
-
-    cDemoBox overrides:
-      - WindowProc / WM_DPICHANGED: update title bar (DPI + zoom% + DPICHANGED count).
-      - apply_zoom (virtual override): call base then update_title() so Ctrl+Wheel zoom
-        also refreshes the title bar immediately.
-    Menu bar (no resource file): add_menu() adds "ConBox" and "Help" popups after open().
-    ConBox popup mirrors the former system-menu items (Save EMF/Text/PDF, Start/Stop Logging).
-
-    cDemoSub (FrameBox subclass for the modal sub-dialog) overrides:
-      - WindowProc / WM_DPICHANGED: update title bar (DPI + zoom% + DPICHANGED count).
-      - apply_zoom: same as cDemoBox, for Ctrl+Wheel zoom on the sub-dialog.
-
-    DemoSub() shows a modal sub-dialog: Sub.OpenFrame(owner,...) disables owner
-    until the sub-frame goes out of scope (close() re-enables owner).
-
-    DPI awareness: PerMonitorV2 is declared in jbClass.manifest (embedded in EXE
-    at link time via AdditionalManifestFiles). Code-based SetProcessDpiAwarenessContext
-    does NOT work with UseOfMfc=Static -- see Learned.md section 1.4.
-
-    The OpenFrame()/Add* call sites below are the live-edit / source-rewrite
-    targets: middle-click a control (or the frame), move/resize it, press Enter,
-    and the four coordinate literals on that call's line are rewritten in place
-    (OpenFrame coords start at arg 2; member-call coords at arg 1).
 */
 
 #include "..\Source\FrameBox.h"
 #include "..\Source\ConBox.h"
 #include "..\Source\TableBox.h"
 #include "resource.h"  // IDR_BACKGROUND
-#include <shlobj.h>    // SHBrowseForFolderW, SHGetPathFromIDListW
 
-
-int  DemoMain(int argc, const char* argv[]);
-void DemoSub(CWnd* owner);
 
 class cDemoApp : public CWinApp {
     int exit_code = 0;
 public:
-    virtual BOOL InitInstance() {
+    BOOL InitInstance() override {
+        int main(int argc, const char *argv[]);
+
         INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_WIN95_CLASSES };
         InitCommonControlsEx(&icc);
         CWinApp::InitInstance();
-        // __argc/__argv are CRT globals (system ANSI codepage, not UTF-8).
-        exit_code = DemoMain(__argc, const_cast<const char**>(__argv));
-        return FALSE;        // DemoMain ran its own loop; exit the app
+
+        exit_code = main(__argc, const_cast<const char**>(__argv));
+        return FALSE;
     }
-    virtual int ExitInstance() { return exit_code; }
+
+    int ExitInstance() override {
+        return(exit_code);
+    }
 };
 
 class cDemoBox : public FrameBox {
 public:
-    ConBox* con_box = nullptr;
     int dpi_changed_count = 0;
 
     void update_title() {
@@ -114,7 +83,7 @@ public:
     }
 };
 
-cDemoApp theApp;
+cDemoApp App;
 
 // TableBox demo data: 50x50 cell text, filled by DemoMain before open().
 static std::vector<std::vector<std::string>> table_text;
@@ -146,11 +115,13 @@ static const char* DefaultTableEdit(int row, int col, const char* text, void* us
     return nullptr;
 }
 
-int DemoMain(int argc, const char* argv[]) {
-    cDemoBox Top;
-    // Top.OpenFrame(&theApp, 510, -910, 510 + 900, -910 + 750);   // main window sized to background image
-    Top.OpenImage(&theApp, 510, -910, IDR_BACKGROUND);   // main window sized to background image
-    Top.frameless(2);                                    // borderless + close/min/max caption buttons
+cDemoBox Top;
+void DemoSub(CWnd *owner);
+
+int main(int argc, const char* argv[]) {
+    Top.OpenFrame(&App, 306, -942, 1222, -103);
+    Top.set_image(IDR_BACKGROUND);
+    // Top.frameless(2);                                    // borderless + close/min/max caption buttons
     Top.CenterWindow();
     Top.set_margin(5);
     Top.update_title();   // show initial DPI (count=0)
@@ -159,12 +130,7 @@ int DemoMain(int argc, const char* argv[]) {
     conBox->setup_from_ini("..\\..\\Documents\\ConBox.ini");
     conBox->open(&Top, 5, 5);
     Top.AddNew(5, 340, 601, 735, conBox);   // coords-first; Top owns conBox
-    Top.con_box = conBox;
 
-    std::vector<int> col_widths(50);
-    for (size_t i = 0; i < col_widths.size(); ++i) col_widths[i] = (i % 2 == 0) ? 125 : 75;
-    std::vector<int> row_heights(50);
-    for (size_t i = 0; i < row_heights.size(); ++i) row_heights[i] = (i % 2 == 0) ? 25 : 25;
     table_text.assign(50, std::vector<std::string>(50));
     char cell_buf[32];
     for (int row = 0; row < 50; ++row) {
@@ -176,8 +142,8 @@ int DemoMain(int argc, const char* argv[]) {
 
     table_text[6][2] = "2";   // Stage 5 combo-cell demo
     TableBox* table = new TableBox;
-    table->set_cols(col_widths);
-    table->set_rows(row_heights);
+    table->set_cols({125, 75}, 25);   // 50 cols: 125/75 pattern x25
+    table->set_rows({25}, 50);        // 50 rows: uniform 25px
     table->set_fixed(1, 1);
     table->set_text_callback(DefaultTableText, nullptr);
     table->set_edit_callback(DefaultTableEdit, nullptr);
@@ -185,13 +151,12 @@ int DemoMain(int argc, const char* argv[]) {
     table->set_align(5);
     table->set_edit_adjust(1, 4, 0, 0);
     table->open(&Top, 5, 5, 10, 8);
-    Top.AddNew(5, 50, 805, 327, table);    // attach-only; keep the size/position open() computed
+    Top.AddNew(20, 45, 820, 322, table);    // attach-only; keep the size/position open() computed
 
     CEdit*     edit   = Top.AddEdit  (685, 405, 874, 445);
-
     CButton*   button = Top.AddButton(710, 370, 790, 395, "Close");
     CButton*   subBtn = Top.AddButton(795, 370, 875, 395, "Sub");
-    CStatic*   label  = Top.AddStatic(665, 455, 875, 475, "강누리 만세");
+    CStatic*   label  = Top.AddStatic(665, 455, 875, 509, "강누리 만세");
     CComboBox* combo  = Top.AddCombo (685, 340, 875, 363, "Left,Center,Right");
 
     AlignText(edit, 5);

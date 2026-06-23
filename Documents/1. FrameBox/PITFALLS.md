@@ -131,7 +131,7 @@
 - `editing_hwnd() == pMsg->hwnd` is false when a child holds focus (target is the child), so the old `PreTranslateMessage` guard did not catch this case.
 - Fix (in `FrameBox::PreTranslateMessage`, only while `editing_hwnd()` is non-NULL): route edit keys (arrows/Enter/Esc) to the editing window via `SendMessageW(edit, WM_KEYDOWN, ...)` regardless of focus and consume them; swallow non-editing controls' mouse messages (`WM_MOUSEFIRST..WM_MOUSELAST`) so they stay inert. Let `WM_MBUTTONDOWN` pass so edit can still be toggled on another control. When the editing window itself is focused (`pMsg->hwnd == edit`), return FALSE to let its own subclass proc handle the key.
 
-### 14. Background Image Re-Stretch Stalls Zoom (open_image)
+### 14. Background Image Re-Stretch Stalls Zoom (set_image)
 
 - Drawing the GDI+ background `Image` directly in `WM_ERASEBKGND` (`Graphics::DrawImage(img, clientRect)`) re-runs the JPEG/PNG resample on EVERY erase. A Ctrl+Wheel zoom triggers many full-client erases (child `MoveWindow`, `Invalidate()`, `fit_to_children` resize, `CS_HREDRAW|CS_VREDRAW`), so the visible result was: background repainted instantly but the whole frame took 1-2 s to settle. `OpenFrame` (solid `FillRect`) had no lag, which isolated the cause to the image resample.
 - Fix: cache the scaled background in a screen-compatible `HBITMAP` (`rebuild_bg_cache`) sized to the client; `WM_ERASEBKGND` `BitBlt`s the cache. Rebuild only when the client size changes (`bg_cache_w/h` mismatch) and free in `close()` / `load_bg_image()`. `frameless`'s `fless_draw` also blits the cache slice instead of re-stretching the full image.

@@ -17,8 +17,10 @@
 //
 // --- Usage ---
 //     TableBox* table = new TableBox;
-//     table->set_cols(100, 15);                 // uniform width 100 (96 DPI), 15 columns total
-//     table->set_rows(25, 60);                   // uniform height 25 (96 DPI), 60 rows total
+//     table->set_cols(100, 15);                 // uniform 100px, 15 cols (no vector alloc)
+//     table->set_cols({125, 75}, 25);           // pattern-repeat: 125/75 alternating, 50 cols total
+//     table->set_rows(25, 60);                   // uniform 25px, 60 rows (no vector alloc)
+//     table->set_rows({25}, 50);                // same as uniform form but via pattern API
 //     table->set_fixed(1, 1);                     // frozen header row/col (default)
 //     table->set_text_callback(MyText, nullptr);  // text source for every cell
 //     table->set_font("Malgun Gothic", 10);       // single font (ConBox name/size/option grammar)
@@ -50,7 +52,7 @@
 #include <vector>
 #include <string>
 
-// Implementation detail of in-place cell editing (Stage 5): an owner-draw dropdown popup defined
+// Implementation detail of in-place cell editing: an owner-draw dropdown popup defined
 // inside TableBox.cpp. Forward-declared here only so TableBox can hold a pointer to it; callers
 // never see its definition. (The plain-text editor is a raw Unicode EDIT window driven by a Win32
 // subclass proc -- see start_text_edit / EditSubclassProc in TableBox.cpp -- not an MFC class,
@@ -59,7 +61,7 @@ class TableComboPopup;
 
 class TableBox : public CWnd
 {
-    // Tightly-coupled implementation detail of in-place editing (Stage 5): it needs to call back
+    // Tightly-coupled implementation detail of in-place editing: it needs to call back
     // into TableBox's private end_combo_edit and read/set ending_edit.
     friend class TableComboPopup;
 
@@ -74,13 +76,15 @@ public:
     void open(CWnd* parent, int x0, int y0, int rows, int cols);
 
     // Uniform column width (96 DPI logical px) repeated for `limit` columns total.
+    // No vector allocation; limit can be very large (thousands).
     void set_cols(int width, int limit);
-    // Per-column widths (96 DPI logical px); column count = widths.size().
-    void set_cols(const std::vector<int>& widths);
+    // Pattern-repeat: repeats `pattern` for `count` times to build col_widths vector.
+    // count=1 (default) uses pattern as-is; col_widths is always non-empty after this call.
+    void set_cols(std::initializer_list<int> pattern, int count = 1);
 
     // Same as set_cols, for row heights.
     void set_rows(int height, int limit);
-    void set_rows(const std::vector<int>& heights);
+    void set_rows(std::initializer_list<int> pattern, int count = 1);
 
     // Frozen header rows/cols (Excel-style: stay fixed while the body scrolls). Default 1, 1.
     void set_fixed(int rows, int cols);
@@ -90,7 +94,7 @@ public:
     // so a reused static buffer is allowed. user is an opaque context passed back on every call.
     void set_text_callback(const char* (*cb)(int row, int col, void* user), void* user = nullptr);
 
-    // Dual-purpose write-back path (Stage 5). Optional: editing is unavailable if never called.
+    // Dual-purpose write-back path for in-place editing. Optional: editing is unavailable if never called.
     // text == nullptr : QUERY mode -- TableBox asks "what kind of cell is this?". Return:
     //   nullptr (0)            : read-only; no editing.
     //   (const char*)(-1)     : CEdit-editable plain-text cell.
@@ -247,8 +251,8 @@ private:
     // the cell is not currently rendered (scrolled out of the fixed/body view).
     bool cell_rect(int row, int col, CRect& rc) const;
 
-    // Stage 4: column/row border resize (vector-form axes only -- a no-op axis configured via
-    // the uniform set_cols/set_rows overload has no border to grab, see cols_uniform/rows_uniform).
+    // Column/row border resize (vector-form axes only -- a no-op when the axis is uniform,
+    // i.e. col_widths/row_heights is empty; uniform axes have no per-cell size to grab).
     // Border hit zones live in the header band: a column border is tested along y in [0,corner_h())
     // at each visible column boundary (fixed + currently scrolled body columns); a row border is
     // tested along x in [0,corner_w()) at each visible row boundary. Returns the index of the
@@ -275,7 +279,7 @@ private:
     // floating editor before the table layout changes beneath it.
     void cancel_edit();
 
-    // Stage 5: in-place cell editing. Starts the text-edit session over (row,col) with its current
+    // In-place cell editing. Starts the text-edit session over (row,col) with its current
     // text selected. The editor is a raw Unicode EDIT window (CreateWindowExW + SetWindowSubclass,
     // NOT an MFC CEdit) so IME composition renders correctly even in an MBCS build. If initial_char
     // != 0 it is forwarded to the new box right after creation (typed-key trigger: replaces the
@@ -357,20 +361,28 @@ private:
                          const CRect& btn_dec, const CRect& btn_inc, const SbarState& s, bool vertical,
                          COLORREF body_bg);
 
-    // Grid definition (96 DPI logical px), one entry per column/row; size() is the grid's total
-    // column/row count (the "limit" of the uniform set_cols/set_rows overload). Ctor default
-    // (before any set_cols/set_rows call): uniform 75 wide x 20 tall, 10000 columns x 10000 rows,
-    // so open() works even if the host never calls set_cols/set_rows.
+    // INVARIANT (do NOT break -- the entire grid logic depends on these two rules):
+    //   1. col_widths.empty() == uniform column axis  (set by set_cols(int,int) or ctor)
+    //      row_heights.empty() == uniform row axis    (set by set_rows(int,int) or ctor)
+    //   2. col_count == total column count in ALL cases (uniform and non-uniform alike).
+    //      set_cols(initializer_list) must keep col_count == col_widths.size() in sync.
+    //      Same rule applies to row_count / row_heights.
+    //
+    // col_uniform_w / row_uniform_h serve two roles:
+    //   - uniform path : the single fixed cell size used for every cell.
+    //   - non-uniform path : out-of-range fallback (c >= col_widths.size() returns col_uniform_w).
+    int col_uniform_w;   // 96 DPI logical px column width (uniform path / OOB fallback)
+    int col_count;       // total column count -- single source of truth for both paths
+    int row_uniform_h;   // 96 DPI logical px row height (uniform path / OOB fallback)
+    int row_count;       // total row count   -- single source of truth for both paths
+
+    // Per-cell sizes for the non-uniform path.
+    // MUST remain empty when the axis is uniform (see INVARIANT above -- do NOT resize/assign here
+    // without also updating col_count, and do NOT clear without confirming it is the uniform path).
     std::vector<int> col_widths;
     std::vector<int> row_heights;
 
-    // True when the axis was last set through the uniform set_cols/set_rows overload (also true
-    // for the ctor default); the vector-form overload clears it. Stage 4 resize/autofit are a
-    // no-op while the axis's flag is true (uniform axes have no per-cell width/height to grab).
-    bool cols_uniform;
-    bool rows_uniform;
-
-    // Stage 4 live border-drag state. resize_col/resize_row (-1 = not resizing) is the dragged
+    // Live border-drag state. resize_col/resize_row (-1 = not resizing) is the dragged
     // border's column/row; resize_start_pt/resize_start_sz are the mouse coordinate (physical px)
     // and that column/row's size (96 DPI logical px) at the moment the drag started, so OnMouseMove
     // can recompute the size from the cursor delta without accumulating rounding error across moves.
@@ -386,7 +398,7 @@ private:
 
     // True while a fresh (non-Shift) header-band click is being dragged across other header
     // cells to multi-select columns/rows (Excel-style header drag-select); mutually exclusive
-    // with `selecting` (body-cell range drag) and the Stage 4 border drags above, since each
+    // with `selecting` (body-cell range drag) and the border drags above, since each
     // starts its own SetCapture() from OnLButtonDown and they are tested in priority order there.
     bool header_drag_col;
     bool header_drag_row;
@@ -410,7 +422,7 @@ private:
     const char* (*edit_cb)(int row, int col, const char* text, void* user);
     void* edit_cb_user;
 
-    // Stage 5 edit session state. edit_box (a raw Unicode EDIT HWND, see start_text_edit) and
+    // In-place edit session state. edit_box (a raw Unicode EDIT HWND, see start_text_edit) and
     // combo_popup are mutually exclusive and non-null only while their respective session is open.
     // ending_edit guards against a re-entrant commit when WM_KILLFOCUS fires as a side effect of
     // our own DestroyWindow()/SetFocus() during commit/cancel (the box's real "lost focus to

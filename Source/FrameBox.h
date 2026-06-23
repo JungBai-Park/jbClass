@@ -28,7 +28,7 @@
 //   WM_PARASITE_REPORT  (wParam=signaling CWnd*): signals listen() to return.
 //
 // --- Usage ---
-//     FrameBox Top;  Top.OpenFrame(&theApp, 560,275, 1360,875);
+//     FrameBox Top;  Top.OpenFrame(&App, 560,275, 1360,875);
 //     Top.set_margin(5);                          // auto-fit frame to children + 5 px padding
 //     CEdit*     e = Top.AddEdit  (10, 10,200, 30);
 //     CButton*   b = Top.AddButton(10, 50,100, 30, "OK");
@@ -37,6 +37,8 @@
 //         CWnd* ev = Top.listen(e, b, c);
 //         if (ev == 0 || ev == b) break;
 //     }
+//     // Background image: Top.set_image(IDR_BG);  or  Top.set_image("bg.png");  (call before or after open)
+//     // Solid color:      Top.set_bg_color(RGB(30,30,30));  Top.set_bg_color(); // restore default gray
 //     // Modal sub-dialog: FrameBox Sub; Sub.OpenFrame(&Top, ...); disables Top until Sub closes.
 //
 
@@ -284,13 +286,16 @@ public:
     // Change the display label of a menu bar item identified by its WM_COMMAND ID.
     void modify_menu_label(int id, const char* label);
 
-    // Open a window whose client area exactly matches an RCDATA image resource
-    // (JPEG/PNG/BMP auto-detected via GDI+). x0,y0 are 96 DPI logical screen coords.
-    // The window size is derived from the image pixel dimensions (no x1,y1 needed).
-    // Two overloads mirror open(): CWinApp* for main window, CWnd* for modal sub-dialog.
-    // Returns false if the resource cannot be loaded or the image format is invalid.
-    bool open_image(CWinApp* app,   int x0, int y0, int id);
-    bool open_image(CWnd*    owner, int x0, int y0, int id);
+    // Set a background image painted stretched to the client area (GDI+ cached resample).
+    // Safe to call before or after open(). resource_id: RCDATA (JPEG/PNG/BMP).
+    // file: UTF-8 path; image bytes are copied so the file is not locked after return.
+    void set_image(int resource_id);
+    void set_image(const char* file);
+
+    // Set a solid background color, replacing any background image.
+    // set_bg_color() with no argument restores the default dialog face color (COLOR_BTNFACE).
+    void set_bg_color(COLORREF color);
+    void set_bg_color();
 
     // Remove the OS title bar and draw owner-drawn Ubuntu-style round caption
     // buttons in the top-right of the client area. Must be called AFTER open()/
@@ -423,12 +428,17 @@ private:
     std::vector<MenuPopup>  menu_popups;
     int                     next_menu_id;
 
-    // Background image (open_image). bg_image is a GDI+ Image* painted in WM_ERASEBKGND.
-    // bg_stream keeps the raw bytes alive (Gdiplus::Image::FromStream does NOT copy them).
-    // Both freed in close(). nullptr = solid COLOR_BTNFACE fill (default).
-    bool            load_bg_image(int id);    // loads resource into bg_image/bg_stream
+    // Background image. bg_image is a GDI+ Image* painted stretched in WM_ERASEBKGND.
+    // bg_stream keeps the raw bytes alive (GDI+ Image::FromStream does NOT copy them).
+    // bg_color/bg_color_set: solid color fallback when bg_image is nullptr.
+    // All freed in close(). Default: bg_image=nullptr, bg_color_set=false -> COLOR_BTNFACE.
+    bool            load_bg_image(int id);          // resource -> bg_image/bg_stream
+    bool            load_bg_file(const char* file); // file -> memory -> bg_image/bg_stream
+    void            clear_bg_image();               // free bg_image/bg_stream/bg_cache
     Gdiplus::Image* bg_image;
     IStream*        bg_stream;
+    COLORREF        bg_color;
+    bool            bg_color_set;
 
     // Cached, pre-scaled background. WM_ERASEBKGND would otherwise re-stretch the
     // GDI+ image (slow JPEG resample) on every paint; during a zoom that runs many
@@ -498,15 +508,10 @@ private:
 #define AddNew(x0,y0,x1,y1,wnd)     add_new((x0),(y0),(x1),(y1), LAYOUT_SRC, (wnd))
 #define AddAsItIs(x0,y0,x1,y1,wnd)  add_asitis((x0),(y0),(x1),(y1), LAYOUT_SRC, (wnd))
 
-// Frame open (member-call form). Pointer-first: p is &theApp (main window) or
+// Frame open (member-call form). Pointer-first: p is &App (main window) or
 // &parentFrame (modal sub-dialog); coords follow. The source rewriter treats
 // OpenFrame coords as starting at the 2nd argument.
-//   FrameBox Top;  Top.OpenFrame(&theApp, 393, -955, 1168, -280);
-//   FrameBox Sub;  Sub.OpenFrame(&Top,    10, 10, 100, 100);
+//   FrameBox Top;  Top.OpenFrame(&App, 393, -955, 1168, -280);
+//   FrameBox Sub;  Sub.OpenFrame(&Top, 10, 10, 100, 100);
 #define OpenFrame(p,x0,y0,x1,y1)    open((p), (x0),(y0),(x1),(y1), LAYOUT_SRC)
 
-// Like OpenFrame but sizes the window to an RCDATA image resource (JPEG/PNG/BMP).
-// Only 2 coords (x0,y0); the window size is determined from the image dimensions.
-// Parasite source-rewriter does NOT apply to this macro (only 2 coords, not 4).
-//   FrameBox Top;  Top.OpenImage(&theApp, 510, -910, IDR_BACKGROUND);
-#define OpenImage(p,x0,y0,id)        open_image((p), (x0),(y0),(id))

@@ -502,7 +502,8 @@ LRESULT Parasite::dispatch(HWND h, UINT msg, WPARAM w, LPARAM l) {
         }
         // Eat all remaining mouse and keyboard messages: in edit mode only
         // move/resize gestures are active; control-native behavior must be silent.
-        if ((msg >= WM_MOUSEFIRST && msg <= WM_MOUSELAST) ||
+        // WM_MBUTTONDBLCLK passes through so FrameBox::WindowProc can handle image resize.
+        if ((msg >= WM_MOUSEFIRST && msg <= WM_MOUSELAST && msg != WM_MBUTTONDBLCLK) ||
             (msg >= WM_KEYFIRST   && msg <= WM_KEYLAST))
             return 0;
     }
@@ -878,6 +879,7 @@ FrameBox::FrameBox()
       waiting(false), timer_fired(false), event(nullptr), timer_id(0),
       dpi(96), zoom_pm(1000), snap_margin(-1), sys_font(nullptr),
       next_menu_id(1), bg_image(nullptr), bg_stream(nullptr),
+      bg_color(0), bg_color_set(false),
       bg_cache(nullptr), bg_cache_w(0), bg_cache_h(0),
       fless_opt(-1), fless_gdip(false), fless_hover_close(false),
       fless_hover_max(false), fless_hover_min(false), fless_tracking(false) {
@@ -939,9 +941,7 @@ void FrameBox::close() {
         if (::IsWindow(m_hWnd)) ::SetMenu(m_hWnd, nullptr);
         if (::IsMenu(hm)) ::DestroyMenu(hm);
     }
-    if (bg_cache)  { ::DeleteObject(bg_cache); bg_cache = nullptr; bg_cache_w = bg_cache_h = 0; }
-    if (bg_image)  { delete bg_image;  bg_image  = nullptr; gdip_release(); }
-    if (bg_stream) { bg_stream->Release(); bg_stream = nullptr; }
+    clear_bg_image();
     if (fless_gdip) { gdip_release(); fless_gdip = false; }  // GDI+ ref taken by frameless()
     if (::IsWindow(m_hWnd)) DestroyWindow();
 }
@@ -1345,27 +1345,74 @@ void FrameBox::modify_menu_label(int id, const char* label) {
             if (item.id == id) { item.label = label; return; }
 }
 
-// ---- background image (open_image / load_bg_image) ------------------------
+// ---- background image (set_image / set_bg_color) ---------------------------
+
+void FrameBox::clear_bg_image() {
+    if (bg_cache)  { ::DeleteObject(bg_cache); bg_cache = nullptr; bg_cache_w = bg_cache_h = 0; }
+    if (bg_image)  { delete bg_image;  bg_image  = nullptr; gdip_release(); }
+    if (bg_stream) { bg_stream->Release(); bg_stream = nullptr; }
+}
 
 // Load RCDATA resource image into bg_image/bg_stream. Frees any prior image first.
-// Returns true on success; bg_image is non-null after a successful call.
 bool FrameBox::load_bg_image(int id) {
     IStream* stm = resource_to_stream(id);
     if (!stm) return false;
     gdip_addref();
     Gdiplus::Image* img = Gdiplus::Image::FromStream(stm);
     if (!img || img->GetLastStatus() != Gdiplus::Ok) {
-        delete img;
-        stm->Release();
-        gdip_release();
+        delete img; stm->Release(); gdip_release();
         return false;
     }
-    // Replace any previously loaded image.
-    if (bg_image)  { delete bg_image;  gdip_release(); }
-    if (bg_stream) { bg_stream->Release(); }
+    clear_bg_image();
     bg_image  = img;
     bg_stream = stm;   // kept alive; GDI+ reads it lazily for JPEG/PNG
-    if (bg_cache) { ::DeleteObject(bg_cache); bg_cache = nullptr; bg_cache_w = bg_cache_h = 0; }  // stale
+    return true;
+}
+
+// Load image from a UTF-8 file path into bg_image/bg_stream.
+// Relative paths are resolved relative to the exe directory (not CWD).
+// Reads the entire file into memory so the file is not locked after return.
+bool FrameBox::load_bg_file(const char* file) {
+    if (!file || !*file) return false;
+    int wlen = ::MultiByteToWideChar(CP_UTF8, 0, file, -1, nullptr, 0);
+    if (wlen <= 0) return false;
+    std::vector<wchar_t> wrel(wlen);
+    ::MultiByteToWideChar(CP_UTF8, 0, file, -1, wrel.data(), wlen);
+
+    // If relative, prepend the exe directory.
+    std::vector<wchar_t> wpath;
+    if (::PathIsRelativeW(wrel.data())) {
+        wchar_t exedir[MAX_PATH];
+        ::GetModuleFileNameW(nullptr, exedir, MAX_PATH);
+        ::PathRemoveFileSpecW(exedir);
+        wchar_t abs[MAX_PATH];
+        ::PathCombineW(abs, exedir, wrel.data());
+        wpath.assign(abs, abs + wcslen(abs) + 1);
+    } else {
+        wpath = wrel;
+    }
+
+    HANDLE hf = ::CreateFileW(wpath.data(), GENERIC_READ, FILE_SHARE_READ,
+                              nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hf == INVALID_HANDLE_VALUE) return false;
+    DWORD sz = ::GetFileSize(hf, nullptr);
+    std::vector<BYTE> buf(sz);
+    DWORD read = 0;
+    BOOL ok = ::ReadFile(hf, buf.data(), sz, &read, nullptr);
+    ::CloseHandle(hf);
+    if (!ok || read != sz) return false;
+
+    IStream* stm = ::SHCreateMemStream(buf.data(), sz);
+    if (!stm) return false;
+    gdip_addref();
+    Gdiplus::Image* img = Gdiplus::Image::FromStream(stm);
+    if (!img || img->GetLastStatus() != Gdiplus::Ok) {
+        delete img; stm->Release(); gdip_release();
+        return false;
+    }
+    clear_bg_image();
+    bg_image  = img;
+    bg_stream = stm;
     return true;
 }
 
@@ -1373,8 +1420,7 @@ bool FrameBox::load_bg_image(int id) {
 // WM_ERASEBKGND calls BitBlt this cache instead of re-running the GDI+ resample.
 void FrameBox::rebuild_bg_cache(HDC ref, int w, int h) {
     if (bg_cache) { ::DeleteObject(bg_cache); bg_cache = nullptr; }
-    bg_cache_w = w;
-    bg_cache_h = h;
+    bg_cache_w = w; bg_cache_h = h;
     if (w <= 0 || h <= 0 || !bg_image) return;
     bg_cache = ::CreateCompatibleBitmap(ref, w, h);
     if (!bg_cache) return;
@@ -1389,18 +1435,28 @@ void FrameBox::rebuild_bg_cache(HDC ref, int w, int h) {
     ::DeleteDC(mem);
 }
 
-bool FrameBox::open_image(CWinApp* a, int x0, int y0, int id) {
-    if (!load_bg_image(id)) return false;
-    int w = (int)bg_image->GetWidth();
-    int h = (int)bg_image->GetHeight();
-    return open(a, x0, y0, x0 + w, y0 + h, nullptr, 0);
+void FrameBox::set_image(int id) {
+    load_bg_image(id);
+    bg_color_set = false;
+    if (::IsWindow(m_hWnd)) Invalidate();
 }
 
-bool FrameBox::open_image(CWnd* owner, int x0, int y0, int id) {
-    if (!load_bg_image(id)) return false;
-    int w = (int)bg_image->GetWidth();
-    int h = (int)bg_image->GetHeight();
-    return open(owner, x0, y0, x0 + w, y0 + h, nullptr, 0);
+void FrameBox::set_image(const char* file) {
+    load_bg_file(file);
+    bg_color_set = false;
+    if (::IsWindow(m_hWnd)) Invalidate();
+}
+
+void FrameBox::set_bg_color(COLORREF color) {
+    clear_bg_image();
+    bg_color = color; bg_color_set = true;
+    if (::IsWindow(m_hWnd)) Invalidate();
+}
+
+void FrameBox::set_bg_color() {
+    clear_bg_image();
+    bg_color_set = false;
+    if (::IsWindow(m_hWnd)) Invalidate();
 }
 
 // ---- frameless mode (custom caption buttons) -------------------------------
@@ -1722,6 +1778,27 @@ LRESULT FrameBox::WindowProc(UINT msg, WPARAM wParam, LPARAM lParam) {
         return reinterpret_cast<LRESULT>(::GetStockObject(NULL_BRUSH));
     }
 
+#if defined(_DEBUG)
+    // Middle-button double-click: resize window to bg_image natural size (96 DPI logical),
+    // leaving Layout Edit mode active so the user can commit with Enter.
+    if (msg == WM_MBUTTONDBLCLK && bg_image) {
+        int cw = ::MulDiv((int)bg_image->GetWidth(),  eff_dpi(), 96);
+        int ch = ::MulDiv((int)bg_image->GetHeight(), eff_dpi(), 96);
+        int ww = cw, wh = ch;
+        if (fless_opt < 0) {   // normal window: convert client size to window size
+            RECT adj = { 0, 0, cw, ch };
+            DWORD style   = (DWORD)::GetWindowLongPtrW(m_hWnd, GWL_STYLE);
+            DWORD exstyle = (DWORD)::GetWindowLongPtrW(m_hWnd, GWL_EXSTYLE);
+            ::AdjustWindowRectEx(&adj, style, FALSE, exstyle);
+            ww = adj.right - adj.left;
+            wh = adj.bottom - adj.top;
+        }
+        ::SetWindowPos(m_hWnd, nullptr, 0, 0, ww, wh,
+                       SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        return 0;
+    }
+#endif
+
     // Paint background: cached bg image (fast BitBlt) or the dialog face color.
     if (msg == WM_ERASEBKGND) {
         HDC dst = reinterpret_cast<HDC>(wParam);
@@ -1738,6 +1815,10 @@ LRESULT FrameBox::WindowProc(UINT msg, WPARAM wParam, LPARAM lParam) {
                 ::SelectObject(mem, old);
                 ::DeleteDC(mem);
             }
+        } else if (bg_color_set) {
+            HBRUSH br = ::CreateSolidBrush(bg_color);
+            ::FillRect(dst, &rc, br);
+            ::DeleteObject(br);
         } else {
             ::FillRect(dst, &rc, ::GetSysColorBrush(COLOR_BTNFACE));
         }
@@ -1756,6 +1837,23 @@ LRESULT FrameBox::WindowProc(UINT msg, WPARAM wParam, LPARAM lParam) {
                                      : HTCAPTION; // empty client: OS drag-move
             // else fall through to default NC hit testing (edges/corners)
         }
+#if defined(_DEBUG)
+        else if (msg == WM_NCMBUTTONDOWN) {
+            // HTCAPTION causes WM_MBUTTONDOWN to arrive as WM_NCMBUTTONDOWN (screen coords);
+            // convert to client coords and re-post as WM_MBUTTONDOWN so Parasite toggle_edit fires.
+            POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+            ::ScreenToClient(m_hWnd, &pt);
+            ::SendMessageW(m_hWnd, WM_MBUTTONDOWN, wParam, MAKELPARAM(pt.x, pt.y));
+            return 0;
+        }
+        else if (msg == WM_NCMBUTTONDBLCLK) {
+            // Forward as WM_MBUTTONDBLCLK so the image-resize handler in WindowProc fires.
+            POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+            ::ScreenToClient(m_hWnd, &pt);
+            ::SendMessageW(m_hWnd, WM_MBUTTONDBLCLK, wParam, MAKELPARAM(pt.x, pt.y));
+            return 0;
+        }
+#endif
         else if (msg == WM_PAINT) {
             PAINTSTRUCT ps;
             HDC hdc = ::BeginPaint(m_hWnd, &ps);

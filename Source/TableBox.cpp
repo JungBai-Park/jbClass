@@ -67,7 +67,7 @@ static const int      SBAR_OP_IDLE     = 130;  // max thumb/button opacity when 
 static const int      SBAR_OP_HOVER    = 215;  // brighter when hovering / dragging
 static const int      SBAR_GUTTER_OP   = 70;   // gutter strip opacity (scaled by the fade alpha)
 
-// Stage 4 column/row resize constants (96 DPI logical px).
+// Column/row resize constants (96 DPI logical px).
 static const int      RESIZE_ZONE_HALF = 4;    // border hit-zone half-width (FrameBox's 8px convention, centered on the line)
 static const int      MIN_CELL_SIZE    = 10;   // minimum column width / row height while dragging or auto-fitting
 static const int      AUTOFIT_PAD      = 8;    // padding added to the measured text extent
@@ -262,10 +262,8 @@ END_MESSAGE_MAP()
 
 TableBox::TableBox()
 {
-    col_widths.assign(10000, 75);
-    row_heights.assign(10000, 20);
-    cols_uniform = true;
-    rows_uniform = true;
+    col_uniform_w = 75;  col_count = 5;
+    row_uniform_h = 20;  row_count = 20;
 
     resize_col = -1;
     resize_row = -1;
@@ -346,10 +344,10 @@ void TableBox::open(CWnd* parent, int x0, int y0, int rows, int cols)
 
     // Initial visible viewport: rows/cols cells, clamped to the configured grid size. Summed
     // per-cell (not a scaled total) so the window matches exactly what will be rendered.
-    int vis_rows = rows < (int)row_heights.size() ? rows : (int)row_heights.size();
-    int vis_cols = cols < (int)col_widths.size()  ? cols : (int)col_widths.size();
-    int pw = 0; for (int c = 0; c < vis_cols; ++c) pw += to_px(col_widths[c]);
-    int ph = 0; for (int r = 0; r < vis_rows; ++r) ph += to_px(row_heights[r]);
+    int vis_rows = rows < row_count ? rows : row_count;
+    int vis_cols = cols < col_count ? cols : col_count;
+    int pw = 0; for (int c = 0; c < vis_cols; ++c) pw += to_px((c < (int)col_widths.size() ? col_widths[c] : col_uniform_w));
+    int ph = 0; for (int r = 0; r < vis_rows; ++r) ph += to_px((r < (int)row_heights.size() ? row_heights[r] : row_uniform_h));
     CRect rc(x0, y0, x0 + pw, y0 + ph);
 
     AfxHookWindowCreate(this);
@@ -383,32 +381,38 @@ void TableBox::build_font()
 
 void TableBox::set_cols(int width, int limit)
 {
-    col_widths.assign(limit, width);
-    cols_uniform = true;
+    col_widths.clear();
+    col_uniform_w = width;  col_count = limit;
     clamp_cursor();
     if (::IsWindow(m_hWnd)) { clamp_scroll(); Invalidate(); }
 }
 
-void TableBox::set_cols(const std::vector<int>& widths)
+void TableBox::set_cols(std::initializer_list<int> pattern, int count)
 {
-    col_widths = widths;
-    cols_uniform = false;
+    col_widths.clear();
+    col_widths.reserve(pattern.size() * count);
+    for (int i = 0; i < count; ++i)
+        for (int w : pattern) col_widths.push_back(w);
+    col_count = (int)col_widths.size();
     clamp_cursor();
     if (::IsWindow(m_hWnd)) { clamp_scroll(); Invalidate(); }
 }
 
 void TableBox::set_rows(int height, int limit)
 {
-    row_heights.assign(limit, height);
-    rows_uniform = true;
+    row_heights.clear();
+    row_uniform_h = height;  row_count = limit;
     clamp_cursor();
     if (::IsWindow(m_hWnd)) { clamp_scroll(); Invalidate(); }
 }
 
-void TableBox::set_rows(const std::vector<int>& heights)
+void TableBox::set_rows(std::initializer_list<int> pattern, int count)
 {
-    row_heights = heights;
-    rows_uniform = false;
+    row_heights.clear();
+    row_heights.reserve(pattern.size() * count);
+    for (int i = 0; i < count; ++i)
+        for (int h : pattern) row_heights.push_back(h);
+    row_count = (int)row_heights.size();
     clamp_cursor();
     if (::IsWindow(m_hWnd)) { clamp_scroll(); Invalidate(); }
 }
@@ -480,26 +484,26 @@ int TableBox::to_px(int logical96) const
 int TableBox::corner_w() const
 {
     int w = 0;
-    int n = fixed_cols < (int)col_widths.size() ? fixed_cols : (int)col_widths.size();
-    for (int i = 0; i < n; ++i) w += to_px(col_widths[i]);
+    int n = fixed_cols < col_count ? fixed_cols : col_count;
+    for (int i = 0; i < n; ++i) w += to_px((i < (int)col_widths.size() ? col_widths[i] : col_uniform_w));
     return w;
 }
 
 int TableBox::corner_h() const
 {
     int h = 0;
-    int n = fixed_rows < (int)row_heights.size() ? fixed_rows : (int)row_heights.size();
-    for (int i = 0; i < n; ++i) h += to_px(row_heights[i]);
+    int n = fixed_rows < row_count ? fixed_rows : row_count;
+    for (int i = 0; i < n; ++i) h += to_px((i < (int)row_heights.size() ? row_heights[i] : row_uniform_h));
     return h;
 }
 
 int TableBox::last_visible_row(int first, int avail_px) const
 {
-    int total = (int)row_heights.size();
+    int total = row_count;
     if (first >= total) return first;
     int acc = 0, idx = first;
     while (idx < total) {
-        acc += to_px(row_heights[idx]);
+        acc += to_px((idx < (int)row_heights.size() ? row_heights[idx] : row_uniform_h));
         idx++;
         if (acc >= avail_px) break;
     }
@@ -508,11 +512,11 @@ int TableBox::last_visible_row(int first, int avail_px) const
 
 int TableBox::last_visible_col(int first, int avail_px) const
 {
-    int total = (int)col_widths.size();
+    int total = col_count;
     if (first >= total) return first;
     int acc = 0, idx = first;
     while (idx < total) {
-        acc += to_px(col_widths[idx]);
+        acc += to_px((idx < (int)col_widths.size() ? col_widths[idx] : col_uniform_w));
         idx++;
         if (acc >= avail_px) break;
     }
@@ -524,11 +528,11 @@ int TableBox::last_visible_col(int first, int avail_px) const
 // content is smaller than avail_px (pinned to the top; leftover stays background-filled).
 int TableBox::max_scroll_row(int avail_px) const
 {
-    int total = (int)row_heights.size();
+    int total = row_count;
     if (total <= fixed_rows) return fixed_rows;
     int acc = 0, idx = total - 1;
     while (idx > fixed_rows) {
-        acc += to_px(row_heights[idx]);
+        acc += to_px((idx < (int)row_heights.size() ? row_heights[idx] : row_uniform_h));
         if (acc >= avail_px) break;
         idx--;
     }
@@ -537,11 +541,11 @@ int TableBox::max_scroll_row(int avail_px) const
 
 int TableBox::max_scroll_col(int avail_px) const
 {
-    int total = (int)col_widths.size();
+    int total = col_count;
     if (total <= fixed_cols) return fixed_cols;
     int acc = 0, idx = total - 1;
     while (idx > fixed_cols) {
-        acc += to_px(col_widths[idx]);
+        acc += to_px((idx < (int)col_widths.size() ? col_widths[idx] : col_uniform_w));
         if (acc >= avail_px) break;
         idx--;
     }
@@ -566,24 +570,24 @@ void TableBox::clamp_scroll()
     if (scroll_col > mc)         scroll_col = mc;
 }
 
-// ===== Selection / current-cell navigation (Stage 3) =====
+// ===== Selection / current-cell navigation =====
 
 int TableBox::last_row_index() const
 {
-    int total = (int)row_heights.size();
+    int total = row_count;
     return total > fixed_rows ? total - 1 : fixed_rows;
 }
 
 int TableBox::last_col_index() const
 {
-    int total = (int)col_widths.size();
+    int total = col_count;
     return total > fixed_cols ? total - 1 : fixed_cols;
 }
 
 bool TableBox::hit_test(CPoint pt, int& row, int& col) const
 {
-    int total_rows = (int)row_heights.size();
-    int total_cols = (int)col_widths.size();
+    int total_rows = row_count;
+    int total_cols = col_count;
     if (total_rows <= 0 || total_cols <= 0)
         return false;
 
@@ -602,7 +606,7 @@ bool TableBox::hit_test(CPoint pt, int& row, int& col) const
     else           { y = ch; r = scroll_row; row_limit = total_rows; }
     row = total_rows - 1;   // fallback: clamp into the grid if the loop runs past rendered rows
     for (; r < row_limit; ++r) {
-        int rh = to_px(row_heights[r]);
+        int rh = to_px((r < (int)row_heights.size() ? row_heights[r] : row_uniform_h));
         if (pt.y < y + rh) { row = r; break; }
         y += rh;
     }
@@ -613,7 +617,7 @@ bool TableBox::hit_test(CPoint pt, int& row, int& col) const
     else           { x = cw; c = scroll_col; col_limit = total_cols; }
     col = total_cols - 1;
     for (; c < col_limit; ++c) {
-        int cwid = to_px(col_widths[c]);
+        int cwid = to_px((c < (int)col_widths.size() ? col_widths[c] : col_uniform_w));
         if (pt.x < x + cwid) { col = c; break; }
         x += cwid;
     }
@@ -708,34 +712,34 @@ bool TableBox::cell_rect(int row, int col, CRect& rc) const
     int y0;
     if (row < fixed_rows) {
         y0 = 0;
-        for (int r = 0; r < row; ++r) y0 += to_px(row_heights[r]);
+        for (int r = 0; r < row; ++r) y0 += to_px((r < (int)row_heights.size() ? row_heights[r] : row_uniform_h));
     } else {
         if (row < scroll_row) return false;
         y0 = ch;
-        for (int r = scroll_row; r < row; ++r) y0 += to_px(row_heights[r]);
+        for (int r = scroll_row; r < row; ++r) y0 += to_px((r < (int)row_heights.size() ? row_heights[r] : row_uniform_h));
         if (y0 >= client.Height()) return false;
     }
 
     int x0;
     if (col < fixed_cols) {
         x0 = 0;
-        for (int c = 0; c < col; ++c) x0 += to_px(col_widths[c]);
+        for (int c = 0; c < col; ++c) x0 += to_px((c < (int)col_widths.size() ? col_widths[c] : col_uniform_w));
     } else {
         if (col < scroll_col) return false;
         x0 = cw;
-        for (int c = scroll_col; c < col; ++c) x0 += to_px(col_widths[c]);
+        for (int c = scroll_col; c < col; ++c) x0 += to_px((c < (int)col_widths.size() ? col_widths[c] : col_uniform_w));
         if (x0 >= client.Width()) return false;
     }
 
-    rc.SetRect(x0, y0, x0 + to_px(col_widths[col]), y0 + to_px(row_heights[row]));
+    rc.SetRect(x0, y0, x0 + to_px((col < (int)col_widths.size() ? col_widths[col] : col_uniform_w)), y0 + to_px((row < (int)row_heights.size() ? row_heights[row] : row_uniform_h)));
     return true;
 }
 
-// ===== Column/row border resize and auto-fit (Stage 4) =====
+// ===== Column/row border resize and auto-fit =====
 
 int TableBox::hit_col_border(CPoint pt) const
 {
-    if (cols_uniform)
+    if (col_widths.empty())
         return -1;
     int ch = corner_h();
     if (ch <= 0 || pt.y < 0 || pt.y >= ch)
@@ -744,20 +748,20 @@ int TableBox::hit_col_border(CPoint pt) const
     int half = to_px(RESIZE_ZONE_HALF);
     CRect rc;
     GetClientRect(&rc);
-    int total_cols = (int)col_widths.size();
+    int total_cols = col_count;
     int fc1 = fixed_cols < total_cols ? fixed_cols : total_cols;
     int cw = corner_w();
 
     int x = 0;
     for (int c = 0; c < fc1; ++c) {
-        x += to_px(col_widths[c]);
+        x += to_px((c < (int)col_widths.size() ? col_widths[c] : col_uniform_w));
         int d = pt.x - x; if (d < 0) d = -d;
         if (d <= half) return c;
     }
     int c1 = last_visible_col(scroll_col, rc.Width() - cw);
     x = cw;
     for (int c = scroll_col; c < c1; ++c) {
-        x += to_px(col_widths[c]);
+        x += to_px((c < (int)col_widths.size() ? col_widths[c] : col_uniform_w));
         int d = pt.x - x; if (d < 0) d = -d;
         if (d <= half) return c;
     }
@@ -766,7 +770,7 @@ int TableBox::hit_col_border(CPoint pt) const
 
 int TableBox::hit_row_border(CPoint pt) const
 {
-    if (rows_uniform)
+    if (row_heights.empty())
         return -1;
     int cw = corner_w();
     if (cw <= 0 || pt.x < 0 || pt.x >= cw)
@@ -775,20 +779,20 @@ int TableBox::hit_row_border(CPoint pt) const
     int half = to_px(RESIZE_ZONE_HALF);
     CRect rc;
     GetClientRect(&rc);
-    int total_rows = (int)row_heights.size();
+    int total_rows = row_count;
     int fr1 = fixed_rows < total_rows ? fixed_rows : total_rows;
     int ch = corner_h();
 
     int y = 0;
     for (int r = 0; r < fr1; ++r) {
-        y += to_px(row_heights[r]);
+        y += to_px((r < (int)row_heights.size() ? row_heights[r] : row_uniform_h));
         int d = pt.y - y; if (d < 0) d = -d;
         if (d <= half) return r;
     }
     int r1 = last_visible_row(scroll_row, rc.Height() - ch);
     y = ch;
     for (int r = scroll_row; r < r1; ++r) {
-        y += to_px(row_heights[r]);
+        y += to_px((r < (int)row_heights.size() ? row_heights[r] : row_uniform_h));
         int d = pt.y - y; if (d < 0) d = -d;
         if (d <= half) return r;
     }
@@ -815,13 +819,13 @@ void TableBox::row_selection_span(int hr, int& r0, int& r1) const
 // virtual grid cannot be scanned in full) and sets col_widths[idx] to the max text extent + padding.
 void TableBox::autofit_col(int idx)
 {
-    if (cols_uniform || idx < 0 || idx >= (int)col_widths.size())
+    if (col_widths.empty() || idx < 0 || idx >= col_count)
         return;
 
     CRect rc;
     GetClientRect(&rc);
     int ch = corner_h();
-    int total_rows = (int)row_heights.size();
+    int total_rows = row_count;
     int fr1 = fixed_rows < total_rows ? fixed_rows : total_rows;
     int r1 = last_visible_row(scroll_row, rc.Height() - ch);
 
@@ -871,13 +875,13 @@ void TableBox::autofit_col(int idx)
 // Same idea transposed: measures text height instead of width, over every visible column.
 void TableBox::autofit_row(int idx)
 {
-    if (rows_uniform || idx < 0 || idx >= (int)row_heights.size())
+    if (row_heights.empty() || idx < 0 || idx >= row_count)
         return;
 
     CRect rc;
     GetClientRect(&rc);
     int cw = corner_w();
-    int total_cols = (int)col_widths.size();
+    int total_cols = col_count;
     int fc1 = fixed_cols < total_cols ? fixed_cols : total_cols;
     int c1 = last_visible_col(scroll_col, rc.Width() - cw);
 
@@ -949,7 +953,7 @@ void TableBox::draw_focus_border(CDC& dc)
     dc.SelectObject(old_pen);
 }
 
-// ===== In-place cell editing (Stage 5) =====
+// ===== In-place cell editing =====
 
 // Owner-draw dropdown for a combo cell. A genuine WS_POPUP (not a TableBox child) positioned in
 // SCREEN coordinates directly below the focused cell, so it can extend past TableBox's own
@@ -1349,10 +1353,10 @@ void TableBox::draw_block(CDC& dc, int r0, int r1, int c0, int c1, int x0, int y
 {
     int y = y0;
     for (int r = r0; r < r1; ++r) {
-        int rh = to_px(row_heights[r]);
+        int rh = to_px((r < (int)row_heights.size() ? row_heights[r] : row_uniform_h));
         int x = x0;
         for (int c = c0; c < c1; ++c) {
-            int cw = to_px(col_widths[c]);
+            int cw = to_px((c < (int)col_widths.size() ? col_widths[c] : col_uniform_w));
             dc.SaveDC();
             dc.IntersectClipRect(x, y, x + cw, y + rh);
             draw_cell(dc, r, c, x, y, x + cw, y + rh);
@@ -1365,8 +1369,8 @@ void TableBox::draw_block(CDC& dc, int r0, int r1, int c0, int c1, int x0, int y
 
 void TableBox::draw_grid_lines(CDC& dc, int r0, int r1, int c0, int c1, int x0, int y0)
 {
-    int total_w = 0; for (int c = c0; c < c1; ++c) total_w += to_px(col_widths[c]);
-    int total_h = 0; for (int r = r0; r < r1; ++r) total_h += to_px(row_heights[r]);
+    int total_w = 0; for (int c = c0; c < c1; ++c) total_w += to_px((c < (int)col_widths.size() ? col_widths[c] : col_uniform_w));
+    int total_h = 0; for (int r = r0; r < r1; ++r) total_h += to_px((r < (int)row_heights.size() ? row_heights[r] : row_uniform_h));
     if (total_w <= 0 || total_h <= 0)
         return;
 
@@ -1377,13 +1381,13 @@ void TableBox::draw_grid_lines(CDC& dc, int r0, int r1, int c0, int c1, int x0, 
     for (int c = c0; c <= c1; ++c) {
         dc.MoveTo(x, y0);
         dc.LineTo(x, y0 + total_h);
-        if (c < c1) x += to_px(col_widths[c]);
+        if (c < c1) x += to_px((c < (int)col_widths.size() ? col_widths[c] : col_uniform_w));
     }
     int y = y0;
     for (int r = r0; r <= r1; ++r) {
         dc.MoveTo(x0, y);
         dc.LineTo(x0 + total_w, y);
-        if (r < r1) y += to_px(row_heights[r]);
+        if (r < r1) y += to_px((r < (int)row_heights.size() ? row_heights[r] : row_uniform_h));
     }
 
     dc.SelectObject(old);
@@ -1507,8 +1511,8 @@ void TableBox::OnPaint()
     // no grid lines, satisfying the "leftover area dark gray" layout rule automatically.
     dc.FillSolidRect(&rc, RGB(64, 64, 64));
 
-    int total_rows = (int)row_heights.size();
-    int total_cols = (int)col_widths.size();
+    int total_rows = row_count;
+    int total_cols = col_count;
     int fr1 = fixed_rows < total_rows ? fixed_rows : total_rows;
     int fc1 = fixed_cols < total_cols ? fixed_cols : total_cols;
     int cw  = corner_w();
@@ -1556,7 +1560,7 @@ void TableBox::OnPaint()
 
 bool TableBox::vsbar_geometry(CRect& gutter, CRect& track, CRect& thumb, CRect& btn_dec, CRect& btn_inc) const
 {
-    int total = (int)row_heights.size();
+    int total = row_count;
     if (total <= fixed_rows)
         return false;
 
@@ -1601,7 +1605,7 @@ bool TableBox::vsbar_geometry(CRect& gutter, CRect& track, CRect& thumb, CRect& 
 
 bool TableBox::hsbar_geometry(CRect& gutter, CRect& track, CRect& thumb, CRect& btn_dec, CRect& btn_inc) const
 {
-    int total = (int)col_widths.size();
+    int total = col_count;
     if (total <= fixed_cols)
         return false;
 
@@ -1793,7 +1797,7 @@ void TableBox::OnLButtonDown(UINT flags, CPoint pt)
     if (hc >= 0) {
         resize_col = hc;
         resize_start_pt = pt.x;
-        resize_start_sz = col_widths[hc];
+        resize_start_sz = (hc < (int)col_widths.size() ? col_widths[hc] : col_uniform_w);
         col_selection_span(hc, resize_group_c0, resize_group_c1);
         SetCapture();
         return;
@@ -1802,7 +1806,7 @@ void TableBox::OnLButtonDown(UINT flags, CPoint pt)
     if (hr >= 0) {
         resize_row = hr;
         resize_start_pt = pt.y;
-        resize_start_sz = row_heights[hr];
+        resize_start_sz = (hr < (int)row_heights.size() ? row_heights[hr] : row_uniform_h);
         row_selection_span(hr, resize_group_r0, resize_group_r1);
         SetCapture();
         return;
