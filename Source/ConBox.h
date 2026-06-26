@@ -651,10 +651,11 @@ private:
     // === Overlay scrollbar (auto-hide/fade, wt-style) ===
     // No native WS_VSCROLL (it would shrink the client and reflow the grid on first appearance). The bar
     // is drawn into the back buffer over the right edge and never reserves client space, so cols stays
-    // fixed. It is shown on user scroll (wheel/PageUp-Down/Ctrl+Home-End) or gutter hover, then fades.
+    // fixed. While scrollable it is always drawn as a slim bar; user scroll (wheel/PageUp-Down/
+    // Ctrl+Home-End), gutter hover, or thumb drag EXPANDS it to the full bar until sbar_hold_until.
     // Geometry is derived on demand from view_top/scrollback/rows (no stored metrics).
-    int sbar_alpha;          // current opacity 0..255; 0 = hidden (not drawn)
-    DWORD sbar_hold_until;   // GetTickCount() deadline; fade starts once past it (unless hover/drag)
+    int sbar_fade;           // expanded-form opacity 0..255; 0 = only the slim bar shows, 255 = full bar
+    DWORD sbar_hold_until;   // GetTickCount() deadline; the expanded form fades out once past it (unless hover/drag)
     bool sbar_hover;         // mouse is over the gutter (held visible while true)
     bool sbar_dragging;      // dragging the thumb (held visible; SetCapture active)
     int sbar_drag_off;       // px from thumb top to the grab point (so the thumb does not jump)

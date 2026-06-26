@@ -33,22 +33,24 @@ static const UINT PUMP_INTERVAL_MS = 16;   // output poll interval; 16~30 keeps 
 // Overlay scrollbar fade timer. 4 to stay distinct from CURSOR(1)/BLINK(2)/PUMP(3).
 static const UINT_PTR SBAR_TIMER = 4;
 
-// Overlay scrollbar geometry/fade tuning (px / ms / alpha). Tuned to read like wt.exe: a slim, rounded,
-// translucent thumb hugging (but slightly inset from) the right edge, brighter on hover.
-static const int   SBAR_W          = 14;   // gutter (hit-test) width at the right edge
-static const int   SBAR_THUMB_W    = 6;    // visible thumb width (right-aligned inside the gutter)
-static const int   SBAR_INSET      = 3;    // gap from the client's right edge to the thumb
+// Overlay scrollbar geometry/tuning (px / ms / alpha). Tuned to read like wt.exe: while scrollable it
+// is ALWAYS visible as a slim translucent bar hugging the right edge (no fade-out); on hover/drag or
+// briefly after a scroll it EXPANDS to the full gutter + rounded thumb + arrow buttons, then snaps
+// back to the slim bar. Hit-testing always uses the full SBAR_W gutter width, even in the slim state.
+static const int   SBAR_W          = 13;   // gutter (hit-test) width at the right edge
+static const int   SBAR_THUMB_W    = 7;    // visible thumb width (centered in the gutter), expanded state
 static const int   SBAR_RADIUS     = 3;    // thumb corner radius (rounded ends)
 static const int   SBAR_BTN_H      = SBAR_W;  // arrow button height (square; track runs between them)
 static const int   SBAR_MIN_THUMB  = 24;   // minimum thumb height so it stays grabbable
-static const DWORD SBAR_HOLD_MS    = 700;  // stay fully visible this long after the last activity
-static const UINT  SBAR_FADE_TICK_MS = 33; // fade animation tick (~30 fps)
-static const int   SBAR_FADE_STEP  = 24;   // alpha removed per tick once fading (gentle ~0.35s fade)
-static const int   SBAR_OP_IDLE    = 130;  // max thumb opacity when shown (translucent, wt-like)
+static const int   SBAR_SLIM_W     = 2;    // slim (idle) bar width
+static const int   SBAR_SLIM_GAP   = 1;    // gap from the client's right edge to the slim bar
+static const int   SBAR_SLIM_OP    = 180;  // slim (idle) bar opacity
+static const DWORD SBAR_HOLD_MS    = 700;  // stay fully expanded this long after the last activity
+static const UINT  SBAR_TICK_MS    = 33;   // fade animation tick (~30 fps)
+static const int   SBAR_FADE_STEP  = 48;   // opacity change per tick (fade in/out); higher = faster
+static const int   SBAR_OP_IDLE    = 130;  // thumb/slim-bar opacity when not hovered (translucent, wt-like)
 static const int   SBAR_OP_HOVER   = 215;  // brighter when hovering / dragging
-static const int   SBAR_GUTTER_OP  = 70;   // gutter strip opacity (scaled by the fade alpha), full
-                                            // SBAR_W width, always drawn while shown -- TableBox.cpp
-                                            // uses the same values; keep both in sync (see its comment).
+static const int   SBAR_GUTTER_OP  = 70;   // gutter strip opacity (expanded state only), full SBAR_W width
 static const COLORREF SBAR_THUMB_COLOR = RGB(200, 200, 200);   // light gray, blended over content
 
 // VT default colors: where SGR 0 (reset) and 39/49 return to (also the Requirements default). Tuned to
@@ -487,8 +489,8 @@ ConBox::ConBox()
     };
     memcpy(paper_ansi_colors, paper16, sizeof(paper16));
 
-    // Overlay scrollbar starts hidden (alpha 0); shown on user scroll / hover.
-    sbar_alpha = 0;
+    // Overlay scrollbar: slim while scrollable, expanded (then fades back to slim) within the hold window.
+    sbar_fade = 0;
     sbar_hold_until = 0;
     sbar_hover = false;
     sbar_dragging = false;
@@ -1313,25 +1315,30 @@ void ConBox::OnTimer(UINT_PTR id)
         return;
     }
     if (id == SBAR_TIMER) {
-        // Overlay scrollbar fade. Held fully visible while hovering/dragging or within the hold window;
-        // otherwise alpha decays each tick until 0, then the timer stops.
-        if (sbar_dragging || sbar_hover) {
-            sbar_hold_until = ::GetTickCount() + SBAR_HOLD_MS;   // keep it up
-            return;
+        // Overlay scrollbar fade in/out. The expanded form ramps toward a target opacity: 255 while
+        // hovering/dragging or within the hold window (fade in / stay), 0 once the hold expires (fade
+        // out to just the slim bar). The timer stops only when fully collapsed (sbar_fade == 0).
+        if (sbar_dragging || sbar_hover)
+            sbar_hold_until = ::GetTickCount() + SBAR_HOLD_MS;
+        int target = (int)(::GetTickCount() - sbar_hold_until) < 0 ? 255 : 0;
+        int prev = sbar_fade;
+        if (sbar_fade < target) {
+            sbar_fade += SBAR_FADE_STEP;
+            if (sbar_fade > 255) sbar_fade = 255;
+        } else if (sbar_fade > target) {
+            sbar_fade -= SBAR_FADE_STEP;
+            if (sbar_fade < 0) sbar_fade = 0;
         }
-        if ((int)(::GetTickCount() - sbar_hold_until) < 0)
-            return;   // still inside the hold window: stay opaque
-        sbar_alpha -= SBAR_FADE_STEP;
-        if (sbar_alpha <= 0) {
-            sbar_alpha = 0;
+        if (sbar_fade == 0 && target == 0)
             KillTimer(SBAR_TIMER);
-        }
-        CRect track, thumb;
-        if (sbar_geometry(track, thumb)) {
-            CRect full;
-            GetClientRect(&full);
-            CRect gutter(full.right - to_px(SBAR_W), full.top, full.right, full.bottom);
-            InvalidateRect(&gutter, FALSE);
+        if (sbar_fade != prev) {
+            CRect track, thumb;
+            if (sbar_geometry(track, thumb)) {
+                CRect full;
+                GetClientRect(&full);
+                CRect gutter(full.right - to_px(SBAR_W), full.top, full.right, full.bottom);
+                InvalidateRect(&gutter, FALSE);   // redraw at the new fade level
+            }
         }
         return;
     }
@@ -2311,14 +2318,15 @@ bool ConBox::sbar_geometry(CRect& track, CRect& thumb) const
     if (thumb_y < track.top)               thumb_y = track.top;
     if (thumb_y > track.bottom - thumb_h)  thumb_y = track.bottom - thumb_h;
 
-    // Thumb is a slim bar near the edge, inset by SBAR_INSET (does not touch the very right edge).
+    // Thumb is a slim bar centered across the gutter width.
     int thumb_w = to_px(SBAR_THUMB_W);
-    int tx = track.right - to_px(SBAR_INSET) - thumb_w;
+    int tx = track.left + (track.Width() - thumb_w) / 2;
     thumb.SetRect(tx, thumb_y, tx + thumb_w, thumb_y + thumb_h);
     return true;
 }
 
-// Make the overlay fully opaque and (re)start the fade timer. Called on user scroll and gutter hover.
+// Arm the expanded overlay: (re)start the hold window and the fade timer, which ramps sbar_fade up
+// to 255 (fade in). Called on user scroll and gutter hover. The slim bar is what shows at rest.
 void ConBox::sbar_show()
 {
     if (!::IsWindow(m_hWnd))
@@ -2326,9 +2334,8 @@ void ConBox::sbar_show()
     CRect track, thumb;
     if (!sbar_geometry(track, thumb))
         return;   // nothing to scroll -> nothing to show
-    sbar_alpha = 255;
     sbar_hold_until = ::GetTickCount() + SBAR_HOLD_MS;
-    SetTimer(SBAR_TIMER, SBAR_FADE_TICK_MS, NULL);
+    SetTimer(SBAR_TIMER, SBAR_TICK_MS, NULL);
     CRect full;
     GetClientRect(&full);
     CRect gutter(full.right - to_px(SBAR_W), full.top, full.right, full.bottom);
@@ -2410,14 +2417,17 @@ static void DrawRoundedThumb(CDC& dc, const CRect& rc, COLORREF color, int baseA
     });
 }
 
-// Antialiased filled triangle (arrow button), tip up or down, padded 3px from rc's edges.
+// Antialiased filled triangle (arrow button), tip up or down. Two separate pads decouple base
+// width from height: bpad insets the base corners (cross axis), tpad insets the tip and base line
+// (pointing axis). For a 13x13 button this yields base 13-2*bpad = 9 and height 13-2*tpad = 7.
 static void DrawTriangle(CDC& dc, const CRect& rc, COLORREF color, int baseAlpha, BYTE fadeAlpha, bool up)
 {
     int w = rc.Width(), h = rc.Height();
-    const double pad = 3.0;
-    double v0x = w / 2.0,     v0y = up ? pad        : h - 1 - pad;   // tip
-    double v1x = pad,         v1y = up ? h - 1 - pad : pad;          // base left
-    double v2x = w - 1 - pad, v2y = v1y;                             // base right
+    const double bpad = 2.0;   // base-corner inset (cross axis) -> base width
+    const double tpad = 3.0;   // tip/base-line inset (pointing axis) -> height
+    double v0x = w / 2.0,    v0y = up ? tpad      : h - tpad;   // tip
+    double v1x = bpad,       v1y = up ? h - tpad   : tpad;       // base left
+    double v2x = w - bpad,   v2y = v1y;                          // base right
     DrawAA(dc, rc, color, baseAlpha, fadeAlpha, [=](double x, double y) {
         double d0 = (v1x-v0x)*(y-v0y) - (v1y-v0y)*(x-v0x);
         double d1 = (v2x-v1x)*(y-v1y) - (v2y-v1y)*(x-v1x);
@@ -2449,23 +2459,21 @@ static void FillTranslucent(CDC& dc, const CRect& rc, COLORREF color, BYTE alpha
 }
 
 // Composite the overlay scrollbar into the back buffer (called last in OnPaint, on top of glyphs/cursor).
-// A full-width gutter fill (always drawn while shown, not just while active) makes the bar read as a
-// SBAR_W-wide strip rather than just the thin thumb; the rounded thumb (brighter on hover/drag) and the
-// two arrow buttons (scroll 1 line on click) are drawn on top, all antialiased. All fade via sbar_alpha.
+// The bar morphs with sbar_fade rather than cross-fading two shapes (sharing the thumb vertical span):
+//  - The thumb is always drawn and interpolates width / x-position / opacity between the slim idle
+//    bar (sbar_fade 0: SBAR_SLIM_W wide, hugging the right edge, SBAR_SLIM_OP) and the full thumb
+//    (sbar_fade 255: SBAR_THUMB_W wide, centered, opcap). It thins+slides out and thickens+slides in.
+//  - The gutter strip and the two arrow buttons fade in/out with sbar_fade (drawn only when > 0).
+//    sbar_fade rises on appear (hover/drag/scroll) and falls once the hold expires (see OnTimer).
 void ConBox::draw_overlay_scrollbar(CDC& dc)
 {
-    if (sbar_alpha <= 0)
-        return;
     CRect track, thumb;
     if (!sbar_geometry(track, thumb))
-        return;
-
-    bool active = (sbar_hover || sbar_dragging);
+        return;   // not scrollable -> nothing
 
     // Pick thumb/gutter shades that contrast with the current background so the bar stays visible on
-    // both dark and light backgrounds (the fixed dark grays were invisible on white). Perceived
-    // luminance of default_bg decides: bright bg -> dark thumb + light gutter, dark bg -> the original
-    // light thumb + dark gutter.
+    // both dark and light backgrounds. Perceived luminance of default_bg decides: bright bg -> dark
+    // thumb + light gutter, dark bg -> light thumb + dark gutter.
     int bg_lum = (GetRValue(default_bg) * 299 + GetGValue(default_bg) * 587 + GetBValue(default_bg) * 114) / 1000;
     bool light_bg = (bg_lum > 128);
     COLORREF thumb_color  = light_bg ? RGB(96, 96, 96)    : SBAR_THUMB_COLOR;
@@ -2473,19 +2481,36 @@ void ConBox::draw_overlay_scrollbar(CDC& dc)
 
     CRect rc_full;
     GetClientRect(&rc_full);
-    CRect gutter(rc_full.right - to_px(SBAR_W), rc_full.top, rc_full.right, rc_full.bottom);
-    FillTranslucent(dc, gutter, gutter_color, (BYTE)(SBAR_GUTTER_OP * sbar_alpha / 255));
 
-    // The thumb: translucent (idle) or brighter (hover/drag), rounded, fading by sbar_alpha.
-    int opcap = active ? SBAR_OP_HOVER : SBAR_OP_IDLE;
-    DrawRoundedThumb(dc, thumb, thumb_color, opcap, to_px(SBAR_RADIUS), (BYTE)sbar_alpha);
+    BYTE fade = (BYTE)sbar_fade;
+    int opcap = (sbar_hover || sbar_dragging) ? SBAR_OP_HOVER : SBAR_OP_IDLE;
 
-    // Arrow buttons at gutter top/bottom (same opacity as thumb).
-    int sw = to_px(SBAR_W), bh = to_px(SBAR_BTN_H);
-    CRect btn_up(rc_full.right - sw, rc_full.top, rc_full.right, rc_full.top + bh);
-    CRect btn_dn(rc_full.right - sw, rc_full.bottom - bh, rc_full.right, rc_full.bottom);
-    DrawTriangle(dc, btn_up, thumb_color, opcap, (BYTE)sbar_alpha, true);
-    DrawTriangle(dc, btn_dn, thumb_color, opcap, (BYTE)sbar_alpha, false);
+    // Gutter strip fades in/out with sbar_fade (skipped when fully collapsed).
+    if (sbar_fade > 0) {
+        CRect gutter(rc_full.right - to_px(SBAR_W), rc_full.top, rc_full.right, rc_full.bottom);
+        FillTranslucent(dc, gutter, gutter_color, (BYTE)(SBAR_GUTTER_OP * sbar_fade / 255));
+    }
+
+    // The bar does not fade; it MORPHS between the slim idle bar (sbar_fade 0: SBAR_SLIM_W wide,
+    // hugging the right edge, SBAR_SLIM_OP opacity) and the full thumb (sbar_fade 255: SBAR_THUMB_W
+    // wide, centered in the gutter, opcap opacity). Width, x-position and opacity interpolate linearly
+    // with sbar_fade, so it visibly thins/thickens and slides instead of cross-fading two shapes.
+    int slim_right = rc_full.right - to_px(SBAR_SLIM_GAP);
+    int slim_left  = slim_right - to_px(SBAR_SLIM_W);
+    int bl = slim_left  + (thumb.left  - slim_left ) * sbar_fade / 255;
+    int br = slim_right + (thumb.right - slim_right) * sbar_fade / 255;
+    int op = SBAR_SLIM_OP + (opcap - SBAR_SLIM_OP) * sbar_fade / 255;
+    CRect bar(bl, thumb.top, br, thumb.bottom);
+    DrawRoundedThumb(dc, bar, thumb_color, op, to_px(SBAR_RADIUS), 255);
+
+    // Arrow buttons fade in/out with the gutter.
+    if (sbar_fade > 0) {
+        int sw = to_px(SBAR_W), bh = to_px(SBAR_BTN_H);
+        CRect btn_up(rc_full.right - sw, rc_full.top, rc_full.right, rc_full.top + bh);
+        CRect btn_dn(rc_full.right - sw, rc_full.bottom - bh, rc_full.right, rc_full.bottom);
+        DrawTriangle(dc, btn_up, thumb_color, opcap, fade, true);
+        DrawTriangle(dc, btn_dn, thumb_color, opcap, fade, false);
+    }
 }
 
 BOOL ConBox::OnMouseWheel(UINT flags, short zDelta, CPoint pt)
@@ -2843,13 +2868,13 @@ void ConBox::OnMouseMove(UINT flags, CPoint pt)
 
 void ConBox::OnMouseLeave()
 {
-    // Left the window: drop gutter hover so the overlay can fade. The fade timer is already running
-    // (started by sbar_show on hover); just refresh the hold window so it lingers briefly, then fades.
+    // Left the window: drop gutter hover so the overlay can collapse. Refresh the hold window so it
+    // lingers expanded briefly, then the timer collapses it to the slim bar.
     if (sbar_hover) {
         sbar_hover = false;
         sbar_hold_until = ::GetTickCount() + SBAR_HOLD_MS;
         if (::IsWindow(m_hWnd))
-            SetTimer(SBAR_TIMER, SBAR_FADE_TICK_MS, NULL);
+            SetTimer(SBAR_TIMER, SBAR_TICK_MS, NULL);
         CRect track, thumb;
         if (sbar_geometry(track, thumb)) {
             CRect full;
@@ -3631,7 +3656,7 @@ void ConBox::OnPaint()
         }
     }
 
-    // Overlay scrollbar on top of everything (only when alpha > 0; auto-hidden otherwise).
+    // Overlay scrollbar on top of everything (slim while scrollable, expanded within the hold window).
     draw_overlay_scrollbar(dc);
 
     // Blit the finished frame to the screen at once (no flicker). The bitmap stays a live member (freed

@@ -54,10 +54,9 @@ static LOGFONTW ParseFontOpts(const char* name, float size_pt, const char* optio
 
 // Overlay scrollbar visual constants (ConBox-style auto-fade, reimplemented in-module).
 static const UINT_PTR SBAR_TIMER       = 1;
-static const int      SBAR_W           = 14;   // gutter (hit-test) thickness
+static const int      SBAR_W           = 13;   // gutter (hit-test) thickness
 static const int      SBAR_BTN_H       = SBAR_W;  // arrow button square side (== gutter thickness)
-static const int      SBAR_THUMB_W     = 6;    // visible thumb thickness
-static const int      SBAR_INSET       = 3;    // gap from the client edge to the thumb
+static const int      SBAR_THUMB_W     = 7;    // visible thumb thickness (centered in the gutter)
 static const int      SBAR_MIN_THUMB   = 24;   // minimum thumb length so it stays grabbable
 static const int      SBAR_RADIUS      = 3;    // thumb corner radius (rounded ends)
 static const DWORD    SBAR_HOLD_MS     = 700;  // stay fully visible this long after last activity
@@ -162,17 +161,21 @@ static void DrawRoundedThumb(CDC& dc, const CRect& rc, COLORREF color, int baseA
 // Arrow button direction (which way the triangle points = which way that button scrolls).
 enum class SbarDir { UP, DOWN, LEFT, RIGHT };
 
-// Antialiased filled triangle (arrow button), tip pointing `dir`, padded 3px from rc's edges.
+// Antialiased filled triangle (arrow button), tip pointing `dir`. Two separate pads decouple the
+// base width from the height: bpad insets the base corners along the cross axis, tpad insets the
+// tip and base line along the pointing axis. For a 13x13 button this yields base 13-2*bpad = 9 and
+// height 13-2*tpad = 7.
 static void DrawTriangle(CDC& dc, const CRect& rc, COLORREF color, int baseAlpha, BYTE fadeAlpha, SbarDir dir)
 {
     int w = rc.Width(), h = rc.Height();
-    const double pad = 3.0;
+    const double bpad = 2.0;   // base-corner inset (cross axis) -> base width
+    const double tpad = 3.0;   // tip/base-line inset (pointing axis) -> height
     double v0x, v0y, v1x, v1y, v2x, v2y;   // v0 = tip, v1/v2 = base corners
     switch (dir) {
-    case SbarDir::UP:    v0x = w/2.0;     v0y = pad;       v1x = pad;       v1y = h-1-pad; v2x = w-1-pad;   v2y = h-1-pad; break;
-    case SbarDir::DOWN:  v0x = w/2.0;     v0y = h-1-pad;   v1x = pad;       v1y = pad;     v2x = w-1-pad;   v2y = pad;     break;
-    case SbarDir::LEFT:  v0x = pad;       v0y = h/2.0;     v1x = w-1-pad;   v1y = pad;     v2x = w-1-pad;   v2y = h-1-pad; break;
-    default:             v0x = w-1-pad;   v0y = h/2.0;     v1x = pad;       v1y = pad;     v2x = pad;       v2y = h-1-pad; break;
+    case SbarDir::UP:    v0x = w/2.0;     v0y = tpad;      v1x = bpad;      v1y = h-tpad;  v2x = w-bpad;    v2y = h-tpad;  break;
+    case SbarDir::DOWN:  v0x = w/2.0;     v0y = h-tpad;    v1x = bpad;      v1y = tpad;    v2x = w-bpad;    v2y = tpad;    break;
+    case SbarDir::LEFT:  v0x = tpad;      v0y = h/2.0;     v1x = w-tpad;    v1y = bpad;    v2x = w-tpad;    v2y = h-bpad;  break;
+    default:             v0x = w-tpad;    v0y = h/2.0;     v1x = tpad;      v1y = bpad;    v2x = tpad;      v2y = h-bpad;  break;
     }
     DrawAA(dc, rc, color, baseAlpha, fadeAlpha, [=](double x, double y) {
         double d0 = (v1x-v0x)*(y-v0y) - (v1y-v0y)*(x-v0x);
@@ -1166,12 +1169,14 @@ END_MESSAGE_MAP()
 
 void TableBox::edit_cell(int row, int col)
 {
-    if (edit_cb == nullptr || row < fixed_rows || col < fixed_cols)
+    if (row < fixed_rows || col < fixed_cols)
         return;
     if (edit_box != nullptr || combo_popup != nullptr)
         return;
 
-    const char* type = edit_cb(row, col, nullptr, edit_cb_context);
+    // cell_data mode without edit_cb: non-fixed cells are plain CEdit (-1).
+    const char* type = edit_cb ? edit_cb(row, col, nullptr, edit_cb_context)
+                               : (cell_data ? (const char*)(intptr_t)-1 : nullptr);
     std::vector<std::string> combo_items;
     if (ParseComboItems(type, combo_items))
         start_combo_edit(row, col);
@@ -1188,6 +1193,8 @@ void TableBox::start_text_edit(int row, int col, wchar_t initial_char)
     CRect rc;
     if (!cell_rect(row, col, rc))
         return;
+
+    anchor_row = row; anchor_col = col;   // collapse any range selection to the editing cell
     rc.left   += to_px(edit_adj_x0); rc.top    += to_px(edit_adj_y0);
     rc.right  -= to_px(edit_adj_x1); rc.bottom -= to_px(edit_adj_y1);
 
@@ -1272,12 +1279,15 @@ void TableBox::end_text_edit(bool commit, int move_dr, int move_dc)
         return;
     ending_edit = true;
 
-    if (commit && edit_cb) {
+    if (commit) {
         wchar_t wbuf[1024];
         ::GetWindowTextW(edit_box, wbuf, _countof(wbuf));
         char utf8[1024 * 3];
         ::WideCharToMultiByte(CP_UTF8, 0, wbuf, -1, utf8, sizeof(utf8), NULL, NULL);
-        edit_cb(edit_row, edit_col, utf8, edit_cb_context);
+        if (cell_data)
+            cell_data[(size_t)edit_row * col_count + edit_col] = utf8;
+        else if (edit_cb)
+            edit_cb(edit_row, edit_col, utf8, edit_cb_context);
     }
 
     HWND eh = edit_box;
@@ -1309,6 +1319,8 @@ void TableBox::start_combo_edit(int row, int col)
         return;
     int sel_idx = ComboIndex(cell_text(row, col), (int)items.size());
 
+    anchor_row = row; anchor_col = col;   // collapse any range selection to the editing cell
+
     // Compute window size so the CLIENT area is exactly cell_h * N pixels tall.
     // WS_BORDER subtracts its frame from the client area; AdjustWindowRectEx adds it back.
     int n = (int)(items.empty() ? 1 : items.size());
@@ -1333,10 +1345,13 @@ void TableBox::end_combo_edit(bool commit, int new_index)
         return;
     ending_edit = true;
 
-    if (commit && edit_cb) {
+    if (commit) {
         char idx_buf[16];
         sprintf_s(idx_buf, sizeof(idx_buf), "%d", new_index >= 0 ? new_index : 0);
-        edit_cb(edit_row, edit_col, idx_buf, edit_cb_context);
+        if (cell_data)
+            cell_data[(size_t)edit_row * col_count + edit_col] = idx_buf;
+        else if (edit_cb)
+            edit_cb(edit_row, edit_col, idx_buf, edit_cb_context);
     }
 
     combo_popup = nullptr;
@@ -1436,7 +1451,8 @@ const char* TableBox::cell_text(int row, int col) const
 }
 
 // Square icon flush with the cell's right edge, side length = cell height (clamped to the
-// cell's width on a very narrow column). DrawTriangle pads its own glyph 3px inside this rect.
+// cell's width on a very narrow column). The dropdown glyph U+25BC is drawn as a font character
+// via DrawTextW, centered in this rect (see draw_cell).
 CRect TableBox::combo_arrow_rect(const CRect& cell_rc) const
 {
     int side = cell_rc.Height();
@@ -1507,7 +1523,7 @@ void TableBox::draw_cell(CDC& dc, int row, int col, int x0, int y0, int x1, int 
     if (edit_cb != nullptr) {
         const char* combo_str = edit_cb(row, col, nullptr, edit_cb_context);
         if (ParseComboItems(combo_str, combo_items)) {
-            // Combo cell: display the currently selected item label, then draw "?? on top.
+            // Combo cell: display the currently selected item label, then draw the U+25BC glyph on top.
             int idx = ComboIndex(cell_text(row, col), (int)combo_items.size());
             CRect arrow_rc = combo_arrow_rect(rc);
             CFont* old_font = dc.SelectObject(&font);
@@ -1635,7 +1651,7 @@ bool TableBox::vsbar_geometry(CRect& gutter, CRect& track, CRect& thumb, CRect& 
     if (thumb_y > track.bottom - thumb_h) thumb_y = track.bottom - thumb_h;
 
     int thumb_w = to_px(SBAR_THUMB_W);
-    int tx = track.right - to_px(SBAR_INSET) - thumb_w;
+    int tx = track.left + (track.Width() - thumb_w) / 2;   // center across the gutter width
     thumb.SetRect(tx, thumb_y, tx + thumb_w, thumb_y + thumb_h);
     return true;
 }
@@ -1680,7 +1696,7 @@ bool TableBox::hsbar_geometry(CRect& gutter, CRect& track, CRect& thumb, CRect& 
     if (thumb_x > track.right - thumb_w)  thumb_x = track.right - thumb_w;
 
     int thumb_h = to_px(SBAR_THUMB_W);
-    int ty = track.bottom - to_px(SBAR_INSET) - thumb_h;
+    int ty = track.top + (track.Height() - thumb_h) / 2;   // center across the gutter height
     thumb.SetRect(thumb_x, ty, thumb_x + thumb_w, ty + thumb_h);
     return true;
 }
@@ -1797,9 +1813,10 @@ void TableBox::OnChar(UINT nChar, UINT nRepCnt, UINT nFlags)
 {
     if (nChar >= 0x20 && nChar != 0x7F &&
         cur_row >= fixed_rows && cur_col >= fixed_cols &&
-        edit_cb != nullptr && edit_box == nullptr && combo_popup == nullptr) {
+        (edit_cb != nullptr || cell_data != nullptr) && edit_box == nullptr && combo_popup == nullptr) {
         // Only CEdit-type cells accept a typed character as a text-overwrite trigger.
-        const char* type = edit_cb(cur_row, cur_col, nullptr, edit_cb_context);
+        const char* type = edit_cb ? edit_cb(cur_row, cur_col, nullptr, edit_cb_context)
+                                   : (const char*)(intptr_t)-1;
         if (type == (const char*)(intptr_t)-1) {
             start_text_edit(cur_row, cur_col, (wchar_t)nChar);
             return;
@@ -2207,9 +2224,10 @@ LRESULT TableBox::WindowProc(UINT message, WPARAM wParam, LPARAM lParam)
     }
 
     if (message == WM_IME_STARTCOMPOSITION &&
-        edit_cb != nullptr && edit_box == nullptr && combo_popup == nullptr &&
+        (edit_cb != nullptr || cell_data != nullptr) && edit_box == nullptr && combo_popup == nullptr &&
         cur_row >= fixed_rows && cur_col >= fixed_cols) {
-        const char* type = edit_cb(cur_row, cur_col, nullptr, edit_cb_context);
+        const char* type = edit_cb ? edit_cb(cur_row, cur_col, nullptr, edit_cb_context)
+                                   : (const char*)(intptr_t)-1;
         if (type == (const char*)(intptr_t)-1) {
             start_text_edit(cur_row, cur_col, 0);   // empty seed; the IME text fills it
             if (edit_box != nullptr)

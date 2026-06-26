@@ -37,8 +37,9 @@
 - The cell grid uses a fully fixed-width unit.
 - CJK characters, including Korean characters, occupy two cell columns: lead and trail.
 - Instead of the default `WS_VSCROLL`, which consumes client pixels, `ConBox` renders a custom rounded overlay scrollbar at the edge of the view.
-- The overlay scrollbar fades out during normal idle state.
-- The overlay scrollbar's rounded thumb and arrow buttons are antialiased, and its gutter strip is filled with a background-contrasting color (not just a faint hover-only groove) for the full time the bar is shown. Visual style matches TableBox's overlay scrollbar (see 3.4); ConBox has only the vertical axis.
+- The overlay scrollbar is wt.exe-like: while scrollable it is ALWAYS visible, but only as a slim bar at rest (a thin translucent bar hugging the right edge, no gutter/arrows). On hover, drag, or a scroll it EXPANDS to the full gutter + rounded thumb + arrow buttons for a hold window, then collapses again. (TableBox's overlay still uses the older auto-show-then-fade-to-nothing behavior; this slim/expand idle state is ConBox-specific.)
+- The expand/collapse is a single-shape MORPH, not a cross-fade of two shapes: the bar itself interpolates width / x-position / opacity between the slim bar and the full thumb, while the gutter strip and arrow buttons fade in/out. Hit-testing always uses the full gutter width even in the slim state, so the thin bar stays easy to grab.
+- The overlay scrollbar's rounded thumb and arrow buttons are antialiased, and its gutter strip is filled with a background-contrasting color. ConBox has only the vertical axis.
 - The mouse cursor remains `IDC_ARROW`, matching Windows Terminal behavior.
 - The text cursor (block/underline/I-beam) is hidden when the window does not have keyboard focus (`WM_KILLFOCUS`). It reappears immediately on `WM_SETFOCUS` with the blink timer restarted.
 

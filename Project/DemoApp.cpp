@@ -127,7 +127,7 @@ int main(int argc, const char* argv[]) {
     table->set_fixed(1, 1);
     table->alloc_text();              // owned mode: A..Z / 1.. headers auto-filled, body blank
     table->cell(6, 2) = "2";          // combo-cell demo: preselect item index 2
-    table->set_edit_callback(DemoTableEdit);
+    // table->set_edit_callback(DemoTableEdit);
     table->set_font("Malgun Gothic", 10);
     table->set_align(5);
     table->set_edit_adjust(1, 4, 0, 0);

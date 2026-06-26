@@ -36,6 +36,7 @@ This project adopts a modular architecture, with the PITFALLS.md files located a
 ```
 
 - Build output uses configuration-specific suffix directories such as `Project\Debug.64\` and `Project\Debug.32\`.
+- If a previously launched `jbBox.exe` is still running, the link step fails with `LNK1168` (cannot open exe for writing). Kill it first: `Get-Process jbBox -ErrorAction SilentlyContinue | Stop-Process -Force` before MSBuild.
 
 ### 2. Bash MSBuild Option Issue
 
