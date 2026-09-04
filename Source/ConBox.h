@@ -21,6 +21,10 @@
 //     registry child with a live start()'d process, closing the host hides it and waits (up to a
 //     few seconds, force-killing via terminate() if needed) before the host actually closes.
 //     Automatic; no host code required. See terminate()/is_running() below.
+//   - Register callbacks (set_title_cb, set_titlebar_color_cb, set_exit_callback, set_input_sink,
+//     set_resize_sink) BEFORE setup()/setup_from_ini(): set_titlebar_color_cb in particular must be
+//     registered first, or a freshly created default INI (no file existed yet) omits [titlebar]
+//     (see CreateDefaultIni/set_titlebar_color_cb).
 //   - Every string API takes UTF-8 (const char*) so C++ string literals pass directly.
 //   - Self-contained: includes its own headers, does not depend on a precompiled header.
 //   - Save .h/.cpp as ASCII (comments are ASCII-only) so encoding is unambiguous.
@@ -70,6 +74,7 @@
 #include <vector>
 #include <deque>
 #include <string>
+#include <unordered_map>
 
 // One screen cell. A double-width glyph (Korean/CJK) occupies a lead cell (CELL_WIDE set)
 // and the next cell is its trail (ch=0, skipped by the renderer). An empty cell is ch=L' '.
@@ -244,6 +249,24 @@ public:
     // ResizePseudoConsole.)
     void set_resize_sink(void (*sink)(int rows, int cols, void* user), void* user);
 
+    // Set the window-title callback. Fired whenever the child sends an OSC 0/2 "set title" sequence
+    // (the xterm convention most shells/CLIs use); title (UTF-8) is the decoded text, with no window
+    // of its own applied -- ConBox has no title bar, so applying it (e.g. SetWindowTextW on the
+    // host's top-level frame) is entirely up to the host. nullptr = no notification (default).
+    void set_title_cb(void (*cb)(const char* title));
+
+    // Set the title-bar color callback. Fired once from setup()/setup_from_ini() (and again
+    // immediately on registration, so the callback never misses the current values regardless of
+    // call order) with the titlebar_caption/titlebar_text/titlebar_border INI colors. ConBox has no
+    // title bar of its own; applying these (DwmSetWindowAttribute with DWMWA_CAPTION_COLOR/
+    // DWMWA_TEXT_COLOR/DWMWA_BORDER_COLOR on the host's top-level frame, Windows 11 22000+ only) is
+    // entirely up to the host. Any color not set in the INI is CLR_INVALID -- leave that attribute
+    // at the system default. nullptr = no notification (default).
+    // Register this (and every other set_*_cb/set_*_sink/set_exit_callback) BEFORE calling
+    // setup()/setup_from_ini(): CreateDefaultIni only writes the [titlebar] block into a freshly
+    // created INI when this callback is already registered at that point (see setup_from_ini).
+    void set_titlebar_color_cb(void (*cb)(COLORREF caption, COLORREF text, COLORREF border));
+
     // === ConPTY child runner (optional) ===
     // Using this group makes ConBox spawn a child and auto-wire its I/O. If start() is never called,
     // the ConPTY members stay dormant and ConBox is a pure terminal view.
@@ -275,7 +298,7 @@ public:
     // Register a callback fired once on the child's natural exit (e.g. shell exit). At callback time
     // cleanup is done (is_running()==false, so the callback may start() again). Not fired for an
     // explicit stop().
-    void set_exit_callback(void (*cb)(void* user), void* user);
+    void set_exit_callback(void (*cb)());
 
     // Read pending child output and feed it to print(). Normally driven by the internal timer.
     void pump();
@@ -336,6 +359,18 @@ private:
     void build_efont();
     void build_kfont();
 
+    // Build efont_fallback (fallback_font_name) at efont_lf's pixel height. Called from build_efont
+    // so it tracks efont's DPI/zoom/point-size changes automatically.
+    void build_fallback_font();
+
+    // True if (wide ? kfont : efont) has a real (non-.notdef) glyph for ch. Result is cached; the
+    // cache is cleared in set_efont/set_kfont.
+    bool HasGlyph(bool wide, wchar_t ch);
+
+    // Returns primary if HasGlyph(wide, ch), else the symbol fallback font (the double-size variant
+    // if dbl). Single substitution point shared by OnPaint/save_emf/save_pdf.
+    CFont* PickFont(CFont* primary, bool wide, bool dbl, wchar_t ch);
+
     // Rebuild both fonts at the window's current DPI, recompute the grid, and repaint. Called from
     // the WM_DPICHANGED / WM_DPICHANGED_AFTERPARENT handlers.
     void relayout_for_dpi();
@@ -381,6 +416,12 @@ private:
 
     // Dispatch a completed CSI sequence (final byte fin): cursor moves / erases / SGR etc.
     void dispatch_csi(wchar_t fin);
+
+    // Parse the accumulated OSC payload (osc_buf, "Ps;Pt") on BEL/ST. Ps 0 or 2 (set window title,
+    // the xterm convention Claude Code and most shells use) decodes Pt to UTF-8 and forwards it via
+    // title_cb; any other Ps (icon name, color queries, etc.) is dropped -- ConBox has no
+    // representation for those. A payload with no ';' is ignored.
+    void dispatch_osc();
 
     // Write one glyph at the cursor (autowrapping first if past cols). A wide glyph fills the lead
     // cell and sets the next to trail (ch=0). Applies the current SGR color/attributes.
@@ -493,14 +534,22 @@ private:
     void (*resize_sink)(int rows, int cols, void* user);
     void* resize_sink_user;
 
+    // Title callback. Reports the decoded text of an OSC 0/2 "set title" sequence (see dispatch_osc).
+    void (*title_cb)(const char* title);
+
+    // Title-bar color callback + the INI-parsed values it is fired with (see set_titlebar_color_cb).
+    // Stored as members (not just passed through at parse time) so registering the callback after
+    // setup()/setup_from_ini() already ran still replays the current values immediately.
+    void (*titlebar_color_cb)(COLORREF caption, COLORREF text, COLORREF border);
+    COLORREF titlebar_caption, titlebar_text, titlebar_border;
+
     // === ConPTY child state (all dormant unless start() is used) ===
     HPCON h_pc;                      // pseudo-console handle
     HANDLE in_write;                 // write end of child stdin
     HANDLE out_read;                 // read end of child output (polled)
     PROCESS_INFORMATION child_proc;
     bool child_running;
-    void (*exit_cb)(void* user);     // child natural-exit callback (nullptr if none)
-    void* exit_cb_user;
+    void (*exit_cb)();               // child natural-exit callback (nullptr if none)
     HANDLE log_file;                 // raw child-output log; INVALID_HANDLE_VALUE = not logging
 
     // On detecting child exit, clean up then fire the exit callback. stop() runs first so the callback
@@ -554,6 +603,14 @@ private:
     LOGFONTW efont_lf;
     LOGFONTW kfont_lf; // keeps the user's original size/style
 
+    // Symbol fallback font (fallback_font_name, e.g. Segoe UI Symbol): TextOutW does not do font
+    // fallback, so a glyph missing from efont/kfont (e.g. media-control symbols outside typical
+    // coding/UI fonts) would show as a hollow box. PickFont substitutes this font (checked via
+    // HasGlyph) at every glyph-drawing site (OnPaint/save_emf/save_pdf). Rebuilt in build_efont()
+    // at efont's pixel height, so it always matches the current cell size/DPI/zoom.
+    CFont efont_fallback;
+    CFont efont_fallback_double;  // 2x-size variant for CELL_DOUBLE cells; built in calc_cell_size
+
     // Original (DPI-independent) font specs, stored by set_efont/set_kfont (and apply_default_fonts
     // for the unset case). Kept so fonts can be rebuilt at a new DPI (build_efont/build_kfont) without
     // the host re-calling. efont_size/kfont_size are in points; kfont_size<=0 means match mode.
@@ -561,6 +618,12 @@ private:
     float       efont_size;
     std::string kfont_name, kfont_opts;
     float       kfont_size;
+    std::string fallback_font_name;  // symbol fallback face name (default "Segoe UI Symbol")
+
+    // HasGlyph() result cache, keyed by character; separate per font since efont/kfont are usually
+    // different faces with different coverage. Cleared in set_efont/set_kfont (a new face name can
+    // change glyph coverage even at the same size).
+    std::unordered_map<wchar_t, bool> efont_glyph_cache, kfont_glyph_cache;
 
     int  box_dpi;           // real monitor DPI; set in open() and updated in OnSize on a DPI change.
                             // build_font uses it pre-window; OnSize compares it to detect a DPI change.
@@ -648,6 +711,7 @@ private:
     bool vt_priv;                 // CSI '?' (DEC private) marker
     bool vt_gtlt;                 // CSI '<' '=' '>' prefix marker (2nd DA/kitty/XTMODKEYS; all ignored)
     bool vt_space;                // CSI ' ' (0x20) intermediate marker; needed to spot DECSCUSR (CSI Ps SP q)
+    std::wstring osc_buf;         // OSC payload accumulated in VT_OSC, consumed by dispatch_osc()
 
     // Current SGR attributes applied by put_char (colors use cur_fg/cur_bg).
     bool cur_bold;

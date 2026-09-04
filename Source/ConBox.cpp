@@ -385,6 +385,9 @@ ConBox::ConBox()
     input_sink_user = nullptr;
     resize_sink = nullptr;
     resize_sink_user = nullptr;
+    title_cb = nullptr;
+    titlebar_color_cb = nullptr;
+    titlebar_caption = titlebar_text = titlebar_border = CLR_INVALID;
 
     // ConPTY child state stays empty until start() (pure terminal view).
     h_pc = nullptr;
@@ -393,7 +396,6 @@ ConBox::ConBox()
     ZeroMemory(&child_proc, sizeof(child_proc));
     child_running = false;
     exit_cb = nullptr;
-    exit_cb_user = nullptr;
     log_file = INVALID_HANDLE_VALUE;
     closing = false;
 
@@ -425,6 +427,7 @@ ConBox::ConBox()
     // open() sets it from the parent monitor; build_font then falls back to the primary monitor DPI.
     efont_size = 0.0f;
     kfont_size = 0.0f;
+    fallback_font_name = "Segoe UI Symbol";
     box_dpi     = 0;
     zoom_pm     = 1000;
     zoom_resize = false;
@@ -529,6 +532,13 @@ static std::map<std::string, std::string> ParseIni(const char* contents)
     std::map<std::string, std::string> m;
     if (!contents) return m;
 
+    // Skip a leading UTF-8 BOM (EF BB BF) so it doesn't get glued onto the first line's
+    // ';'/'#'/'[' comment/section check or the first key name. Safe to read up to 3 bytes
+    // ahead: a matched non-NUL byte guarantees the C string continues at least that far.
+    if ((unsigned char)contents[0] == 0xEF && (unsigned char)contents[1] == 0xBB &&
+        (unsigned char)contents[2] == 0xBF)
+        contents += 3;
+
     std::istringstream ss(contents);
     std::string line;
     while (std::getline(ss, line)) {
@@ -577,11 +587,17 @@ static COLORREF ParseColor(const std::string& s, COLORREF def)
 // Write a default INI file to path (called on first run when no config exists).
 // The generated INI text contains Korean UTF-8 comments directly in these literals.
 // Keep this source file saved as UTF-8 with BOM so MSVC reads them correctly.
-static void CreateDefaultIni(const wchar_t* path)
+// The written file itself gets a UTF-8 BOM prepended (see below); ParseIni() skips it on read.
+// include_titlebar: write the [titlebar] block only if the host has already registered
+// set_titlebar_color_cb (otherwise those keys would have no way to take effect, so omitting them
+// keeps a fresh default INI from suggesting a feature that is not wired up).
+static void CreateDefaultIni(const wchar_t* path, bool include_titlebar)
 {
     FILE* f = nullptr;
     _wfopen_s(&f, path, L"w");
     if (!f) return;
+    static const unsigned char utf8_bom[3] = { 0xEF, 0xBB, 0xBF };
+    fwrite(utf8_bom, 1, sizeof(utf8_bom), f);   // text mode only rewrites \n; raw BOM bytes pass through untouched
     fputs(
         "; ConBox 설정 파일\n"
         "; 섹션 이름은 무시됩니다 -- 키 이름으로만 인식합니다.\n"
@@ -594,6 +610,7 @@ static void CreateDefaultIni(const wchar_t* path)
         "kfont_name    = Malgun Gothic   ; 한글 폰트 이름\n"
         "kfont_size    = 0               ; 0 이하: 영문 높이에 맞춤 / 양수: 크기 직접 지정\n"
         "kfont_opts    = B               ; 한글 폰트 옵션\n"
+        "fallback_font_name = Segoe UI Symbol ; 영문/한글 폰트에 글리프가 없는 기호의 대체 폰트\n"
         "\n"
         "[layout]\n"
         "; 마진: 콘텐츠와 창 가장자리 사이 여백(px). adjust: 셀 크기 미세조정(px, 음수=줄임)\n"
@@ -659,7 +676,19 @@ static void CreateDefaultIni(const wchar_t* path)
         "cursor_blend_bg = 4             ; 커서 색상 - 배경색 비중\n"
         "cursor_blend_fg = 6             ; 커서 색상 - 글자색 비중\n"
         "cursor_blink_ms = 0             ; 깜빡임 간격(ms). 0 = 시스템 설정 따름\n"
-        "\n"
+        "\n",
+        f);
+    if (include_titlebar) {
+        fputs(
+            "[titlebar]\n"
+            "; Windows 11 이상만 적용됨, 비워두면 시스템 기본값 유지.\n"
+            "titlebar_caption =               ; 타이틀 바 배경색\n"
+            "titlebar_text    =               ; 타이틀 바 글자색\n"
+            "titlebar_border  =               ; 창 테두리색\n"
+            "\n",
+            f);
+    }
+    fputs(
         "[rendering]\n"
         "builtin_glyphs = 2              ; 0=폰트, 1=블록문자 직접그림, 2=박스선까지 직접그림(기본)\n"
         "scrollback_cap = 5000           ; 스크롤백 최대 줄 수\n"
@@ -698,6 +727,9 @@ void ConBox::setup(const char* contents)
     if (const std::string* s = get("kfont_name")) kfont_name = *s;
     if (const std::string* s = get("kfont_size")) { try { kfont_size = std::stof(*s); } catch (...) {} }
     if (const std::string* s = get("kfont_opts")) kfont_opts = *s;
+    // fallback_font_name is read directly into the member (not a local) since build_fallback_font
+    // (called from build_efont, triggered by set_efont below) reads it from there.
+    if (const std::string* s = get("fallback_font_name")) fallback_font_name = *s;
     set_efont(efont_name.c_str(), efont_size, efont_opts.c_str());
     set_kfont(kfont_name.c_str(), kfont_size, kfont_opts.c_str());
 
@@ -730,6 +762,13 @@ void ConBox::setup(const char* contents)
         if (const std::string* s = get(pal_key))
             paper_ansi_colors[i] = ParseColor(*s, paper_ansi_colors[i]);
     }
+
+    // Title bar colors (host-applied via set_titlebar_color_cb; ConBox has no title bar of its own).
+    // Absent keys stay CLR_INVALID (ctor default), meaning "leave that attribute at the system default".
+    if (const std::string* s = get("titlebar_caption")) titlebar_caption = ParseColor(*s, CLR_INVALID);
+    if (const std::string* s = get("titlebar_text"))    titlebar_text    = ParseColor(*s, CLR_INVALID);
+    if (const std::string* s = get("titlebar_border"))  titlebar_border  = ParseColor(*s, CLR_INVALID);
+    if (titlebar_color_cb) titlebar_color_cb(titlebar_caption, titlebar_text, titlebar_border);
 
     // Cursor
     set_cursor(geti("cursor_type", 0));
@@ -771,7 +810,7 @@ void ConBox::setup_from_ini(const char* path)
     };
 
     if (::GetFileAttributesW(wide_path.c_str()) == INVALID_FILE_ATTRIBUTES) {
-        CreateDefaultIni(wide_path.c_str());
+        CreateDefaultIni(wide_path.c_str(), titlebar_color_cb != nullptr);
         ini_msg = "ConBox: INI file not found. Created with defaults:\r\n" + w2u(wide_path) + "\r\n";
         return;
     }
@@ -1039,6 +1078,7 @@ void ConBox::calc_cell_size()
     // render Korean double-size glyphs at the wrong (1x-looking) size.
     MakeDoubleFont(efont_double, efont);
     MakeDoubleFont(kfont_double, kfont);
+    MakeDoubleFont(efont_fallback_double, efont_fallback);
 
     // In match mode kfont_lf.lfHeight was 0 at set_kfont time, so the bold/italic variants built
     // there also got lfHeight=0 (GDI default, too large). Sync kfont_lf from the now-finalized
@@ -1058,7 +1098,50 @@ void ConBox::build_efont()
     MakeFontVariant(efont_bold,        efont_lf, true,  false);
     MakeFontVariant(efont_italic,      efont_lf, false, true);
     MakeFontVariant(efont_bold_italic, efont_lf, true,  true);
-    // efont_double is (re)built in calc_cell_size.
+    build_fallback_font();
+    // efont_double/efont_fallback_double are (re)built in calc_cell_size.
+}
+
+// Build efont_fallback at efont_lf's pixel height (lfWidth=0, regular weight/style -- only used to
+// substitute a missing glyph, not to match efont's SGR variant). Rebuilt whenever efont is (DPI,
+// zoom, set_efont), so it always tracks the current cell size.
+void ConBox::build_fallback_font()
+{
+    LOGFONTW lf = efont_lf;
+    lf.lfWidth  = 0;
+    lf.lfWeight = FW_NORMAL;
+    lf.lfItalic = 0;
+    ::MultiByteToWideChar(CP_UTF8, 0, fallback_font_name.c_str(), -1, lf.lfFaceName, LF_FACESIZE);
+    efont_fallback.DeleteObject();
+    efont_fallback.Attach(::CreateFontIndirectW(&lf));
+}
+
+// GGI_MARK_NONEXISTING_GLYPHS makes GetGlyphIndicesW return 0xFFFF for a char the font has no
+// glyph for (TextOutW itself does not fall back and would otherwise print a hollow box). Uses a
+// throwaway screen DC for the query -- never the OnPaint back buffer or an EMF/printer DC being
+// recorded, since GDI calls on those are metafile/spool records, not free queries.
+bool ConBox::HasGlyph(bool wide, wchar_t ch)
+{
+    std::unordered_map<wchar_t, bool>& cache = wide ? kfont_glyph_cache : efont_glyph_cache;
+    auto it = cache.find(ch);
+    if (it != cache.end()) return it->second;
+
+    HDC hdc = ::GetDC(NULL);
+    HGDIOBJ old = ::SelectObject(hdc, (wide ? kfont : efont).GetSafeHandle());
+    WORD gi = 0xFFFF;
+    DWORD ret = ::GetGlyphIndicesW(hdc, &ch, 1, &gi, GGI_MARK_NONEXISTING_GLYPHS);
+    ::SelectObject(hdc, old);
+    ::ReleaseDC(NULL, hdc);
+
+    bool has = (ret != GDI_ERROR) && (gi != 0xFFFF);
+    cache[ch] = has;
+    return has;
+}
+
+CFont* ConBox::PickFont(CFont* primary, bool wide, bool dbl, wchar_t ch)
+{
+    if (HasGlyph(wide, ch)) return primary;
+    return dbl ? &efont_fallback_double : &efont_fallback;
 }
 
 // Build kfont + variants from the stored kfont_* spec; size<=0 keeps match mode.
@@ -1080,6 +1163,7 @@ void ConBox::set_efont(const char* name, float size, const char* option)
     efont_name = name ? name : "";
     efont_size = size;
     efont_opts = option ? option : "";
+    efont_glyph_cache.clear();
     build_efont();
 
     // Cell size changed; recompute the grid if the window is up.
@@ -1094,6 +1178,7 @@ void ConBox::set_kfont(const char* name, float size, const char* option)
     kfont_name = name ? name : "";
     kfont_size = size;
     kfont_opts = option ? option : "";
+    kfont_glyph_cache.clear();
     build_kfont();
 
     if (::IsWindow(m_hWnd)) {
@@ -1904,7 +1989,7 @@ static COLORREF Xterm256ToRgb(int n, const COLORREF* pal)
 // GROUND: glyph->put_char; C0: CR/LF/BS/TAB(x8)/BEL.
 // ESC: 7,8=DECSC/RC; D=IND, E=NEL, M=RI, c=RIS, [=CSI, ]=OSC.
 // CSI: accumulate params; ?=priv, <>=gtlt, ' '=space/DECSCUSR; final byte->dispatch_csi.
-// OSC: discard up to BEL/ST.
+// OSC: accumulate up to BEL/ST, then dispatch_osc() (title_cb on Ps 0/2; other Ps dropped).
 void ConBox::vt_feed(wchar_t wc)
 {
     // Parser state machine. State (vt_state etc.) is a member, so a sequence survives print() chunks.
@@ -1936,7 +2021,7 @@ void ConBox::vt_feed(wchar_t wc)
             for (int k = 0; k < 16; ++k) vt_params[k] = 0;
             return;
         }
-        if (wc == L']') { vt_state = VT_OSC; return; }   // OSC: discard (window title etc.)
+        if (wc == L']') { vt_state = VT_OSC; osc_buf.clear(); return; }   // OSC: accumulate until BEL/ST
         if (wc == L'7') { saved_cur = { cur_row, cur_col }; vt_state = VT_GROUND; return; }   // DECSC
         if (wc == L'8') { cur_row = saved_cur.row; cur_col = saved_cur.col; clamp_cursor(); vt_state = VT_GROUND; return; }  // DECRC
         if (wc == L'M') {   // RI: at the region top scroll down, else move up one line
@@ -2002,16 +2087,44 @@ void ConBox::vt_feed(wchar_t wc)
         return;
 
     case VT_OSC:
-        // OSC string (set window title etc.): discard up to the terminator. Terminator: BEL (0x07) or
-        // ST (ESC '\'). On ESC, go to ESC state to finish on the next char.
-        if (wc == 0x07) { vt_state = VT_GROUND; return; }
-        if (wc == 0x1B) { vt_state = VT_ESC; return; }
+        // OSC string ("Ps;Pt", e.g. set window title): accumulate into osc_buf up to the terminator,
+        // then hand it to dispatch_osc(). Terminator: BEL (0x07) or ST (ESC '\'); on ESC, go to ESC
+        // state so the following '\' is consumed by its normal (ignored) 2-byte-sequence path.
+        if (wc == 0x07) { dispatch_osc(); vt_state = VT_GROUND; return; }
+        if (wc == 0x1B) { dispatch_osc(); vt_state = VT_ESC; return; }
+        osc_buf += wc;
         return;
 
     default:
         vt_state = VT_GROUND;
         return;
     }
+}
+
+// Parse osc_buf ("Ps;Pt") on OSC termination. Ps 0 ("icon name + title") and 2 ("title" only) are
+// the xterm codes shells/CLIs use to set the window title; Pt is decoded to UTF-8 and forwarded via
+// title_cb. Any other Ps (icon name=1, color queries=4/10/11, hyperlinks=8, etc.) is dropped --
+// ConBox has no representation for those and no callback fires. A payload missing the ';' separator
+// (malformed, or an empty OSC) is ignored.
+void ConBox::dispatch_osc()
+{
+    if (!title_cb) return;
+
+    size_t semi = osc_buf.find(L';');
+    if (semi == std::wstring::npos) return;
+
+    int ps;
+    try { ps = std::stoi(osc_buf.substr(0, semi)); } catch (...) { return; }
+    if (ps != 0 && ps != 2) return;
+
+    std::wstring text = osc_buf.substr(semi + 1);
+    int n = ::WideCharToMultiByte(CP_UTF8, 0, text.c_str(), (int)text.size(), nullptr, 0, nullptr, nullptr);
+    std::string title;
+    if (n > 0) {
+        title.resize(n);
+        ::WideCharToMultiByte(CP_UTF8, 0, text.c_str(), (int)text.size(), &title[0], n, nullptr, nullptr);
+    }
+    title_cb(title.c_str());
 }
 
 // CSI dispatch. Drops sequences with gtlt prefix (private <>=) to avoid final-byte misparse.
@@ -3056,6 +3169,19 @@ void ConBox::set_resize_sink(void (*sink)(int rows, int cols, void* user), void*
     resize_sink_user = user;
 }
 
+void ConBox::set_title_cb(void (*cb)(const char* title))
+{
+    title_cb = cb;
+}
+
+void ConBox::set_titlebar_color_cb(void (*cb)(COLORREF caption, COLORREF text, COLORREF border))
+{
+    titlebar_color_cb = cb;
+    // Replay immediately: setup()/setup_from_ini() may already have run (and found no callback to
+    // fire to) before the host gets around to registering one.
+    if (titlebar_color_cb) titlebar_color_cb(titlebar_caption, titlebar_text, titlebar_border);
+}
+
 void ConBox::send_input_bytes(const char* bytes, int len)
 {
     if (input_sink != nullptr && bytes != nullptr && len > 0)
@@ -3458,7 +3584,7 @@ void ConBox::OnPaint()
                 // Glyph skipped for blank/trail (ch=0/' ') and blink-off; decorations always drawn.
                 if (c.ch != 0 && c.ch != L' ' && !(c.flags & CELL_BLINK && !blink_on)) {
                     bool cw = (c.flags & CELL_WIDE) != 0;
-                    CFont* df = cw ? &kfont_double : &efont_double;
+                    CFont* df = PickFont(cw ? &kfont_double : &efont_double, cw, true, c.ch);
                     if (df != last_font) { dc.SelectObject(df); last_font = df; }
                     if (fg != last_fg)   { dc.SetTextColor(fg); last_fg = fg; }
                     // adjust is scaled 2x for double-size glyphs (left/top position; right/bottom
@@ -3484,6 +3610,7 @@ void ConBox::OnPaint()
                         bool cw = (c.flags & CELL_WIDE)   != 0;
                         CFont* f = cw ? (cb && ci ? &kfont_bold_italic : cb ? &kfont_bold : ci ? &kfont_italic : &kfont)
                                       : (cb && ci ? &efont_bold_italic : cb ? &efont_bold : ci ? &efont_italic : &efont);
+                        f = PickFont(f, cw, false, c.ch);
                         if (f  != last_font) { dc.SelectObject(f);  last_font = f; }
                         if (fg != last_fg)   { dc.SetTextColor(fg); last_fg = fg; }
                         ::TextOutW(dc.GetSafeHdc(),px + adjust_left, py + cell_base, &c.ch, 1);
@@ -3550,7 +3677,7 @@ void ConBox::OnPaint()
             for (size_t i = 0; i < comp_str.size(); ++i) {
                 wchar_t wc = comp_str[i];
                 bool wide = IsWideChar(wc);
-                dc.SelectObject(wide ? &kfont : &efont);
+                dc.SelectObject(PickFont(wide ? &kfont : &efont, wide, false, wc));
                 bool cdrawn = (glyph_level >= 1 && DrawBlockElement(dc, wc, x, cur.top, cell_w, cell_h, cur_fg))
                            || (glyph_level >= 2 && DrawBoxLine(dc, wc, x, cur.top, cell_w, cell_h, cur_fg));
                 if (!cdrawn)
@@ -3621,7 +3748,7 @@ void ConBox::OnPaint()
                         bool cw = (cc.flags & CELL_WIDE)   != 0;
                         CFont* f = cw ? (cb && ci ? &kfont_bold_italic : cb ? &kfont_bold : ci ? &kfont_italic : &kfont)
                                       : (cb && ci ? &efont_bold_italic : cb ? &efont_bold : ci ? &efont_italic : &efont);
-                        dc.SelectObject(f);
+                        dc.SelectObject(PickFont(f, cw, false, cc.ch));
                         bool cdrawn = (glyph_level >= 1 && DrawBlockElement(dc, cc.ch, x, cur.top, cell_w, cell_h, cur_fg))
                                    || (glyph_level >= 2 && DrawBoxLine(dc, cc.ch, x, cur.top, cell_w, cell_h, cur_fg));
                         if (!cdrawn)
@@ -3762,7 +3889,7 @@ bool ConBox::save_emf(const char* dir)
                     // Glyph: skipped for trail cells (ch=0) and spaces; blink always visible in EMF.
                     if (c.ch != 0 && c.ch != L' ') {
                         bool cw = (c.flags & CELL_WIDE) != 0;
-                        cdc.SelectObject(cw ? &kfont_double : &efont_double);
+                        cdc.SelectObject(PickFont(cw ? &kfont_double : &efont_double, cw, true, c.ch));
                         cdc.SetTextColor(fg);
                         ::TextOutW(cdc.GetSafeHdc(),px + 2 * adjust_left, py + dbl_base, &c.ch, 1);
                     }
@@ -3790,7 +3917,7 @@ bool ConBox::save_emf(const char* dir)
                             CFont* f = cw
                                 ? (cb&&ci ? &kfont_bold_italic : cb ? &kfont_bold : ci ? &kfont_italic : &kfont)
                                 : (cb&&ci ? &efont_bold_italic : cb ? &efont_bold : ci ? &efont_italic : &efont);
-                            cdc.SelectObject(f);
+                            cdc.SelectObject(PickFont(f, cw, false, c.ch));
                             cdc.SetTextColor(fg);
                             ::TextOutW(cdc.GetSafeHdc(),px + adjust_left, py + cell_base, &c.ch, 1);
                         }
@@ -3977,7 +4104,7 @@ bool ConBox::save_pdf(const char* path)
                     int dbl_base = cell_base + adjust_top;
                     if (c.ch != 0 && c.ch != L' ') {
                         bool cw = (c.flags & CELL_WIDE) != 0;
-                        cdc.SelectObject(cw ? &kfont_double : &efont_double);
+                        cdc.SelectObject(PickFont(cw ? &kfont_double : &efont_double, cw, true, c.ch));
                         cdc.SetTextColor(fg);
                         ::TextOutW(cdc.GetSafeHdc(),px + 2 * adjust_left, py + dbl_base, &c.ch, 1);
                     }
@@ -4003,7 +4130,7 @@ bool ConBox::save_pdf(const char* path)
                             CFont* f = cw
                                 ? (cb&&ci ? &kfont_bold_italic : cb ? &kfont_bold : ci ? &kfont_italic : &kfont)
                                 : (cb&&ci ? &efont_bold_italic : cb ? &efont_bold : ci ? &efont_italic : &efont);
-                            cdc.SelectObject(f);
+                            cdc.SelectObject(PickFont(f, cw, false, c.ch));
                             cdc.SetTextColor(fg);
                             ::TextOutW(cdc.GetSafeHdc(),px + adjust_left, py + cell_base, &c.ch, 1);
                         }
@@ -4340,10 +4467,9 @@ void ConBox::child_resize_thunk(int rows, int cols, void* user)
         self->resize(rows, cols);
 }
 
-void ConBox::set_exit_callback(void (*cb)(void* user), void* user)
+void ConBox::set_exit_callback(void (*cb)())
 {
     exit_cb = cb;
-    exit_cb_user = user;
 }
 
 void ConBox::stop()
@@ -4448,8 +4574,7 @@ void ConBox::handle_child_exit()
 {
     // The child exited naturally. Grab the callback info first, then clean up, then call the callback
     // with cleanup done (is_running()==false) so it may immediately start() again without conflict.
-    void (*cb)(void*) = exit_cb;
-    void* user = exit_cb_user;
+    void (*cb)() = exit_cb;
     bool was_closing = closing;
     stop();
     // If the host frame was waiting on us via OnCloseQuery, finish the close now rather than
@@ -4461,7 +4586,7 @@ void ConBox::handle_child_exit()
             ::PostMessageW(p->GetSafeHwnd(), WM_CLOSE, 0, 0);
     }
     if (cb != nullptr)
-        cb(user);
+        cb();
 }
 
 LRESULT ConBox::OnCloseQuery(WPARAM, LPARAM)
