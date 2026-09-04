@@ -69,6 +69,7 @@
 - Horizontal arrow correction:
   - After IME commit, the child process automatically moves the cursor one cell to the right.
   - To keep mouse and manual cursor tracking aligned, the input module may swallow the right arrow or send the left-move sequence twice for a left-arrow input.
+- Enter variants are distinguished by the byte sent, not by a VT modifier sequence: plain Enter and Shift+Enter both arrive as `WM_CHAR` with `ch == '\r'` (Windows does not vary Enter's translated char with Shift), so Shift is detected by querying `GetKeyState(VK_SHIFT)` inside the `'\r'` branch and sending LF instead of CR when held. Ctrl+Enter and Ctrl+J both arrive as `ch == '\n'` already (Windows' own key translation, not app logic) and are sent as raw LF. Net effect: Enter -> CR (submit); Shift+Enter / Ctrl+Enter / Ctrl+J -> LF (newline, no submit) for child programs that distinguish the two.
 
 ### 7. Clipboard and Drag-and-Drop
 
@@ -92,7 +93,7 @@
 - `stop()` closes the pseudo console (`ClosePseudoConsole`) and all pipe/process/thread handles, but does NOT force the child process to exit -- it relies on the child noticing the closed console and exiting on its own, which is not guaranteed (see PITFALLS).
 - `terminate()`: last-resort cleanup. `::TerminateProcess`s the child if a handle exists, then calls `stop()`. Idempotent / a no-op if no child is running.
 - `is_running()` reports whether a child is currently alive.
-- **Host-close cooperation (`WM_JBCLOSEQUERY`, see `Documents/1. FrameBox/REQUIREMENTS.md` #8)**: `ConBox::OnCloseQuery` returns non-zero while `is_running()`, so a host `FrameBox` hides instead of destroying itself on `WM_CLOSE`. On the FIRST such query it starts a one-shot grace timer (`CLOSE_TIMER`, duration = `cfg_close_kill_timeout_ms`, from the `close_kill_timeout_ms` INI key, default 3000). Whichever happens first:
+- **Host-close cooperation (`WM_JBCLOSEQUERY`, see `Documents/1. FrameBox/REQUIREMENTS.md` #8)**: `ConBox::OnCloseQuery` returns non-zero while `is_running()`, so a host `FrameBox` hides instead of destroying itself on `WM_CLOSE`. On the FIRST such query it starts a one-shot grace timer (`CLOSE_TIMER`, duration = `cfg_close_kill_timeout_ms`, from the `close_kill_timeout_ms` INI key, default 250). Whichever happens first:
   - the child exits naturally (`handle_child_exit`) -> the pending close is completed immediately (re-posts `WM_CLOSE` to the parent), or
   - the timer expires -> `terminate()` force-kills the child, then the close is completed the same way.
 - This is automatic for any `ConBox` registered as a `FrameBox` child (`AddNew`) -- no host application code is required. Multiple `ConBox` instances under one `FrameBox` are handled independently (each answers `WM_JBCLOSEQUERY` for itself).
@@ -102,3 +103,31 @@
 - `set_exit_callback`, `set_title_cb`, and `set_titlebar_color_cb` take no opaque `user` context argument (unlike `set_input_sink`/`set_resize_sink`, which keep theirs since `start()` reuses them internally via static thunks).
 - `set_titlebar_color_cb(caption, text, border)` is fed from the `[titlebar]` INI colors; a color not set in the INI is `CLR_INVALID`. `ConBox` has no title bar of its own -- applying the values (e.g. via `DwmSetWindowAttribute`) is entirely up to the host. The callback fires once from `setup()`/`setup_from_ini()` and again immediately on registration, so it never misses the current values regardless of call order.
 - `CreateDefaultIni` writes the `[titlebar]` block into a freshly created INI only if `set_titlebar_color_cb` is already registered at that point -- so hosts that want it must register callbacks BEFORE calling `setup()`/`setup_from_ini()`.
+
+### 11. Keyboard Macros ([macros]) and Line-Triggered Auto-Input ([triggers])
+
+- `[macros]`: an F1..F12 INI key holds literal text (escape-decoded, see below) sent verbatim to the
+  child when that key is pressed, instead of its normal VT function-key sequence. Modifier state
+  (Shift/Ctrl/Alt) is not distinguished -- any combination fires the same macro. F10 is not
+  supported: it is delivered as `WM_SYSKEYDOWN`, not `WM_KEYDOWN` (see PITFALLS), so it never reaches
+  `terminal_keydown()` regardless of INI content.
+- `[triggers]`: repeated `match=`/`send=`/`cool=` line groups (NOT numbered keys -- a new group starts
+  at each `match=` line; `send`/`cool` lines until the next `match=` belong to it). After every
+  output chunk (`print()`), if the current line's text from column 0 to the cursor ends with a
+  group's `match` (suffix match), that group's `send` is sent to the child verbatim -- e.g.
+  auto-filling an SSH password prompt. A group with an empty/missing `match` or `send` is not
+  registered (same "empty INI value == unset" convention as `work_directory` etc.).
+  - `cool` (ms): absent or negative = fire once then permanently inactive; `0` = fire on every match;
+    positive = minimum ms between fires (checked against `GetTickCount64()`).
+  - `active_trigger_count` short-circuits `check_triggers()` to a no-op once every trigger has either
+    never been defined or is a spent one-shot -- so a config with no (or exhausted) triggers pays no
+    per-chunk cost building/comparing the current line's text.
+  - Unlike every other setting, `[triggers]` groups from a layered `setup()`/`setup_from_ini()` call
+    are APPENDED, never replacing or overriding ones an earlier layer already registered -- this lets
+    a host load a git-tracked base INI plus a separate untracked one for secrets (e.g. `send` holding
+    a real password) without the second file being able to accidentally blank out the first's rules.
+- Escape decoding (`DecodeMacroEscapes`, shared by both `[macros]` values and `[triggers]`
+  `match`/`send`): `\r \b \a \t \n \f \v \\ \" \' \?` and `\xHH` (2-digit hex, case-insensitive, any
+  byte -- the only way to embed a literal `;` in a value, since the INI parser cuts a value at the
+  first raw `;` before this decoding ever runs). No octal escapes. Byte-wise, so multi-byte UTF-8
+  (Korean etc.) passes through unaffected.

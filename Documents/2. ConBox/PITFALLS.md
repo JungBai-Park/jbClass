@@ -109,9 +109,10 @@
   and exit on their own -- but this is NOT an OS guarantee, only common-case cooperative behavior.
 - Measured directly (real run, not just reasoning about the API): closing the host frame while a
   plain, idle `cmd.exe` child was sitting at its prompt did NOT make it exit promptly. It only
-  exited once the ~3 s `terminate()` (`::TerminateProcess`) fallback fired (see REQUIREMENTS #9).
-  So even the simplest, most well-behaved shell cannot be assumed to exit from `ClosePseudoConsole`
-  alone within any short/bounded time.
+  exited once the `terminate()` (`::TerminateProcess`) fallback fired at the `close_kill_timeout_ms`
+  grace period then in effect (see REQUIREMENTS #9; default has since changed, 3000 -> 250 ms -- the
+  point stands regardless of the exact number). So even the simplest, most well-behaved shell cannot
+  be assumed to exit from `ClosePseudoConsole` alone within any short/bounded time.
 - Implication: any code path that tears down a `ConBox` with a live child MUST have a forced
   `terminate()` fallback (with a timeout) if it needs to guarantee the child is gone -- `stop()`
   alone can leave an orphaned child process running indefinitely.
@@ -135,3 +136,33 @@
 - The installed SDK (10.0.26100.0) defines all three attribute constants unconditionally in
   `dwmapi.h` (no `NTDDI_VERSION` guard), so `#include <dwmapi.h>` + `#pragma comment(lib,
   "dwmapi.lib")` is enough; no extra version-gated include logic is needed.
+
+### 13. WM_CHAR Does Not Vary Enter's Char Code With Shift -- Only Ctrl Does
+
+- Plain Enter and Shift+Enter both arrive at `OnChar` as `WM_CHAR` with `ch == '\r'` (0x0D): Windows'
+  key translation does not give Shift+Enter a different char code, so Shift must be detected
+  separately via `GetKeyState(VK_SHIFT)` inside the `'\r'` handler, not inferred from `ch`.
+- Ctrl+Enter, in contrast, IS translated differently by Windows itself: it arrives as `ch == '\n'`
+  (0x0A), identical to Ctrl+J. This is the OS keyboard-layout translation, not app logic -- do not
+  assume `ch` alone identifies the physical key.
+
+### 14. F10 (and Any Alt+key) Is WM_SYSKEYDOWN, Never Reaches WM_KEYDOWN
+
+- Win32 always routes F10-by-itself, and any key held with Alt, through `WM_SYSKEYDOWN`/`WM_SYSCHAR`,
+  not `WM_KEYDOWN`/`WM_CHAR` -- this is a fixed OS rule (F10 activates the menu bar; Shift+F10's
+  context-menu convention uses the same path), not something app code opts into.
+- Neither `ConBox` nor `FrameBox` has an `ON_WM_SYSKEYDOWN`/`OnSysKeyDown` handler anywhere. Result:
+  `terminal_keydown()`'s `case VK_F10` (sends the xterm F10 VT sequence) was already unreachable dead
+  code before the `[macros]` feature existed -- confirmed by tracing the message path, not by a live
+  keypress test. Any future F10 (or Alt+anything) handling needs an explicit `OnSysKeyDown` override
+  that consumes the message (else `DefWindowProc` tries to activate the system menu).
+
+### 15. ParseIni's Map Collapses Repeated Keys -- [triggers] Needed a Separate Line-Order Parser
+
+- `ParseIni()` builds a `std::map<key, value>`, so a repeated key (`match=` appearing many times, one
+  per `[triggers]` rule) collapses to only the last occurrence -- unusable for a format where the
+  same key name intentionally repeats once per group.
+- Fix: factored the single-line "key = value" extraction out of `ParseIni()` into `ParseIniLine()`,
+  then added `ParseTriggers()` which walks the raw INI text in line order (not through the map) and
+  groups `match=`/`send=`/`cool=` runs itself. `ParseIni()`'s map is still used for every other
+  (non-repeating) key.
