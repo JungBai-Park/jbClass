@@ -100,6 +100,17 @@ enum {
 
 typedef std::vector<CharInfo> Row;
 
+// One [triggers] rule: when the current line's text from column 0 up to the cursor ends with
+// `match`, `send` is sent to the child verbatim (see check_triggers()). cool_ms: <0 = fire once
+// then stay inactive, 0 = fire every match, >0 = minimum ms between fires. `active`/`last_fire` are
+// runtime state, not INI input.
+struct Trigger {
+    std::string match, send;
+    int         cool_ms;
+    bool        active = true;    // cool_ms < 0 only: false once it has fired
+    ULONGLONG   last_fire = 0;    // cool_ms > 0 only: GetTickCount64() at the last fire
+};
+
 class ConBox : public CWnd
 {
 public:
@@ -193,13 +204,23 @@ public:
     // Load settings from an INI file (section-agnostic key matching). path is UTF-8; a relative
     // path is resolved against the EXE directory (not the working directory). nullptr defaults to
     // "ConBox.ini". If the file does not exist, it is created with compiled-in defaults and a
-    // notification is stored in ini_msg (printed by open() once the window exists). Settings stay
-    // at constructor defaults. If the file exists but cannot be opened, the same deferred print()
+    // notification is appended to ini_msg (printed by open() once the window exists; multiple
+    // calls accumulate their messages instead of overwriting each other). Settings stay at
+    // constructor defaults. If the file exists but cannot be opened, the same deferred print()
     // path applies. Call before open() so fonts/margins are set before the first layout.
+    // Calling this (or setup()) more than once layers settings: the first call resolves every key
+    // to its compiled-in default unless the file overrides it; each later call only touches keys
+    // present in that file and leaves every other setting at whatever the previous call resolved
+    // -- e.g. setup_from_ini(global) then setup_from_ini(local) makes local an override layer on
+    // top of global, not a second independent reset. A key must be entirely absent from a file to
+    // inherit the previous layer; writing it with the same value as the default still pins it.
     void setup_from_ini(const char* path = nullptr);
 
     // Apply INI-format settings from a string. contents is UTF-8 with \n line endings (no BOM).
-    // Useful for programmatic injection of settings without a file.
+    // Useful for programmatic injection of settings without a file. Same layering rule as
+    // setup_from_ini(): the first call ever made (to either function) establishes compiled-in
+    // defaults for absent keys; subsequent calls keep the previous layer's resolved value for any
+    // key the new contents does not mention.
     void setup(const char* contents);
 
     // Export all content (scrollback + screen) to a series of EMF vector files in dir (UTF-8 path).
@@ -255,13 +276,16 @@ public:
     // host's top-level frame) is entirely up to the host. nullptr = no notification (default).
     void set_title_cb(void (*cb)(const char* title));
 
-    // Set the title-bar color callback. Fired once from setup()/setup_from_ini() (and again
-    // immediately on registration, so the callback never misses the current values regardless of
-    // call order) with the titlebar_caption/titlebar_text/titlebar_border INI colors. ConBox has no
-    // title bar of its own; applying these (DwmSetWindowAttribute with DWMWA_CAPTION_COLOR/
-    // DWMWA_TEXT_COLOR/DWMWA_BORDER_COLOR on the host's top-level frame, Windows 11 22000+ only) is
-    // entirely up to the host. Any color not set in the INI is CLR_INVALID -- leave that attribute
-    // at the system default. nullptr = no notification (default).
+    // Set the title-bar color callback. Fired once from open() -- after every setup()/
+    // setup_from_ini() call the host made beforehand has resolved titlebar_caption/text/border, so
+    // a multi-layer setup (e.g. a global INI then a local override INI) notifies the host only once,
+    // with the final colors -- and again immediately on registration, so the callback never misses
+    // the current values if registered after open() already ran. Colors are the
+    // titlebar_caption/titlebar_text/titlebar_border INI keys. ConBox has no title bar of its own;
+    // applying these (DwmSetWindowAttribute with DWMWA_CAPTION_COLOR/DWMWA_TEXT_COLOR/
+    // DWMWA_BORDER_COLOR on the host's top-level frame, Windows 11 22000+ only) is entirely up to
+    // the host. Any color not set in the INI is CLR_INVALID -- leave that attribute at the system
+    // default. nullptr = no notification (default).
     // Register this (and every other set_*_cb/set_*_sink/set_exit_callback) BEFORE calling
     // setup()/setup_from_ini(): CreateDefaultIni only writes the [titlebar] block into a freshly
     // created INI when this callback is already registered at that point (see setup_from_ini).
@@ -274,7 +298,9 @@ public:
     // Spawn cmdline (UTF-8, e.g. "python.exe", "cmd /c dir") under ConPTY. Console size is taken from
     // grid_size(). Internally wires the input/resize sinks to itself and starts an output
     // polling timer. Restarts if already running. Returns true on success. Call after open() (the
-    // polling timer needs the window).
+    // polling timer needs the window). The child's working directory is cfg_work_dir (work_directory
+    // INI key) if set -- a relative value is resolved against the EXE directory, same as an INI
+    // path -- otherwise the child inherits this process's current directory (CreateProcessW default).
     // The no-arg overload uses cfg_cmdline set by setup_from_ini() (also called automatically by
     // open() when cfg_cmdline is non-empty).
     bool start();
@@ -426,6 +452,12 @@ private:
     // Write one glyph at the cursor (autowrapping first if past cols). A wide glyph fills the lead
     // cell and sets the next to trail (ch=0). Applies the current SGR color/attributes.
     void put_char(wchar_t wc);
+
+    // [triggers]: compare the current line's text (column 0..cursor, UTF-8) against cfg_triggers by
+    // suffix; fires at most one eligible rule's `send` per call. Called once at the end of print()'s
+    // chunk. Short-circuits immediately when active_trigger_count is 0 (no rules, or every one-shot
+    // rule already fired) so a quiet terminal with no/exhausted triggers pays no per-chunk cost.
+    void check_triggers();
 
     // Move the cursor down a line. At the scroll region's bottom (scroll_bot) this scrolls the region
     // (scroll_up_region); otherwise it advances one line without leaving the screen.
@@ -755,9 +787,19 @@ private:
     int         cfg_cols;
     int         cfg_rows;
     std::string cfg_cmdline;
+    std::string cfg_work_dir;  // work_directory INI key (UTF-8); empty = inherit the host process's CWD
     int         cfg_lines_per_paper; // EMF export: rows per page (lines_per_paper INI key; default 50)
-    int         cfg_close_kill_timeout_ms; // host-close grace period before terminate() (close_kill_timeout_ms INI key; default 3000)
+    int         cfg_close_kill_timeout_ms; // host-close grace period before terminate() (close_kill_timeout_ms INI key; default 250)
+    std::string cfg_macro_f[12];     // [macros] F1..F12 INI keys, escape-decoded (UTF-8); empty = key
+                                      // keeps its normal VT sequence. Modifier state (Ctrl/Shift/Alt)
+                                      // is not distinguished. F10 never reaches here (WM_SYSKEYDOWN,
+                                      // not WM_KEYDOWN -- see terminal_keydown), so an F10 entry is inert.
+    std::vector<Trigger> cfg_triggers;   // [triggers] match=/send=/cool= groups; see check_triggers().
+                                          // Append-only: every setup()/setup_from_ini() layer can only
+                                          // add rules, never remove or override ones already loaded.
+    int         active_trigger_count;    // count of cfg_triggers not yet permanently fired (see Trigger)
     std::string ini_msg;             // deferred message from setup_from_ini(); printed by open() once the window exists
+    bool        setup_ran;           // false until setup() first applies content; see setup()'s layering comment
 
     // Double-buffer cache reused by OnPaint (not recreated each frame).
     CDC back_dc;              // persistent memory DC

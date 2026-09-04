@@ -31,6 +31,7 @@
   - Apply the configured ratio option.
   - Calculate `cell_w` as `(max(2 * w_e, w_k) + 1) / 2` to round up and avoid glyph clipping.
 - `adjust(left, top, right, bottom)` keeps the font size unchanged, adjusts per-side cell margins, and compensates the internal glyph drawing position so block and box-drawing characters can render without gaps.
+- Symbol fallback: `TextOutW` does not do font fallback, so a glyph missing from `efont`/`kfont` (e.g. Miscellaneous Technical symbols) would render as a hollow box. Every glyph-drawing site (screen paint, EMF export, PDF export) checks glyph existence and substitutes a configurable fallback font (`fallback_font_name` INI key, default `"Segoe UI Symbol"`) when needed.
 
 ### 4. Rendering and Viewport
 
@@ -57,6 +58,7 @@
 - 256-color and True Color output are supported by default.
 - Two-byte ESC support includes ESC 7/8 (DECSC/DECRC), RI (`M`), and RIS (`c`).
 - Private sequence extensions that are likely to cause incorrect behavior are excluded.
+- OSC 0/2 (set window title) is parsed; the decoded UTF-8 title text is forwarded to the host via `set_title_cb`. Other OSC codes (icon name, color queries, hyperlinks, etc.) are dropped.
 
 ### 6. Input Mapping and IME Commit Handling
 
@@ -94,3 +96,9 @@
   - the child exits naturally (`handle_child_exit`) -> the pending close is completed immediately (re-posts `WM_CLOSE` to the parent), or
   - the timer expires -> `terminate()` force-kills the child, then the close is completed the same way.
 - This is automatic for any `ConBox` registered as a `FrameBox` child (`AddNew`) -- no host application code is required. Multiple `ConBox` instances under one `FrameBox` are handled independently (each answers `WM_JBCLOSEQUERY` for itself).
+
+### 10. Host Notification Callbacks
+
+- `set_exit_callback`, `set_title_cb`, and `set_titlebar_color_cb` take no opaque `user` context argument (unlike `set_input_sink`/`set_resize_sink`, which keep theirs since `start()` reuses them internally via static thunks).
+- `set_titlebar_color_cb(caption, text, border)` is fed from the `[titlebar]` INI colors; a color not set in the INI is `CLR_INVALID`. `ConBox` has no title bar of its own -- applying the values (e.g. via `DwmSetWindowAttribute`) is entirely up to the host. The callback fires once from `setup()`/`setup_from_ini()` and again immediately on registration, so it never misses the current values regardless of call order.
+- `CreateDefaultIni` writes the `[titlebar]` block into a freshly created INI only if `set_titlebar_color_cb` is already registered at that point -- so hosts that want it must register callbacks BEFORE calling `setup()`/`setup_from_ini()`.

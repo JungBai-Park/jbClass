@@ -11,6 +11,7 @@
 #include <sstream>
 #include <map>
 #include <cmath>            // std::fabs (overlay scrollbar antialiasing)
+#include <climits>          // INT_MIN (ParseTriggers "cool not given" sentinel)
 #include <imm.h>            // Korean IME (Input Method Manager)
 #pragma comment(lib, "imm32.lib")
 #include <winspool.h>       // EnumPrintersW, OpenPrinterW, GetPrinterW, CreateDCW (save_pdf)
@@ -35,7 +36,7 @@ static const UINT_PTR SBAR_TIMER = 4;
 // One-shot grace period for the host-close safety net (OnCloseQuery/handle_child_exit): started
 // when the host frame first asks to close while a child is running; on expiry the child is
 // force-terminated so the close can proceed even if it never exits on its own. Duration is
-// cfg_close_kill_timeout_ms (close_kill_timeout_ms INI key; default 3000).
+// cfg_close_kill_timeout_ms (close_kill_timeout_ms INI key; default 250).
 static const UINT_PTR CLOSE_TIMER = 5;
 
 // Overlay scrollbar geometry/tuning (px / ms / alpha). Tuned to read like wt.exe: while scrollable it
@@ -444,8 +445,11 @@ ConBox::ConBox()
     cfg_cols = 96;
     cfg_rows = 32;
     cfg_cmdline = "";
+    cfg_work_dir = "";
     cfg_lines_per_paper = 50;
-    cfg_close_kill_timeout_ms = 3000;
+    cfg_close_kill_timeout_ms = 250;
+    active_trigger_count = 0;
+    setup_ran = false;
 
     // Default 16-color ANSI palette (matches the hardcoded base16[] in Xterm256ToRgb).
     static const COLORREF def16[16] = {
@@ -500,9 +504,10 @@ ConBox::~ConBox()
 }
 
 // ===== Config file loader =====
-// Resolve a UTF-8 INI path to a wide absolute path. Relative paths are anchored at the EXE
-// directory (not the working directory) so the config file travels with the executable.
-static std::wstring ResolveIniPath(const char* utf8)
+// Resolve a UTF-8 path to a wide absolute path. Relative paths are anchored at the EXE directory
+// (not the current working directory) so a relative INI path or work_directory setting travels
+// with the executable regardless of the process's inherited CWD.
+static std::wstring ResolveExeRelativePath(const char* utf8)
 {
     int n = ::MultiByteToWideChar(CP_UTF8, 0, utf8, -1, nullptr, 0);
     std::wstring w(n, 0);
@@ -522,55 +527,142 @@ static std::wstring ResolveIniPath(const char* utf8)
     return dir + w;
 }
 
-// Parse an INI file into a key->value map. Section headers are silently ignored so the caller
-// can match keys regardless of which section they appear in.  key names are lower-cased.
-// Parse INI-format contents (key=value, one per line) into a key->value map.
-// contents: UTF-8 string with \n line endings. If nullptr, returns empty map.
-// Section headers and comments are silently ignored; key names are lowercased.
+// Parse one already-extracted line as "key = value" per ConBox's INI conventions: leading
+// whitespace trimmed; a line starting with ';', '#', or '[' (comment/section) is not a key=value
+// line; key is lower-cased; value is leading-trimmed, cut at the first raw ';' (inline comment;
+// ConBox INI values never contain a literal ';' -- use \x3b), then trailing-trimmed. Returns false
+// (key_out/val_out untouched) for a blank/comment/section/no-'='/empty-key line.
+static bool ParseIniLine(const std::string& line_in, std::string& key_out, std::string& val_out)
+{
+    size_t start = 0;
+    while (start < line_in.size() && (line_in[start] == ' ' || line_in[start] == '\t')) ++start;
+    if (start >= line_in.size() || line_in[start] == ';' || line_in[start] == '#' || line_in[start] == '[')
+        return false;
+
+    std::string line = line_in.substr(start);
+    size_t eq_pos = line.find('=');
+    if (eq_pos == std::string::npos) return false;
+
+    std::string key = line.substr(0, eq_pos);
+    while (!key.empty() && (key.back() == ' ' || key.back() == '\t')) key.pop_back();
+    for (char& c : key) c = (char)tolower((unsigned char)c);
+    if (key.empty()) return false;
+
+    std::string val = line.substr(eq_pos + 1);
+    size_t val_start = 0;
+    while (val_start < val.size() && (val[val_start] == ' ' || val[val_start] == '\t')) ++val_start;
+    val = val.substr(val_start);
+    size_t semi_pos = val.find(';');
+    if (semi_pos != std::string::npos) val = val.substr(0, semi_pos);
+    while (!val.empty() && (val.back() == '\r' || val.back() == '\n' || val.back() == ' ')) val.pop_back();
+
+    key_out = std::move(key);
+    val_out = std::move(val);
+    return true;
+}
+
+// Skip a leading UTF-8 BOM (EF BB BF). Safe to read up to 3 bytes ahead: a matched non-NUL byte
+// guarantees the C string continues at least that far.
+static const char* SkipUtf8Bom(const char* contents)
+{
+    if ((unsigned char)contents[0] == 0xEF && (unsigned char)contents[1] == 0xBB &&
+        (unsigned char)contents[2] == 0xBF)
+        return contents + 3;
+    return contents;
+}
+
+// Parse INI-format contents (key=value, one per line) into a key->value map (last occurrence of a
+// repeated key wins). contents: UTF-8 string with \n line endings. If nullptr, returns empty map.
+// Section headers are silently ignored so the caller can match keys regardless of which section
+// they appear in.
 static std::map<std::string, std::string> ParseIni(const char* contents)
 {
     std::map<std::string, std::string> m;
     if (!contents) return m;
-
-    // Skip a leading UTF-8 BOM (EF BB BF) so it doesn't get glued onto the first line's
-    // ';'/'#'/'[' comment/section check or the first key name. Safe to read up to 3 bytes
-    // ahead: a matched non-NUL byte guarantees the C string continues at least that far.
-    if ((unsigned char)contents[0] == 0xEF && (unsigned char)contents[1] == 0xBB &&
-        (unsigned char)contents[2] == 0xBF)
-        contents += 3;
+    contents = SkipUtf8Bom(contents);
 
     std::istringstream ss(contents);
-    std::string line;
-    while (std::getline(ss, line)) {
-        // Trim leading whitespace.
-        size_t start = 0;
-        while (start < line.size() && (line[start] == ' ' || line[start] == '\t')) ++start;
-        // Skip empty lines, comments, and section headers.
-        if (start >= line.size() || line[start] == ';' || line[start] == '#' || line[start] == '[') continue;
-
-        line = line.substr(start);
-        size_t eq_pos = line.find('=');
-        if (eq_pos == std::string::npos) continue;
-
-        // Key: everything before '=', trailing-trimmed.
-        std::string key = line.substr(0, eq_pos);
-        while (!key.empty() && (key.back() == ' ' || key.back() == '\t')) key.pop_back();
-        for (char& c : key) c = (char)tolower((unsigned char)c);
-
-        // Value: everything after '=', leading-trimmed, inline comment and trailing whitespace stripped.
-        std::string val = line.substr(eq_pos + 1);
-        size_t val_start = 0;
-        while (val_start < val.size() && (val[val_start] == ' ' || val[val_start] == '\t')) ++val_start;
-        val = val.substr(val_start);
-        // Strip inline comment (ConBox INI values never contain ';').
-        size_t semi_pos = val.find(';');
-        if (semi_pos != std::string::npos) val = val.substr(0, semi_pos);
-        // Trim trailing whitespace.
-        while (!val.empty() && (val.back() == '\r' || val.back() == '\n' || val.back() == ' ')) val.pop_back();
-
-        if (!key.empty()) m[key] = val;
-    }
+    std::string line, key, val;
+    while (std::getline(ss, line))
+        if (ParseIniLine(line, key, val)) m[key] = val;
     return m;
+}
+
+// Decode a [macros] INI value's escapes: \r \b \a \t \n \f \v \\ \" \' \? and \xHH (2-digit hex,
+// case-insensitive, any byte). No octal escapes. An unrecognized \X keeps X literally (backslash
+// dropped). Byte-wise scan (not wchar_t), so multi-byte UTF-8 (Korean etc.) passes through
+// untouched -- none of its bytes equal the ASCII backslash that triggers an escape.
+static std::string DecodeMacroEscapes(const std::string& raw)
+{
+    std::string out;
+    out.reserve(raw.size());
+    for (size_t i = 0; i < raw.size(); ++i) {
+        if (raw[i] != '\\' || i + 1 >= raw.size()) { out.push_back(raw[i]); continue; }
+        char e = raw[++i];
+        switch (e) {
+        case 'r': out.push_back('\r'); break;
+        case 'b': out.push_back('\b'); break;
+        case 'a': out.push_back('\a'); break;
+        case 't': out.push_back('\t'); break;
+        case 'n': out.push_back('\n'); break;
+        case 'f': out.push_back('\f'); break;
+        case 'v': out.push_back('\v'); break;
+        case '\\': out.push_back('\\'); break;
+        case '"': out.push_back('"'); break;
+        case '\'': out.push_back('\''); break;
+        case '?': out.push_back('?'); break;
+        case 'x':
+            if (i + 2 < raw.size() && isxdigit((unsigned char)raw[i + 1]) && isxdigit((unsigned char)raw[i + 2])) {
+                char hex[3] = { raw[i + 1], raw[i + 2], 0 };
+                out.push_back((char)strtol(hex, nullptr, 16));
+                i += 2;
+            } else {
+                out.push_back('x');
+            }
+            break;
+        default:
+            out.push_back(e);
+            break;
+        }
+    }
+    return out;
+}
+
+// Parse repeated [triggers] groups from the raw INI text, in line order (NOT via ParseIni's map,
+// since a map can only hold the last of a repeated key -- these keys intentionally repeat once per
+// rule). A "match" line starts a new group; "send"/"cool" lines belonging to that group must follow
+// it before the next "match" (or EOF). A group is discarded (not registered) if, by then, "match"
+// or "send" is empty or missing -- same "empty INI value == unset" convention as e.g.
+// work_directory above (an empty suffix would match every line, so match is checked too). A group
+// with no "cool" (or an empty one) defaults to -1 (fire once). match/send both go through
+// DecodeMacroEscapes, same as [macros]. Appends newly found rules to `out` -- never clears or
+// replaces existing entries, so a layered setup()/setup_from_ini() call can only add triggers (see
+// setup()'s layering comment).
+static void ParseTriggers(const char* contents, std::vector<Trigger>& out)
+{
+    if (!contents) return;
+    contents = SkipUtf8Bom(contents);
+
+    bool have_group = false;
+    std::string match, send;
+    int cool = INT_MIN;   // sentinel: "cool" not given (or empty) in this group
+
+    auto flush = [&]() {
+        if (have_group && !match.empty() && !send.empty())
+            out.push_back({ DecodeMacroEscapes(match), DecodeMacroEscapes(send), (cool == INT_MIN ? -1 : cool) });
+        have_group = false; match.clear(); send.clear(); cool = INT_MIN;
+    };
+
+    std::istringstream ss(contents);
+    std::string line, key, val;
+    while (std::getline(ss, line)) {
+        if (!ParseIniLine(line, key, val)) continue;
+        if (key == "match") { flush(); have_group = true; match = val; }
+        else if (!have_group) continue;
+        else if (key == "send") { send = val; }
+        else if (key == "cool") { try { cool = std::stoi(val); } catch (...) {} }
+    }
+    flush();
 }
 
 // Parse "#RRGGBB" hex color string to COLORREF.  Returns def on failure.
@@ -695,7 +787,28 @@ static void CreateDefaultIni(const wchar_t* path, bool include_titlebar)
         "\n"
         "[child]\n"
         "cmdline =                       ; 실행할 자식 프로세스 명령줄 (비워두면 자동 실행 안함)\n"
-        "close_kill_timeout_ms = 3000    ; 창을 닫을 때 자식 프로세스 정상 종료를 기다리는 시간(ms). 지나면 강제 종료\n",
+        "work_directory =                ; 자식 프로세스의 작업 디렉토리 (비워두면 부모 프로세스의 작업 디렉토리를 물려받음)\n"
+        "close_kill_timeout_ms = 250     ; 창을 닫을 때 자식 프로세스 정상 종료를 기다리는 시간(ms). 지나면 강제 종료\n"
+        "\n"
+        "[macros]\n"
+        "; F1~F12 키를 누르면 아래 문자열을 그대로 자식 프로세스에 입력합니다 (F10 사용불가, 비워두면 해당 키는 원래 동작 유지).\n"
+        "F1 =\n"
+        "F2 =\n"
+        "F3 =\n"
+        "F4 =\n"
+        "F5 =\n"
+        "F6 =\n"
+        "F7 =\n"
+        "F8 =\n"
+        "F9 =\n"
+        "F11 =\n"
+        "F12 =\n"
+        "\n"
+        "[triggers]\n"
+        "; 화면 커서 왼쪽 문자열이 match로 끝나면 send를 그대로 자식에 입력합니다. (복수개의 match/send 정의 가능)\n"
+        "match = password:\\x20   ; 커서 왼쪽에서 검색할 비교 대상\n"
+        "send  =                 ; 비교 대상이 발견 되었을 때 전송되는 문자열 (비워져 있으면 등록되지 않음)\n"
+        "cool  =                 ; 사용된 후 재사용 될 때까지의 대기시간 (비워져 있으면 1회성으로 사용됨)\n",
         f);
     fclose(f);
 }
@@ -704,6 +817,16 @@ static void CreateDefaultIni(const wchar_t* path, bool include_titlebar)
 void ConBox::setup(const char* contents)
 {
     if (!contents) return;
+
+    // Layering: the first call ever made to setup() (via either setup_from_ini() or directly)
+    // resolves every key to the same compiled-in defaults as before -- single-call hosts see no
+    // behavior change. Each later call only applies keys present in `contents`; every other
+    // setting falls back to the CURRENT member value (i.e. whatever the previous call resolved),
+    // not back to the compiled default. This lets a host call setup_from_ini() more than once to
+    // build a global-then-local override layering: the later file only needs to list the keys it
+    // wants to change.
+    bool first = !setup_ran;
+    setup_ran = true;
 
     std::map<std::string, std::string> m = ParseIni(contents);
     auto get = [&](const char* k) -> const std::string* {
@@ -717,10 +840,12 @@ void ConBox::setup(const char* contents)
     };
 
     // Font
-    std::string efont_name = "Cascadia Mono", efont_opts = "";
-    float efont_size = 12.0f;
-    std::string kfont_name = "Malgun Gothic", kfont_opts = "B";
-    float kfont_size = 0.0f;
+    std::string efont_name = first ? "Cascadia Mono" : this->efont_name;
+    std::string efont_opts = first ? "" : this->efont_opts;
+    float efont_size = first ? 12.0f : this->efont_size;
+    std::string kfont_name = first ? "Malgun Gothic" : this->kfont_name;
+    std::string kfont_opts = first ? "B" : this->kfont_opts;
+    float kfont_size = first ? 0.0f : this->kfont_size;
     if (const std::string* s = get("efont_name")) efont_name = *s;
     if (const std::string* s = get("efont_size")) { try { efont_size = std::stof(*s); } catch (...) {} }
     if (const std::string* s = get("efont_opts")) efont_opts = *s;
@@ -734,13 +859,17 @@ void ConBox::setup(const char* contents)
     set_kfont(kfont_name.c_str(), kfont_size, kfont_opts.c_str());
 
     // Layout
-    int mt = geti("margin_top", 10), ml = geti("margin_left", 10);
-    int mb = geti("margin_bottom", 10), mr = geti("margin_right", 10);
+    int mt = geti("margin_top", first ? 10 : margin_top);
+    int ml = geti("margin_left", first ? 10 : margin_left);
+    int mb = geti("margin_bottom", first ? 10 : margin_bottom);
+    int mr = geti("margin_right", first ? 10 : margin_right);
     set_margin(mt, ml, mb, mr);
-    int al = geti("adjust_left", 0), at = geti("adjust_top", -2);
-    int ar = geti("adjust_right", 0), ab = geti("adjust_bottom", 0);
+    int al = geti("adjust_left", first ? 0 : adjust_left);
+    int at = geti("adjust_top", first ? -2 : adjust_top);
+    int ar = geti("adjust_right", first ? 0 : adjust_right);
+    int ab = geti("adjust_bottom", first ? 0 : adjust_bottom);
     adjust(al, at, ar, ab);
-    snap_mode = geti("snap_mode", 2);
+    snap_mode = geti("snap_mode", first ? 2 : snap_mode);
 
     // Screen colors: screen_text / screen_back / screen_palette00..15 (0-indexed, matching ANSI indices 0..15).
     if (const std::string* s = get("screen_text")) set_fg_color(ParseColor(*s, default_fg));
@@ -765,41 +894,66 @@ void ConBox::setup(const char* contents)
 
     // Title bar colors (host-applied via set_titlebar_color_cb; ConBox has no title bar of its own).
     // Absent keys stay CLR_INVALID (ctor default), meaning "leave that attribute at the system default".
+    // The callback itself is not fired here -- open() fires it once, after every setup()/
+    // setup_from_ini() layer the host makes has already resolved titlebar_caption/text/border, so a
+    // multi-layer (e.g. global+local INI) setup does not replay the callback once per layer.
     if (const std::string* s = get("titlebar_caption")) titlebar_caption = ParseColor(*s, CLR_INVALID);
     if (const std::string* s = get("titlebar_text"))    titlebar_text    = ParseColor(*s, CLR_INVALID);
     if (const std::string* s = get("titlebar_border"))  titlebar_border  = ParseColor(*s, CLR_INVALID);
-    if (titlebar_color_cb) titlebar_color_cb(titlebar_caption, titlebar_text, titlebar_border);
 
     // Cursor
-    set_cursor(geti("cursor_type", 0));
-    set_cursor_blend(geti("cursor_blend_bg", 4), geti("cursor_blend_fg", 6));
-    set_cursor_blink(geti("cursor_blink_ms", 0));
+    // cursor_type's 0 keeps its documented meaning ("use set_cursor's built-in default", resolved
+    // to 3 inside set_cursor) only on the first call; later calls fall back to the already-resolved
+    // member so an absent key does not silently reset a previously chosen cursor style.
+    set_cursor(geti("cursor_type", first ? 0 : cursor_type));
+    set_cursor_blend(geti("cursor_blend_bg", first ? 4 : cursor_bg_weight),
+                      geti("cursor_blend_fg", first ? 6 : cursor_fg_weight));
+    set_cursor_blink(geti("cursor_blink_ms", first ? 0 : cursor_blink_ms));
 
     // Rendering
-    set_builtin_glyphs(geti("builtin_glyphs", 2));
-    int cap = geti("scrollback_cap", 5000);
+    set_builtin_glyphs(geti("builtin_glyphs", first ? 2 : glyph_level));
+    int cap = geti("scrollback_cap", first ? 5000 : max_scrollback);
     if (cap > 0) max_scrollback = cap;
 
     // Host-consumed values (stored; accessed via config_cols/rows/cmdline)
-    cfg_cols = geti("grid_cols", 96);
-    cfg_rows = geti("grid_rows", 32);
+    cfg_cols = geti("grid_cols", first ? 96 : cfg_cols);
+    cfg_rows = geti("grid_rows", first ? 32 : cfg_rows);
     if (const std::string* s = get("cmdline")) { if (!s->empty()) cfg_cmdline = *s; }
-    cfg_lines_per_paper = geti("lines_per_paper", 50);
+    if (const std::string* s = get("work_directory")) { if (!s->empty()) cfg_work_dir = *s; }
+    cfg_lines_per_paper = geti("lines_per_paper", first ? 50 : cfg_lines_per_paper);
     if (cfg_lines_per_paper < 1) cfg_lines_per_paper = 1;
-    cfg_close_kill_timeout_ms = geti("close_kill_timeout_ms", 3000);
+    cfg_close_kill_timeout_ms = geti("close_kill_timeout_ms", first ? 250 : cfg_close_kill_timeout_ms);
     if (cfg_close_kill_timeout_ms < 0) cfg_close_kill_timeout_ms = 0;
+
+    // [macros] F1..F12: raw text -> escape-decoded macro (empty = no macro for that key).
+    static const char* const fkeys[12] = {
+        "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11", "f12"
+    };
+    for (int i = 0; i < 12; ++i)
+        if (const std::string* s = get(fkeys[i])) cfg_macro_f[i] = DecodeMacroEscapes(*s);
+
+    // [triggers]: append this layer's match=/send=/cool= groups (see ParseTriggers). Unlike every
+    // setting above, a later layer can only add triggers -- it cannot remove or override ones an
+    // earlier layer already registered.
+    size_t triggers_before = cfg_triggers.size();
+    ParseTriggers(contents, cfg_triggers);
+    active_trigger_count += (int)(cfg_triggers.size() - triggers_before);
 }
 
 // Load settings from an INI file.  Sections are ignored; keys are matched by name only.
 // Relative paths are resolved against the EXE directory.
 // - File not found: auto-created with compiled-in defaults at the resolved path; a status message is
-//   stored in ini_msg and printed by open() once the window exists. Settings stay at constructor defaults.
-// - File found but cannot be opened: same deferred print() path, no settings changed.
+//   appended to ini_msg and printed by open() once the window exists. Settings stay at whatever the
+//   previous setup()/setup_from_ini() call resolved (constructor defaults on the very first call).
+// - File found but cannot be opened: same deferred append-and-print path, no settings changed.
+// Calling this more than once (e.g. a global INI then a local override INI) appends each call's
+// status message rather than replacing it, so a "file not found" from an earlier call is not lost
+// when a later call succeeds or also reports a message.
 void ConBox::setup_from_ini(const char* path)
 {
     bool explicit_path = (path && *path);
     const char* src = explicit_path ? path : "ConBox.ini";
-    std::wstring wide_path = ResolveIniPath(src);
+    std::wstring wide_path = ResolveExeRelativePath(src);
 
     // Helper: wstring -> UTF-8 string (for the deferred print() message).
     auto w2u = [](const std::wstring& ws) -> std::string {
@@ -811,7 +965,7 @@ void ConBox::setup_from_ini(const char* path)
 
     if (::GetFileAttributesW(wide_path.c_str()) == INVALID_FILE_ATTRIBUTES) {
         CreateDefaultIni(wide_path.c_str(), titlebar_color_cb != nullptr);
-        ini_msg = "ConBox: INI file not found. Created with defaults:\r\n" + w2u(wide_path) + "\r\n";
+        ini_msg += "ConBox: INI file not found. Created with defaults:\r\n" + w2u(wide_path) + "\r\n";
         return;
     }
 
@@ -819,7 +973,7 @@ void ConBox::setup_from_ini(const char* path)
     FILE* f = nullptr;
     _wfopen_s(&f, wide_path.c_str(), L"r");
     if (!f) {
-        ini_msg = "ConBox: Cannot open INI file:\r\n" + w2u(wide_path) + "\r\n";
+        ini_msg += "ConBox: Cannot open INI file:\r\n" + w2u(wide_path) + "\r\n";
         return;
     }
 
@@ -836,6 +990,13 @@ void ConBox::setup_from_ini(const char* path)
 
 void ConBox::open(CWnd* parent, int left, int top)
 {
+    // Fire the title-bar color callback once, here, with whatever setup()/setup_from_ini() calls
+    // the host made before open() have resolved titlebar_caption/text/border to. This is the single
+    // authoritative point: it runs after callback registration and after every setup layer (open()
+    // is called once per instance, unlike setup_from_ini() which a host may call more than once for
+    // a global+local override layering), so the host is not notified with stale/intermediate colors.
+    if (titlebar_color_cb) titlebar_color_cb(titlebar_caption, titlebar_text, titlebar_border);
+
     // Register the "ConBox" window class on first call; subsequent calls (multiple instances) skip.
     // Fixed name allows FindWindowEx(parent, NULL, L"ConBox", NULL) from host/test scripts.
     // No background brush (we paint it). Arrow cursor (like wt.exe).
@@ -1900,6 +2061,41 @@ void ConBox::put_char(wchar_t wc)
     cur_col += advance;
 }
 
+void ConBox::check_triggers()
+{
+    if (active_trigger_count <= 0) return;   // no rules, or every one-shot rule already fired
+    if (cur_row < 0 || cur_row >= (int)screen.size()) return;
+
+    // Column 0..cursor of the current line, as UTF-8 (skip CELL_WIDE trail placeholders, ch==0).
+    const Row& line = screen[cur_row];
+    int end = min(cur_col, (int)line.size());
+    std::wstring wtext;
+    wtext.reserve(end);
+    for (int i = 0; i < end; ++i)
+        if (line[i].ch != 0) wtext += line[i].ch;
+    if (wtext.empty()) return;
+
+    int blen = ::WideCharToMultiByte(CP_UTF8, 0, wtext.c_str(), (int)wtext.size(), NULL, 0, NULL, NULL);
+    if (blen <= 0) return;
+    std::vector<char> buf(blen);
+    ::WideCharToMultiByte(CP_UTF8, 0, wtext.c_str(), (int)wtext.size(), buf.data(), blen, NULL, NULL);
+    std::string text(buf.data(), blen);
+
+    for (Trigger& tr : cfg_triggers) {
+        if (tr.cool_ms < 0 && !tr.active) continue;             // one-shot, already fired
+        if (text.size() < tr.match.size()) continue;
+        if (text.compare(text.size() - tr.match.size(), tr.match.size(), tr.match) != 0) continue;
+        if (tr.cool_ms > 0) {
+            ULONGLONG now = ::GetTickCount64();
+            if (now - tr.last_fire < (ULONGLONG)tr.cool_ms) continue;   // still cooling down
+            tr.last_fire = now;
+        }
+        send_input_bytes(tr.send.data(), (int)tr.send.size());
+        if (tr.cool_ms < 0) { tr.active = false; --active_trigger_count; }
+        break;   // at most one rule fires per check
+    }
+}
+
 void ConBox::print(const char* text)
 {
     if (text == nullptr)
@@ -1954,6 +2150,8 @@ void ConBox::print(const char* text)
     // passed to MultiByteToWideChar), so iterate over all wlen chars.
     for (int i = 0; i < wlen; ++i)
         vt_feed(print_ws[i]);
+
+    check_triggers();   // [triggers]: chunk-end suffix match against the current line
 
     // New output invalidates any selection (cell positions moved); clear it, scroll to bottom, repaint.
     sel_active = false;
@@ -3255,6 +3453,16 @@ bool ConBox::terminal_keydown(UINT vk, bool ctrl, bool shift)
         return true;
     }
 
+    // [macros] F1..F12: a configured key sends its INI-defined text instead of the VT function-key
+    // sequence below. Modifier state is ignored on purpose (any Fn press fires the macro).
+    if (vk >= VK_F1 && vk <= VK_F12) {
+        const std::string& mac = cfg_macro_f[vk - VK_F1];
+        if (!mac.empty()) {
+            send_input_bytes(mac.data(), (int)mac.size());
+            return true;
+        }
+    }
+
     // Other edit/function keys -> fixed VT sequences. (Modifier combos are rarely used here, so simplified.)
     const char* seq = nullptr;
     switch (vk) {
@@ -3342,9 +3550,18 @@ void ConBox::OnChar(UINT ch, UINT rep, UINT flags)
                 // Backspace -> DEL (0x7F) per readline/Unix convention.
                 send_input_bytes("\x7f", 1);
             }
-            else if (ch == L'\r' || ch == L'\n') {
-                // Enter -> CR (0x0D).
-                send_input_bytes("\r", 1);
+            else if (ch == L'\r') {
+                // Enter -> CR (0x0D). Shift+Enter also yields ch == '\r' here (Windows' WM_CHAR
+                // translation does not vary Enter's char code with Shift, unlike Ctrl), so query
+                // the Shift key directly and send LF instead so Shift+Enter inserts a newline
+                // rather than submitting.
+                bool tshift = (::GetKeyState(VK_SHIFT) & 0x8000) != 0;
+                send_input_bytes(tshift ? "\n" : "\r", 1);
+            }
+            else if (ch == L'\n') {
+                // Ctrl+J -> raw LF (0x0A), distinct from Enter's CR so apps that bind them
+                // differently (e.g. Enter submits, Ctrl+J inserts newline) work as expected.
+                send_input_bytes("\n", 1);
             }
             else if (ch == 0x03 || ch == 0x16) {
                 // Ctrl+C (0x03) and Ctrl+V (0x16) are special-cased in terminal_keydown (copy/interrupt
@@ -4395,13 +4612,24 @@ bool ConBox::start(const char* cmdline)
         return false;
     }
 
+    // cfg_work_dir empty -> lpCurrentDirectory NULL, so the child inherits this process's CWD
+    // (CreateProcessW default). Otherwise resolve it the same way as an INI path (relative ->
+    // anchored at the EXE directory) so a relative work_directory does not depend on the host's CWD.
+    std::wstring work_dir_w;
+    LPCWSTR work_dir_arg = nullptr;
+    if (!cfg_work_dir.empty()) {
+        work_dir_w = ResolveExeRelativePath(cfg_work_dir.c_str());
+        work_dir_arg = work_dir_w.c_str();
+    }
+
     BOOL ok = ::CreateProcessW(
         NULL,            // find the module from the command line
         cmd.data(),      // mutable command-line buffer
         NULL, NULL,
         FALSE,           // do not inherit handles (only the console via the pseudoconsole attribute)
         EXTENDED_STARTUPINFO_PRESENT,
-        NULL, NULL,
+        NULL,            // lpEnvironment: inherit this process's environment
+        work_dir_arg,    // lpCurrentDirectory: NULL = inherit this process's CWD
         &si.StartupInfo,
         &child_proc);
 

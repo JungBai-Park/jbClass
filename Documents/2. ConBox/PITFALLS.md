@@ -115,3 +115,23 @@
 - Implication: any code path that tears down a `ConBox` with a live child MUST have a forced
   `terminate()` fallback (with a timeout) if it needs to guarantee the child is gone -- `stop()`
   alone can leave an orphaned child process running indefinitely.
+
+### 11. GetGlyphIndicesW Must Use a Throwaway DC, Never the Target Being Recorded
+
+- `HasGlyph()` (glyph-existence check for font fallback) queries via `::GetDC(NULL)`, never the
+  `OnPaint` back buffer, an EMF DC (`CreateEnhMetaFileW`), or a printer DC (`save_pdf`). GDI calls on
+  an EMF/printer DC are metafile/spool records, not free queries -- running the check there would
+  corrupt the recording or the print job, not just waste a call.
+
+### 12. Title-Bar Color: Windows 11 Only, No Per-Window API on Windows 10
+
+- `DWMWA_CAPTION_COLOR`/`DWMWA_TEXT_COLOR`/`DWMWA_BORDER_COLOR` (via `DwmSetWindowAttribute`) require
+  Windows 11 build 22000+. On Windows 10 there is no per-window caption background color API at all
+  (only `DWMWA_USE_IMMERSIVE_DARK_MODE`, a dark/light toggle) -- a window's title bar there follows
+  the system accent-color/theme setting unconditionally.
+  `DwmSetWindowAttribute` with an attribute the running OS does not recognize just fails (non-zero
+  `HRESULT`), it does not crash -- calling it unconditionally and ignoring the return value is safe
+  and needs no OS-version branch.
+- The installed SDK (10.0.26100.0) defines all three attribute constants unconditionally in
+  `dwmapi.h` (no `NTDDI_VERSION` guard), so `#include <dwmapi.h>` + `#pragma comment(lib,
+  "dwmapi.lib")` is enough; no extra version-gated include logic is needed.
