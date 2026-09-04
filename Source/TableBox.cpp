@@ -244,25 +244,6 @@ static int ComboIndex(const char* idx_text, int max)
     return idx < max ? idx : max - 1;
 }
 
-BEGIN_MESSAGE_MAP(TableBox, CWnd)
-    ON_WM_PAINT()
-    ON_WM_SIZE()
-    ON_WM_ERASEBKGND()
-    ON_WM_SETFOCUS()
-    ON_WM_KILLFOCUS()
-    ON_WM_GETDLGCODE()
-    ON_WM_KEYDOWN()
-    ON_WM_CHAR()
-    ON_WM_MOUSEWHEEL()
-    ON_WM_LBUTTONDOWN()
-    ON_WM_MOUSEMOVE()
-    ON_WM_LBUTTONUP()
-    ON_WM_LBUTTONDBLCLK()
-    ON_WM_SETCURSOR()
-    ON_WM_MOUSELEAVE()
-    ON_WM_TIMER()
-END_MESSAGE_MAP()
-
 TableBox::TableBox()
 {
     col_uniform_w = 75;  col_count = 5;
@@ -1157,15 +1138,6 @@ protected:
 
     DECLARE_MESSAGE_MAP()
 };
-
-BEGIN_MESSAGE_MAP(TableComboPopup, CWnd)
-    ON_WM_PAINT()
-    ON_WM_MOUSEMOVE()
-    ON_WM_LBUTTONUP()
-    ON_WM_GETDLGCODE()
-    ON_WM_KEYDOWN()
-    ON_WM_ACTIVATE()
-END_MESSAGE_MAP()
 
 void TableBox::edit_cell(int row, int col)
 {
@@ -2274,3 +2246,34 @@ BOOL TableBox::OnEraseBkgnd(CDC* dc)
     // Background is painted in OnPaint to avoid flicker.
     return TRUE;
 }
+
+// Moved to end of file: kept out of tree-sitter's way of the surrounding functions
+// (these macro blocks, not proper C++ syntax pre-expansion, otherwise confuse the
+// codebase-memory indexer's parser recovery for a wide stretch of the file).
+BEGIN_MESSAGE_MAP(TableBox, CWnd)
+    ON_WM_PAINT()
+    ON_WM_SIZE()
+    ON_WM_ERASEBKGND()
+    ON_WM_SETFOCUS()
+    ON_WM_KILLFOCUS()
+    ON_WM_GETDLGCODE()
+    ON_WM_KEYDOWN()
+    ON_WM_CHAR()
+    ON_WM_MOUSEWHEEL()
+    ON_WM_LBUTTONDOWN()
+    ON_WM_MOUSEMOVE()
+    ON_WM_LBUTTONUP()
+    ON_WM_LBUTTONDBLCLK()
+    ON_WM_SETCURSOR()
+    ON_WM_MOUSELEAVE()
+    ON_WM_TIMER()
+END_MESSAGE_MAP()
+
+BEGIN_MESSAGE_MAP(TableComboPopup, CWnd)
+    ON_WM_PAINT()
+    ON_WM_MOUSEMOVE()
+    ON_WM_LBUTTONUP()
+    ON_WM_GETDLGCODE()
+    ON_WM_KEYDOWN()
+    ON_WM_ACTIVATE()
+END_MESSAGE_MAP()

@@ -84,3 +84,13 @@
 - `get_text_lines()` returns the scrollback and current output as a list of UTF-8 text lines after trimming horizontal trailing spaces.
 - `save_log(file_name)` writes the raw stream bytes received from the child process to a log file without CRLF conversion, encoding conversion, or other transformation.
 - When a logging session restarts, four newline characters and a unique date timestamp delimiter are inserted.
+
+### 9. Child Process Lifecycle and Host-Close Cooperation
+
+- `stop()` closes the pseudo console (`ClosePseudoConsole`) and all pipe/process/thread handles, but does NOT force the child process to exit -- it relies on the child noticing the closed console and exiting on its own, which is not guaranteed (see PITFALLS).
+- `terminate()`: last-resort cleanup. `::TerminateProcess`s the child if a handle exists, then calls `stop()`. Idempotent / a no-op if no child is running.
+- `is_running()` reports whether a child is currently alive.
+- **Host-close cooperation (`WM_JBCLOSEQUERY`, see `Documents/1. FrameBox/REQUIREMENTS.md` #8)**: `ConBox::OnCloseQuery` returns non-zero while `is_running()`, so a host `FrameBox` hides instead of destroying itself on `WM_CLOSE`. On the FIRST such query it starts a one-shot grace timer (`CLOSE_TIMER`, duration = `cfg_close_kill_timeout_ms`, from the `close_kill_timeout_ms` INI key, default 3000). Whichever happens first:
+  - the child exits naturally (`handle_child_exit`) -> the pending close is completed immediately (re-posts `WM_CLOSE` to the parent), or
+  - the timer expires -> `terminate()` force-kills the child, then the close is completed the same way.
+- This is automatic for any `ConBox` registered as a `FrameBox` child (`AddNew`) -- no host application code is required. Multiple `ConBox` instances under one `FrameBox` are handled independently (each answers `WM_JBCLOSEQUERY` for itself).

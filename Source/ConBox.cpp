@@ -32,6 +32,11 @@ static const UINT_PTR PUMP_TIMER = 3;
 static const UINT PUMP_INTERVAL_MS = 16;   // output poll interval; 16~30 keeps the view smooth
 // Overlay scrollbar fade timer. 4 to stay distinct from CURSOR(1)/BLINK(2)/PUMP(3).
 static const UINT_PTR SBAR_TIMER = 4;
+// One-shot grace period for the host-close safety net (OnCloseQuery/handle_child_exit): started
+// when the host frame first asks to close while a child is running; on expiry the child is
+// force-terminated so the close can proceed even if it never exits on its own. Duration is
+// cfg_close_kill_timeout_ms (close_kill_timeout_ms INI key; default 3000).
+static const UINT_PTR CLOSE_TIMER = 5;
 
 // Overlay scrollbar geometry/tuning (px / ms / alpha). Tuned to read like wt.exe: while scrollable it
 // is ALWAYS visible as a slim translucent bar hugging the right edge (no fade-out); on hover/drag or
@@ -61,33 +66,6 @@ static const COLORREF DEFAULT_BG = RGB(32, 32, 32);
 enum { VT_GROUND = 0, VT_ESC = 1, VT_CSI = 2, VT_OSC = 3 };
 
 // MAX_SCROLLBACK is now the instance member max_scrollback (configurable via config()).
-
-BEGIN_MESSAGE_MAP(ConBox, CWnd)
-    ON_WM_PAINT()
-    ON_WM_ERASEBKGND()
-    ON_WM_SIZE()
-    ON_WM_CHAR()
-    ON_WM_KEYDOWN()
-    ON_WM_GETDLGCODE()
-    ON_WM_MOUSEWHEEL()
-    ON_WM_TIMER()
-    ON_WM_DESTROY()
-    ON_WM_LBUTTONDOWN()
-    ON_WM_LBUTTONDBLCLK()
-    ON_WM_LBUTTONUP()
-    ON_WM_MOUSEMOVE()
-    ON_WM_MOUSELEAVE()
-    ON_WM_RBUTTONDOWN()
-    ON_WM_DROPFILES()
-    ON_WM_SETFOCUS()
-    ON_WM_KILLFOCUS()
-    ON_MESSAGE(WM_DPICHANGED, &ConBox::OnDpiChanged)
-    ON_MESSAGE(WM_JBZOOM,    &ConBox::OnJbZoom)
-    ON_MESSAGE(WM_IME_STARTCOMPOSITION, &ConBox::OnImeStart)
-    ON_MESSAGE(WM_IME_COMPOSITION, &ConBox::OnImeComp)
-    ON_MESSAGE(WM_IME_ENDCOMPOSITION, &ConBox::OnImeEnd)
-    ON_MESSAGE(WM_IME_NOTIFY, &ConBox::OnImeNotify)
-END_MESSAGE_MAP()
 
 // Whether a char is double-width (Korean, CJK, etc.): 1 cell for English, 2 cells for this range.
 static bool IsWideChar(wchar_t ch)
@@ -417,6 +395,7 @@ ConBox::ConBox()
     exit_cb = nullptr;
     exit_cb_user = nullptr;
     log_file = INVALID_HANDLE_VALUE;
+    closing = false;
 
     cursor_bg_weight = 4;
     cursor_fg_weight = 6;
@@ -463,6 +442,7 @@ ConBox::ConBox()
     cfg_rows = 32;
     cfg_cmdline = "";
     cfg_lines_per_paper = 50;
+    cfg_close_kill_timeout_ms = 3000;
 
     // Default 16-color ANSI palette (matches the hardcoded base16[] in Xterm256ToRgb).
     static const COLORREF def16[16] = {
@@ -685,7 +665,8 @@ static void CreateDefaultIni(const wchar_t* path)
         "scrollback_cap = 5000           ; 스크롤백 최대 줄 수\n"
         "\n"
         "[child]\n"
-        "cmdline =                       ; 실행할 자식 프로세스 명령줄 (비워두면 자동 실행 안함)\n",
+        "cmdline =                       ; 실행할 자식 프로세스 명령줄 (비워두면 자동 실행 안함)\n"
+        "close_kill_timeout_ms = 3000    ; 창을 닫을 때 자식 프로세스 정상 종료를 기다리는 시간(ms). 지나면 강제 종료\n",
         f);
     fclose(f);
 }
@@ -766,6 +747,8 @@ void ConBox::setup(const char* contents)
     if (const std::string* s = get("cmdline")) { if (!s->empty()) cfg_cmdline = *s; }
     cfg_lines_per_paper = geti("lines_per_paper", 50);
     if (cfg_lines_per_paper < 1) cfg_lines_per_paper = 1;
+    cfg_close_kill_timeout_ms = geti("close_kill_timeout_ms", 3000);
+    if (cfg_close_kill_timeout_ms < 0) cfg_close_kill_timeout_ms = 0;
 }
 
 // Load settings from an INI file.  Sections are ignored; keys are matched by name only.
@@ -1312,6 +1295,19 @@ void ConBox::OnTimer(UINT_PTR id)
     if (id == PUMP_TIMER) {
         // Child (ConPTY) output polling. start() set this; no child means no timer.
         pump();
+        return;
+    }
+    if (id == CLOSE_TIMER) {
+        // Grace period expired: the child ignored ClosePseudoConsole (or never received it), so
+        // force it down and let the host frame's WM_CLOSE proceed.
+        KillTimer(CLOSE_TIMER);
+        terminate();
+        if (closing) {
+            closing = false;
+            CWnd* p = GetParent();
+            if (p && ::IsWindow(p->GetSafeHwnd()))
+                ::PostMessageW(p->GetSafeHwnd(), WM_CLOSE, 0, 0);
+        }
         return;
     }
     if (id == SBAR_TIMER) {
@@ -4353,8 +4349,10 @@ void ConBox::set_exit_callback(void (*cb)(void* user), void* user)
 void ConBox::stop()
 {
     // Kill the polling timer first (so pump is no longer called). KillTimer only while the window lives.
-    if (GetSafeHwnd() != nullptr)
+    if (GetSafeHwnd() != nullptr) {
         KillTimer(PUMP_TIMER);
+        KillTimer(CLOSE_TIMER);   // no-op if no host-close wait was in progress
+    }
 
     // Release the input/resize sinks start() wired to itself (with no child, input is dropped).
     if (input_sink == &ConBox::child_input_thunk)
@@ -4385,6 +4383,15 @@ void ConBox::stop()
     }
     ZeroMemory(&child_proc, sizeof(child_proc));
     child_running = false;
+}
+
+void ConBox::terminate()
+{
+    // TerminateProcess on an already-exited process handle just fails harmlessly (no crash);
+    // no need to check GetExitCodeProcess first.
+    if (child_proc.hProcess != nullptr)
+        ::TerminateProcess(child_proc.hProcess, 1);
+    stop();
 }
 
 bool ConBox::is_running() const
@@ -4443,9 +4450,29 @@ void ConBox::handle_child_exit()
     // with cleanup done (is_running()==false) so it may immediately start() again without conflict.
     void (*cb)(void*) = exit_cb;
     void* user = exit_cb_user;
+    bool was_closing = closing;
     stop();
+    // If the host frame was waiting on us via OnCloseQuery, finish the close now rather than
+    // waiting out the rest of CLOSE_TIMER's grace period.
+    if (was_closing) {
+        closing = false;
+        CWnd* p = GetParent();
+        if (p && ::IsWindow(p->GetSafeHwnd()))
+            ::PostMessageW(p->GetSafeHwnd(), WM_CLOSE, 0, 0);
+    }
     if (cb != nullptr)
         cb(user);
+}
+
+LRESULT ConBox::OnCloseQuery(WPARAM, LPARAM)
+{
+    if (!child_running)
+        return 0;   // nothing to wait for; ready to close
+    if (!closing) {
+        closing = true;
+        SetTimer(CLOSE_TIMER, (UINT)cfg_close_kill_timeout_ms, nullptr);
+    }
+    return 1;       // still running: ask the host frame to hide and wait
 }
 
 void ConBox::OnDestroy()
@@ -4461,3 +4488,34 @@ void ConBox::OnDestroy()
     KillTimer(SBAR_TIMER);
     CWnd::OnDestroy();
 }
+
+// Moved to end of file: kept out of tree-sitter's way of the surrounding functions
+// (this macro block, not proper C++ syntax pre-expansion, otherwise confuses the
+// codebase-memory indexer's parser recovery for a wide stretch of the file).
+BEGIN_MESSAGE_MAP(ConBox, CWnd)
+    ON_WM_PAINT()
+    ON_WM_ERASEBKGND()
+    ON_WM_SIZE()
+    ON_WM_CHAR()
+    ON_WM_KEYDOWN()
+    ON_WM_GETDLGCODE()
+    ON_WM_MOUSEWHEEL()
+    ON_WM_TIMER()
+    ON_WM_DESTROY()
+    ON_WM_LBUTTONDOWN()
+    ON_WM_LBUTTONDBLCLK()
+    ON_WM_LBUTTONUP()
+    ON_WM_MOUSEMOVE()
+    ON_WM_MOUSELEAVE()
+    ON_WM_RBUTTONDOWN()
+    ON_WM_DROPFILES()
+    ON_WM_SETFOCUS()
+    ON_WM_KILLFOCUS()
+    ON_MESSAGE(WM_DPICHANGED, &ConBox::OnDpiChanged)
+    ON_MESSAGE(WM_JBZOOM,    &ConBox::OnJbZoom)
+    ON_MESSAGE(WM_JBCLOSEQUERY, &ConBox::OnCloseQuery)
+    ON_MESSAGE(WM_IME_STARTCOMPOSITION, &ConBox::OnImeStart)
+    ON_MESSAGE(WM_IME_COMPOSITION, &ConBox::OnImeComp)
+    ON_MESSAGE(WM_IME_ENDCOMPOSITION, &ConBox::OnImeEnd)
+    ON_MESSAGE(WM_IME_NOTIFY, &ConBox::OnImeNotify)
+END_MESSAGE_MAP()

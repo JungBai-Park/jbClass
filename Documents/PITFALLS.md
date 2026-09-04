@@ -32,11 +32,12 @@ This project adopts a modular architecture, with the PITFALLS.md files located a
 - Known x64 Debug build command:
 
 ```powershell
-& "C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Current\Bin\MSBuild.exe" "Project\jbBox.sln" /t:Build /p:Configuration=Debug /p:Platform=x64
+& "C:\Program Files\Microsoft Visual Studio\18\Community\MSBuild\Current\Bin\MSBuild.exe" "Build\jbBox.sln" /t:Build /p:Configuration=Debug /p:Platform=x64
 ```
 
-- Build output uses configuration-specific suffix directories such as `Project\Debug.64\` and `Project\Debug.32\`.
-- If a previously launched `jbBox.exe` is still running, the link step fails with `LNK1168` (cannot open exe for writing). Kill it first: `Get-Process jbBox -ErrorAction SilentlyContinue | Stop-Process -Force` before MSBuild.
+- Solution directory is `Build\` (solution `jbBox.sln` at its root); each project lives in its own subdirectory, e.g. `Build\DemoApp\DemoApp.vcxproj`.
+- Build output uses per-project, configuration-specific suffix directories (`OutDir`/`IntDir` set to `$(ProjectDir)$(Configuration).64\` etc., not `$(SolutionDir)`), e.g. `Build\DemoApp\Debug.64\`.
+- If a previously launched `DemoApp.exe` is still running, the link step fails with `LNK1168` (cannot open exe for writing). Kill it first: `Get-Process DemoApp -ErrorAction SilentlyContinue | Stop-Process -Force` before MSBuild.
 
 ### 2. Bash MSBuild Option Issue
 
@@ -123,3 +124,20 @@ This project adopts a modular architecture, with the PITFALLS.md files located a
 - ConBox previously used `make_font` (TableBox uses `build_font`) and `sbar_px` (TableBox uses
   `to_px`) for the same concepts. Renamed to `build_font` / `to_px` in ConBox to match TableBox.
 - If divergence reappears in future sessions, the canonical names are `build_font` and `to_px`.
+
+### 14. CBM (codebase-memory-mcp) Cannot Parse MFC Message-Map Macros
+
+- `BEGIN_MESSAGE_MAP(...)`/`ON_WM_*()`/`END_MESSAGE_MAP()` are not real C++ syntax before macro
+  expansion, and CBM's indexer (tree-sitter, no preprocessor) can choke on them. At a top-level
+  occurrence (translation-unit scope) it is usually a handful of 1-line parse blips that resync
+  immediately next line. But one occurrence (a `BEGIN_MESSAGE_MAP` for a locally-defined class,
+  deep inside `TableBox.cpp`) made the parser fail to resync AT ALL for the rest of the file
+  (~1250 lines silently missing from the graph) -- confirmed by comparing the indexer's reported
+  error-range format: many separate `N-N` (1-line) entries vs. one giant `1000-2276` (to EOF) entry.
+- Fix applied project-wide: move every `BEGIN_MESSAGE_MAP`/`END_MESSAGE_MAP` block to the end of
+  its `.cpp` file (see project `CLAUDE.md` coding rule #4). Verified by re-indexing: the giant
+  range collapsed back to small per-macro-line blips, node/edge counts increased (920->961,
+  3170->3517). `DECLARE_MESSAGE_MAP()` cannot move (must stay inside the class body in the header)
+  but only produces a harmless 1-line blip on its own.
+- This is a CBM/tree-sitter parsing limitation, not a project code defect (all affected files
+  compile cleanly).

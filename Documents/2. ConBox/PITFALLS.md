@@ -102,3 +102,16 @@
     diff added so a bordered popup sizes its CLIENT. The snap's follow-up OnSize has `cur == box_dpi`
     and recomputes the IDENTICAL grid (same size -> no `resize_sink` -> no PTY resize), so even
     mode-2 shrink is corruption-safe.
+
+### 10. ClosePseudoConsole Does Not Guarantee the Child Exits
+
+- `stop()`'s `::ClosePseudoConsole(h_pc)` ends the console session, and most console apps notice
+  and exit on their own -- but this is NOT an OS guarantee, only common-case cooperative behavior.
+- Measured directly (real run, not just reasoning about the API): closing the host frame while a
+  plain, idle `cmd.exe` child was sitting at its prompt did NOT make it exit promptly. It only
+  exited once the ~3 s `terminate()` (`::TerminateProcess`) fallback fired (see REQUIREMENTS #9).
+  So even the simplest, most well-behaved shell cannot be assumed to exit from `ClosePseudoConsole`
+  alone within any short/bounded time.
+- Implication: any code path that tears down a `ConBox` with a live child MUST have a forced
+  `terminate()` fallback (with a timeout) if it needs to guarantee the child is gone -- `stop()`
+  alone can leave an orphaned child process running indefinitely.

@@ -869,9 +869,6 @@ static IStream* resource_to_stream(int id) {
 // [HOST]   FrameBox -- CWnd host: per-frame registry + surveil/listen/report
 // ======================================================================
 
-BEGIN_MESSAGE_MAP(FrameBox, CWnd)
-END_MESSAGE_MAP()
-
 static const UINT_PTR MODAL_TIMER_ID = 1;
 
 FrameBox::FrameBox()
@@ -1689,6 +1686,8 @@ void FrameBox::rescale_children() {
 // Called at the end of rescale_children() so it fires after every zoom/DPI rescale,
 // including after ConBox's snap_to_grid() has already adjusted ConBox's final size
 // (snap_to_grid runs synchronously inside MoveWindow above, before this point).
+// Public: also callable directly (e.g. right after add_new() at startup) to size the
+// still-hidden frame around a child before the first show().
 void FrameBox::fit_to_children() {
     if (snap_margin < 0 || !::IsWindow(m_hWnd)) return;
 
@@ -1998,6 +1997,27 @@ LRESULT FrameBox::WindowProc(UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
     }
 
+    // Ask every WS_CHILD registry entry whether it is ready to close (WM_JBCLOSEQUERY; unhandled
+    // by plain controls' DefWindowProc == 0 == ready). If any says "not ready" (e.g. ConBox with a
+    // live child process), hide instead of destroying; the child is responsible for reposting
+    // WM_CLOSE once it is actually ready (see ConBox::OnCloseQuery / handle_child_exit).
+    if (msg == WM_CLOSE) {
+        bool block = false;
+        for (ChildEntry& e : registry) {
+            if (!e.layout) continue;
+            CWnd* w = static_cast<CWnd*>(*e.layout);
+            if (w && ::IsWindow(w->m_hWnd) && ::SendMessageW(w->m_hWnd, WM_JBCLOSEQUERY, 0, 0) != 0) {
+                block = true;
+                break;
+            }
+        }
+        if (block) {
+            ShowWindow(SW_HIDE);
+            return 0;
+        }
+        // else: fall through to CWnd::WindowProc's default handling (DestroyWindow).
+    }
+
     // window going away while in a modal listen: break out with no event.
     if (msg == WM_DESTROY) {
         event = nullptr;
@@ -2082,3 +2102,9 @@ BOOL FrameBox::PreTranslateMessage(MSG* pMsg) {
     }
     return CWnd::PreTranslateMessage(pMsg);
 }
+
+// Moved to end of file: kept out of tree-sitter's way of the surrounding functions
+// (this macro block, not proper C++ syntax pre-expansion, otherwise confuses the
+// codebase-memory indexer's parser recovery for a wide stretch of the file).
+BEGIN_MESSAGE_MAP(FrameBox, CWnd)
+END_MESSAGE_MAP()

@@ -26,6 +26,9 @@
 //     WM_HSCROLL/VSCROLL (lParam=ctrl) -> SendMessage(ctrlHwnd, WM_PARASITE_CALLBACK, 0, LOWORD(wParam))
 //   WM_PARASITE_SURVEIL (wParam=CWnd* or 0): register/unregister report target at listen() entry/exit.
 //   WM_PARASITE_REPORT  (wParam=signaling CWnd*): signals listen() to return.
+//   WM_JBCLOSEQUERY: sent to every registry child on WM_CLOSE; non-zero reply = "not ready" ->
+//     frame hides (SW_HIDE) instead of destroying; child must repost WM_CLOSE once ready.
+//     Unhandled (plain controls) = 0 = ready, so ordinary children never block a close.
 //
 // --- Usage ---
 //     FrameBox Top;  Top.OpenFrame(&App, 560,275, 1360,875);
@@ -78,6 +81,15 @@ enum {
 // before rescale_children() so ConBox/TableBox update their internal zoom before MoveWindow fires OnSize.
 #ifndef WM_JBZOOM
 #define WM_JBZOOM  (WM_APP + 100)
+#endif
+
+// Close-query message: on WM_CLOSE, FrameBox sends this to every WS_CHILD registry entry first.
+// A handler returns non-zero to mean "not ready yet" (e.g. ConBox with a live child process);
+// FrameBox then hides itself (SW_HIDE) instead of destroying, and expects the non-ready child to
+// PostMessage(WM_CLOSE) back to the frame once it is actually ready. Unhandled by DefWindowProc
+// (plain controls), which returns 0 = ready, so ordinary children never block a close.
+#ifndef WM_JBCLOSEQUERY
+#define WM_JBCLOSEQUERY  (WM_APP + 101)
 #endif
 
 
@@ -276,6 +288,13 @@ public:
     // Default -1 = disabled (FrameBox keeps the size set by open/zoom/DPI change).
     void set_margin(int margin_96) { snap_margin = margin_96; }
 
+    // Resize FrameBox now to wrap all WS_CHILD children plus set_margin() padding
+    // (no-op if set_margin() was never called, i.e. snap_margin<0). Runs automatically
+    // after every zoom/DPI rescale; call it directly right after add_new()/add_asitis()
+    // at startup to size the still-hidden frame around a child that computed its own
+    // size (e.g. ConBox sized from an INI grid) before the first show()/wait().
+    void fit_to_children();
+
     // Add a top-level popup to the menu bar (no resource file needed). Returns the
     // WM_COMMAND ID assigned to the first non-separator item in this popup, which
     // the caller can use with modify_menu_label() to change the label later.
@@ -398,7 +417,6 @@ private:
     void      surveil_one(CWnd* w, bool on);   // send WM_PARASITE_SURVEIL to one control
     void      surveil_all(bool on);            // send to all controls in surveil_list
     void      rescale_children();   // reposition WS_CHILD entries + reapply sys_font at eff_dpi()
-    void      fit_to_children();   // if snap_margin>=0: resize FrameBox to wrap all child rects + margin
 
     friend class Parasite;   // Parasite::eff_dpi() calls protected FrameBox::eff_dpi()
     std::vector<ChildEntry> registry;     // children this frame owns

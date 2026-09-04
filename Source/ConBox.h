@@ -17,6 +17,10 @@
 //     fonts/cell metrics use GetDpiForWindow, rebuilt automatically on monitor DPI change.
 //   - Zoom (WM_JBZOOM from FrameBox): sets zoom_pm (x1000); eff_dpi()=box_dpi*zoom_pm/1000 drives
 //     build_font() and to_px() so fonts/geometry scale with zoom like a DPI change.
+//   - Host-close safety (WM_JBCLOSEQUERY, answered internally): if this ConBox is a FrameBox
+//     registry child with a live start()'d process, closing the host hides it and waits (up to a
+//     few seconds, force-killing via terminate() if needed) before the host actually closes.
+//     Automatic; no host code required. See terminate()/is_running() below.
 //   - Every string API takes UTF-8 (const char*) so C++ string literals pass directly.
 //   - Self-contained: includes its own headers, does not depend on a precompiled header.
 //   - Save .h/.cpp as ASCII (comments are ASCII-only) so encoding is unambiguous.
@@ -41,6 +45,15 @@
 // Zoom message shared with FrameBox/TableBox (same numeric value in each module header).
 #ifndef WM_JBZOOM
 #define WM_JBZOOM  (WM_APP + 100)
+#endif
+
+// Close-query message shared with FrameBox (same numeric value in each module header, same
+// pattern as WM_JBZOOM). Sent by FrameBox to every WS_CHILD registry entry on WM_CLOSE.
+// A handler returns non-zero to mean "not ready yet" (FrameBox hides instead of destroying);
+// an unhandled default (DefWindowProc, e.g. plain controls) returns 0 = ready. No header
+// dependency between FrameBox and ConBox is introduced by this.
+#ifndef WM_JBCLOSEQUERY
+#define WM_JBCLOSEQUERY  (WM_APP + 101)
 #endif
 
 // ConPTY (CreatePseudoConsole/HPCON/ResizePseudoConsole) is declared only on Win10 1809
@@ -253,6 +266,10 @@ public:
     // Tear down child/PTY/pipes/polling timer. Idempotent.
     void stop();
 
+    // Force-kill the child if still alive (::TerminateProcess), then stop(). Idempotent (a no-op
+    // if no child is running). Last-resort cleanup for a child that ignores ClosePseudoConsole.
+    void terminate();
+
     bool is_running() const;
 
     // Register a callback fired once on the child's natural exit (e.g. shell exit). At callback time
@@ -304,6 +321,9 @@ protected:
     // does the font rebuild + grid preservation.
     afx_msg LRESULT OnDpiChanged(WPARAM w, LPARAM l);
     afx_msg LRESULT OnJbZoom(WPARAM w, LPARAM l);  // WM_JBZOOM: update zoom_pm and flag next OnSize
+    // WM_JBCLOSEQUERY: non-zero ("not ready") while a child process is running; starts CLOSE_TIMER
+    // on the first call. See the "Host-close safety net" block below for the rest of the sequence.
+    afx_msg LRESULT OnCloseQuery(WPARAM w, LPARAM l);
     DECLARE_MESSAGE_MAP()
 
 private:
@@ -490,6 +510,13 @@ private:
     static void child_input_thunk(const char* bytes, int len, void* user);
     static void child_resize_thunk(int rows, int cols, void* user);
 
+    // === Host-close safety net (WM_JBCLOSEQUERY, see OnCloseQuery above) ===
+    // While a child is running, OnCloseQuery answers "not ready" so the host frame hides instead
+    // of destroying itself; a one-shot CLOSE_TIMER then either sees the child exit on its own
+    // (handle_child_exit reposts WM_CLOSE to the parent) or, on timeout, force-terminate()s it
+    // before reposting WM_CLOSE so the close finally proceeds.
+    bool closing;   // true from the first OnCloseQuery call until the host frame actually closes
+
     COLORREF default_fg; // default RGB(200,200,200)
     COLORREF default_bg; // default RGB(32,32,32)
 
@@ -665,6 +692,7 @@ private:
     int         cfg_rows;
     std::string cfg_cmdline;
     int         cfg_lines_per_paper; // EMF export: rows per page (lines_per_paper INI key; default 50)
+    int         cfg_close_kill_timeout_ms; // host-close grace period before terminate() (close_kill_timeout_ms INI key; default 3000)
     std::string ini_msg;             // deferred message from setup_from_ini(); printed by open() once the window exists
 
     // Double-buffer cache reused by OnPaint (not recreated each frame).
