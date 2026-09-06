@@ -18,6 +18,8 @@
 #include <winspool.h>       // EnumPrintersW, OpenPrinterW, GetPrinterW, CreateDCW (save_pdf)
 #pragma comment(lib, "winspool.lib")
 #pragma comment(lib, "msimg32.lib")   // AlphaBlend (overlay scrollbar fade)
+#include <shellapi.h>       // ShellExecuteW (OSC 8 hyperlink Ctrl+Click)
+#pragma comment(lib, "shell32.lib")
 
 // Some SDK configurations expose CreatePseudoConsole/HPCON but not this attribute macro, so define it
 // if missing (ProcThreadAttributePseudoConsole=22 | PROC_THREAD_ATTRIBUTE_INPUT(0x00020000); a fixed
@@ -39,6 +41,10 @@ static const UINT_PTR SBAR_TIMER = 4;
 // force-terminated so the close can proceed even if it never exits on its own. Duration is
 // cfg_close_kill_timeout_ms (close_kill_timeout_ms INI key; default 250).
 static const UINT_PTR CLOSE_TIMER = 5;
+// One-shot visual-bell flash (BEL, cfg_bell_style bit 2). Started in vt_feed on \a, killed (and one
+// final Invalidate to end the flash) in OnTimer once BELL_FLASH_MS has passed.
+static const UINT_PTR BELL_TIMER = 6;
+static const UINT     BELL_FLASH_MS = 120;
 
 // Overlay scrollbar geometry/tuning (px / ms / alpha). Tuned to read like wt.exe: while scrollable it
 // is ALWAYS visible as a slim translucent bar hugging the right edge (no fade-out); on hover/drag or
@@ -375,12 +381,15 @@ ConBox::ConBox()
     mouse_last_col = -1;
     ime_committed = false;
     cur_bold = false;
+    cur_dim = false;
     cur_italic = false;
     cur_underline = false;
     cur_strike = false;
     cur_blink = false;
     cur_reverse = false;
     cur_double = false;
+    cur_link_id = 0;
+    link_table.push_back(std::string());   // index 0 = "no link" placeholder, never assigned to a cell
     blink_on = true;
 
     // Input modes default off; the child turns them on.
@@ -454,6 +463,8 @@ ConBox::ConBox()
     cfg_work_dir = "";
     cfg_lines_per_paper = 50;
     cfg_close_kill_timeout_ms = 250;
+    cfg_bell_style = 1;   // audible
+    bell_flash_until = 0;
     active_trigger_count = 0;
     setup_ran = false;
 
@@ -805,6 +816,9 @@ static bool CreateDefaultIni(const wchar_t* path, bool include_titlebar)
         "cursor_blend_bg = 4             ; 커서 색상 - 배경색 비중\n"
         "cursor_blend_fg = 6             ; 커서 색상 - 글자색 비중\n"
         "cursor_blink_ms = 0             ; 깜빡임 간격(ms). 0 = 시스템 설정 따름\n"
+        "\n"
+        "[bell]\n"
+        "bell_style      = 1             ; BEL(\\a) 응답: 0=끔, 1=소리(기본), 2=화면 반전 깜빡임, 3=소리+깜빡임\n"
         "\n",
         f);
     if (include_titlebar) {
@@ -968,6 +982,10 @@ void ConBox::setup(const char* contents)
     if (cfg_lines_per_paper < 1) cfg_lines_per_paper = 1;
     cfg_close_kill_timeout_ms = geti("close_kill_timeout_ms", first ? 250 : cfg_close_kill_timeout_ms);
     if (cfg_close_kill_timeout_ms < 0) cfg_close_kill_timeout_ms = 0;
+
+    // Bell (BEL, \a): 0=none, 1=audible (default), 2=visual flash, 3=both (bit field).
+    cfg_bell_style = geti("bell_style", first ? 1 : cfg_bell_style);
+    if (cfg_bell_style < 0 || cfg_bell_style > 3) cfg_bell_style = 1;
 
     // [macros] F1..F12: value is already escape-decoded by ParseIniLine (empty = no macro for that key).
     static const char* const fkeys[12] = {
@@ -1616,6 +1634,12 @@ void ConBox::OnTimer(UINT_PTR id)
         }
         return;
     }
+    if (id == BELL_TIMER) {
+        // Visual bell flash duration elapsed: stop the one-shot timer and repaint without the flash.
+        KillTimer(BELL_TIMER);
+        Invalidate(FALSE);
+        return;
+    }
     if (id == SBAR_TIMER) {
         // Overlay scrollbar fade in/out. The expanded form ramps toward a target opacity: 255 while
         // hovering/dragging or within the hold window (fade in / stay), 0 once the hold expires (fade
@@ -2077,6 +2101,18 @@ void ConBox::leave_alt_screen()
     reset_screen();
 }
 
+// SGR 2 (faint): return fg moved halfway toward bg. Blending toward the actual cell background --
+// rather than scaling fg toward black, as some emulators do -- keeps the effect a genuine contrast
+// reduction on light backgrounds too (scaling toward black would darken, i.e. strengthen, the text).
+// Applied once at put_char time so the stored cell color is already faint and the renderer needs no
+// dim-specific path; a later SGR color change or SGR 22 only affects cells written after it.
+static COLORREF DimColor(COLORREF fg, COLORREF bg)
+{
+    return RGB((GetRValue(fg) + GetRValue(bg)) / 2,
+               (GetGValue(fg) + GetGValue(bg)) / 2,
+               (GetBValue(fg) + GetBValue(bg)) / 2);
+}
+
 // Writes one glyph at the cursor. Autowraps if it would exceed cols. CELL_DOUBLE stores the glyph
 // in 1 cell but advances cur_col by w*2; subsequent chars land past the 2x visual span without manual
 // spacing. Scroll workers: scroll_lines_up/down (pure rotation), scroll_up_region (pushes displaced
@@ -2095,9 +2131,10 @@ void ConBox::put_char(wchar_t wc)
         line_feed();
     }
 
-    // reverse swaps fg/bg into the cell.
+    // reverse swaps fg/bg into the cell; dim then fades whichever color ended up in the foreground.
     COLORREF fg = cur_reverse ? cur_bg : cur_fg;
     COLORREF bg = cur_reverse ? cur_fg : cur_bg;
+    if (cur_dim) fg = DimColor(fg, bg);
     uint8_t attr = (cur_bold      ? CELL_BOLD      : 0)
                  | (cur_italic    ? CELL_ITALIC    : 0)
                  | (cur_underline ? CELL_UNDERLINE : 0)
@@ -2111,11 +2148,13 @@ void ConBox::put_char(wchar_t wc)
         line[cur_col].flags = attr | (w == 2 ? CELL_WIDE : 0);
         line[cur_col].fg = fg;
         line[cur_col].bg = bg;
+        line[cur_col].link_id = (uint8_t)cur_link_id;
         if (w == 2 && cur_col + 1 < (int)line.size()) {
             line[cur_col + 1].ch = 0;   // trail cell (the lead draws both)
             line[cur_col + 1].flags = attr;   // no CELL_WIDE on trail
             line[cur_col + 1].fg = fg;
             line[cur_col + 1].bg = bg;
+            line[cur_col + 1].link_id = (uint8_t)cur_link_id;
         }
     }
     cur_col += advance;
@@ -2264,7 +2303,15 @@ void ConBox::vt_feed(wchar_t wc)
             cur_col = next;
             return;
         }
-        if (wc == 0x07) return;   // BEL ignored
+        if (wc == 0x07) {   // BEL: audible (bit 1) and/or visual flash (bit 2) per cfg_bell_style
+            if (cfg_bell_style & 1) ::MessageBeep(MB_OK);
+            if (cfg_bell_style & 2) {
+                bell_flash_until = ::GetTickCount64() + BELL_FLASH_MS;
+                SetTimer(BELL_TIMER, BELL_FLASH_MS, nullptr);
+                Invalidate(FALSE);
+            }
+            return;
+        }
         if (wc < 0x20) return;    // other C0 ignored
         put_char(wc);
         return;
@@ -2309,7 +2356,8 @@ void ConBox::vt_feed(wchar_t wc)
             mouse_track = 0; mouse_sgr = false; mouse_btn = -1;
             cursor_visible = true;
             cur_fg = default_fg; cur_bg = default_bg;
-            cur_bold = cur_italic = cur_underline = cur_strike = cur_blink = cur_reverse = false;
+            cur_bold = cur_dim = cur_italic = cur_underline = cur_strike = cur_blink = cur_reverse = false;
+            cur_link_id = 0;
             for (int r = 0; r < rows; ++r) erase_cells(r, 0, cols);
             if (alt_active) leave_alt_screen();
             vt_state = VT_GROUND; return;
@@ -2476,9 +2524,9 @@ void ConBox::osc52(const std::wstring& arg)
 
 // Parse osc_buf ("Ps;Pt") on OSC termination. Ps 0 ("icon name + title") and 2 ("title" only) are
 // the xterm codes shells/CLIs use to set the window title; Pt is decoded to UTF-8 and forwarded via
-// title_cb. Ps 52 is clipboard access (osc52()). Any other Ps (icon name=1, color queries=4/10/11,
-// hyperlinks=8, etc.) is dropped -- ConBox has no representation for those and no callback fires.
-// A payload missing the ';' separator (malformed, or an empty OSC) is ignored.
+// title_cb. Ps 52 is clipboard access (osc52()). Ps 8 is a hyperlink (osc8()). Any other Ps (icon
+// name=1, color queries=4/10/11, etc.) is dropped -- ConBox has no representation for those and no
+// callback fires. A payload missing the ';' separator (malformed, or an empty OSC) is ignored.
 void ConBox::dispatch_osc()
 {
     size_t semi = osc_buf.find(L';');
@@ -2488,6 +2536,7 @@ void ConBox::dispatch_osc()
     try { ps = std::stoi(osc_buf.substr(0, semi)); } catch (...) { return; }
 
     if (ps == 52) { osc52(osc_buf.substr(semi + 1)); return; }
+    if (ps == 8)  { osc8(osc_buf.substr(semi + 1));  return; }
 
     if (ps != 0 && ps != 2) return;
     if (!title_cb) return;
@@ -2502,13 +2551,56 @@ void ConBox::dispatch_osc()
     title_cb(title.c_str());
 }
 
-// CSI dispatch. Drops sequences with gtlt prefix (private <>=) to avoid final-byte misparse.
+// OSC 8: arg = "<params>;<URI>" (params, e.g. "id=xxx", is ignored -- ConBox does not group
+// multi-line links by id, only marks the literal cell range the shell wraps in the sequence). An
+// empty URI closes the current link (cur_link_id = 0), matching the "ESC]8;;ST" closing form every
+// shell/CLI emits. A non-empty URI opens one: reuse an existing link_table entry with the same URI,
+// or add a new one. put_char() stamps cur_link_id onto every cell written while a link is open.
+void ConBox::osc8(const std::wstring& arg)
+{
+    size_t semi = arg.find(L';');
+    std::wstring wuri = (semi == std::wstring::npos) ? std::wstring() : arg.substr(semi + 1);
+    if (wuri.empty()) { cur_link_id = 0; return; }
+
+    int n = ::WideCharToMultiByte(CP_UTF8, 0, wuri.c_str(), (int)wuri.size(), nullptr, 0, nullptr, nullptr);
+    std::string uri;
+    if (n > 0) {
+        uri.resize(n);
+        ::WideCharToMultiByte(CP_UTF8, 0, wuri.c_str(), (int)wuri.size(), &uri[0], n, nullptr, nullptr);
+    }
+
+    for (size_t i = 1; i < link_table.size(); ++i) {
+        if (link_table[i] == uri) { cur_link_id = (int)i; return; }
+    }
+    // CharInfo::link_id is 1 byte: 256 entries (index 0 reserved) is the hard cap. Beyond it, further
+    // distinct links simply are not tracked -- the text still prints normally, just without click
+    // support (rare in practice; a screen/scrollback rarely holds more than a couple hundred distinct
+    // link targets at once).
+    if (link_table.size() >= 256) { cur_link_id = 0; return; }
+    link_table.push_back(uri);
+    cur_link_id = (int)link_table.size() - 1;
+}
+
+// CSI dispatch. Drops sequences with gtlt prefix (private <>=) to avoid final-byte misparse, with
+// XTVERSION (CSI > 0 q) as the sole answered exception.
 // Cursor: CUU/CUD/CUF/CUB/CUP/HVP/CHA/VPA/CNL/CPL. Erase: ED/EL/ECH. SGR: m.
 // Modes h/l: ?25, ?1049/47, ?1048, ?1, ?2004. Save/restore: s/u.
-// Scroll: DECSTBM r, IL/DL, ICH/DCH, SU/SD. Queries: DSR->CPR, DA->VT102.
+// Scroll: DECSTBM r, IL/DL, ICH/DCH, SU/SD. Queries: DSR->CPR, DA->VT220+color, XTVERSION->DCS.
 void ConBox::dispatch_csi(wchar_t fin)
 {
-    // Sequences prefixed with '<' '=' '>' (2nd DA, kitty keyboard protocol, XTMODKEYS...) are
+    // XTVERSION (CSI > 0 q): the one gtlt-prefixed sequence answered, so it must be handled before
+    // the blanket drop below. Reply is a DCS string, not CSI: DCS > | name(version) ST. The 'q' final
+    // byte is shared with DECSCUSR (CSI Ps SP q), but that form sets vt_space and never vt_gtlt.
+    if (vt_gtlt && fin == L'q') {
+        int ps = (vt_nparam >= 1) ? vt_params[0] : 0;
+        if (ps == 0 && input_sink != nullptr) {
+            static const char reply[] = "\x1bP>|" CONBOX_NAME "(" CONBOX_VERSION ")\x1b\\";
+            send_input_bytes(reply, (int)(sizeof(reply) - 1));   // -1 drops the NUL terminator
+        }
+        return;
+    }
+
+    // Other sequences prefixed with '<' '=' '>' (2nd DA, kitty keyboard protocol, XTMODKEYS...) are
     // unsupported. Their final byte (u/m/q...) must not be misparsed as a standard command (e.g.
     // ESC[<u being treated as restore-cursor once jumped the cursor to 0,0), so drop the whole sequence.
     if (vt_gtlt)
@@ -2599,20 +2691,21 @@ void ConBox::dispatch_csi(wchar_t fin)
         if (vt_nparam == 0) {
             // No params = reset (SGR 0).
             cur_fg = default_fg; cur_bg = default_bg;
-            cur_bold = cur_italic = cur_underline = cur_strike = cur_blink = cur_reverse = cur_double = false;
+            cur_bold = cur_dim = cur_italic = cur_underline = cur_strike = cur_blink = cur_reverse = cur_double = false;
             break;
         }
         for (int i = 0; i < vt_nparam; ++i) {
             int p = vt_params[i];
             if (p == 0)  { cur_fg = default_fg; cur_bg = default_bg;
-                           cur_bold = cur_italic = cur_underline = cur_strike = cur_blink = cur_reverse = cur_double = false; }
+                           cur_bold = cur_dim = cur_italic = cur_underline = cur_strike = cur_blink = cur_reverse = cur_double = false; }
             else if (p == 1)  cur_bold = true;
+            else if (p == 2)  cur_dim = true;
             else if (p == 3)  cur_italic = true;
             else if (p == 4)  cur_underline = true;
             else if (p == 5 || p == 6) cur_blink = true;
             else if (p == 7)  cur_reverse = true;
             else if (p == 9)  cur_strike = true;
-            else if (p == 22) cur_bold = false;
+            else if (p == 22) cur_bold = cur_dim = false;   // "normal intensity" clears both bold and dim
             else if (p == 23) cur_italic = false;
             else if (p == 24) cur_underline = false;
             else if (p == 25) cur_blink = false;
@@ -2708,10 +2801,15 @@ void ConBox::dispatch_csi(wchar_t fin)
         }
         break;
 
-    case L'c':   // DA (device attributes): answer Primary DA as VT102-compatible.
+    case L'c':   // DA (device attributes): answer Primary DA.
         if (input_sink != nullptr && (n == 0)) {
-            // ESC[?6c = VT102. Lets the child identify terminal capabilities.
-            send_input_bytes("\x1b[?6c", 5);
+            // ESC[?62;22c = VT220 class (62) with ANSI color (22). The old VT102 (?6) answer made
+            // capability-sniffing TUIs treat ConBox as a monochrome 1982 terminal despite its
+            // truecolor/mouse/OSC-52 support. Only genuinely supported extensions are listed: no
+            // sixel (4) or ReGIS (3), no DRCS (7), no rectangular editing (28), no horizontal
+            // scrolling (21), and no selective erase (6) -- DECSCA is unimplemented, so DECSED/DECSEL
+            // (CSI ? J / CSI ? K) erase protected cells like the plain forms do.
+            send_input_bytes("\x1b[?62;22c", 9);
         }
         break;
 
@@ -3237,6 +3335,30 @@ void ConBox::OnLButtonDown(UINT flags, CPoint pt)
     // Finalize any IME composition first (a click is also a composition-ending trigger).
     finalize_composition();
     ime_committed = false;   // a click is not an arrow; don't let it enable the arrow correction
+
+    // Ctrl+Click on a hyperlinked cell (OSC 8) opens it via the OS default handler instead of
+    // starting a selection or forwarding to a mouse-reporting child -- Ctrl always means "handle
+    // this locally", the same precedence Shift already has for mouse_reporting below.
+    if (::GetKeyState(VK_CONTROL) & 0x8000) {
+        int abs_row, col;
+        hit_test(pt, abs_row, col);
+        int total = (int)scrollback.size() + rows;
+        if (abs_row >= 0 && abs_row < total) {
+            const Row& line = line_at(abs_row);
+            if (col >= 0 && col < (int)line.size()) {
+                int id = line[col].link_id;
+                if (id > 0 && id < (int)link_table.size()) {
+                    int n = ::MultiByteToWideChar(CP_UTF8, 0, link_table[id].c_str(), -1, nullptr, 0);
+                    if (n > 0) {
+                        std::wstring wuri(n, 0);
+                        ::MultiByteToWideChar(CP_UTF8, 0, link_table[id].c_str(), -1, &wuri[0], n);
+                        ::ShellExecuteW(m_hWnd, L"open", wuri.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+                    }
+                    return;
+                }
+            }
+        }
+    }
 
     // Child owns the mouse: forward the press instead of starting a local selection (the child runs
     // its own selection UI and copies via OSC 52). Shift keeps the local path, as in xterm/wt.exe.
@@ -4137,7 +4259,7 @@ void ConBox::OnPaint()
                     // are already 2x via dw = 2*w*cell_w which uses the adjusted cell_w).
                     ::TextOutW(dc.GetSafeHdc(),px + 2 * adjust_left, py + dbl_base, &c.ch, 1);
                 }
-                if (c.flags & CELL_UNDERLINE)
+                if ((c.flags & CELL_UNDERLINE) || c.link_id)   // link_id: OSC 8 hyperlink underline
                     dc.FillSolidRect(CRect(px, py + cell_h - 2, px + dw, py + cell_h), fg);
                 if (c.flags & CELL_STRIKE) {
                     int my = py + dbl_base - cell_h / 2;
@@ -4163,7 +4285,7 @@ void ConBox::OnPaint()
                     }
                 }
                 // Underline and strikethrough decoration lines (drawn even on space/trail cells).
-                if (c.flags & CELL_UNDERLINE)
+                if ((c.flags & CELL_UNDERLINE) || c.link_id)   // link_id: OSC 8 hyperlink underline
                     dc.FillSolidRect(CRect(px, py + cell_h - 1, px + w * cell_w, py + cell_h), fg);
                 if (c.flags & CELL_STRIKE)
                     dc.FillSolidRect(CRect(px, py + cell_h / 2, px + w * cell_w, py + cell_h / 2 + 1), fg);
@@ -4327,6 +4449,11 @@ void ConBox::OnPaint()
 
     // Overlay scrollbar on top of everything (slim while scrollable, expanded within the hold window).
     draw_overlay_scrollbar(dc);
+
+    // Visual bell (BEL, cfg_bell_style bit 2): invert the whole frame while bell_flash_until has not
+    // passed yet (set in vt_feed; BELL_TIMER's expiry repaints once more past the deadline to end it).
+    if (bell_flash_until != 0 && ::GetTickCount64() < bell_flash_until)
+        back_dc.PatBlt(0, 0, rc.Width(), rc.Height(), DSTINVERT);
 
     // Blit the finished frame to the screen at once (no flicker). The bitmap stays a live member (freed
     // in the dtor), so it is not detached here.
@@ -5268,6 +5395,7 @@ void ConBox::OnDestroy()
     }
     KillTimer(BLINK_TIMER);
     KillTimer(SBAR_TIMER);
+    KillTimer(BELL_TIMER);
     CWnd::OnDestroy();
 }
 

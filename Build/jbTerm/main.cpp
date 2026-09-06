@@ -59,6 +59,14 @@ public:
     }
 
     LRESULT WindowProc(UINT msg, WPARAM wp, LPARAM lp) override {
+        if (msg == WM_ENDSESSION && wp && con_box) {
+            // Session is actually ending (shutdown/logoff/restart), not just being queried:
+            // force-kill the ConPTY child synchronously. The normal WM_CLOSE -> OnDestroy path
+            // relies on an async grace-period timer (CLOSE_TIMER) that may never fire if Windows
+            // tears this process down before it elapses, leaving the child as an orphan. terminate()
+            // is idempotent, so this is harmless even if the child already exited on its own.
+            con_box->terminate();
+        }
         if (msg == WM_SYSCOMMAND && con_box) {
             UINT id = (UINT)(wp & 0xFFF0);
             if (id == ID_SAVE_EMF) {

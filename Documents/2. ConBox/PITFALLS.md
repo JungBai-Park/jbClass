@@ -181,3 +181,12 @@
   failure was swallowed and `setup_from_ini()` unconditionally reported "Created with defaults" even
   when nothing was written; it now reports the failure distinctly so a bad path is visible instead of
   silently assumed to have succeeded.
+
+### 17. OnPaint Background Fill Used cur_bg (Per-Cell SGR State), Not default_bg
+
+- `OnPaint` filled the whole client rect (margins included) with `cur_bg` -- the per-cell "SGR
+  background for the next glyph to be written" state -- instead of `default_bg`. A full-screen TUI
+  actively re-coloring a mouse selection (see REQUIREMENTS #12) can leave `cur_bg` transiently holding
+  the selection-highlight color, which then leaked into the margin area on the next repaint.
+- Fix: fill the client background with `default_bg` unconditionally. `cur_bg` is per-cell state
+  consumed by `put_char`, never a stand-in for "the terminal's background color."

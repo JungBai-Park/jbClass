@@ -31,6 +31,9 @@
 //     child scrolls its own view -- holding Shift forces the local behavior back (xterm/wt.exe
 //     convention). Right click always pastes locally. OSC 52 lets the child read/write the Windows
 //     clipboard (that is how a TUI copies a selection it drew itself). All automatic; no host code.
+//   - OSC 8 hyperlinks: text the child wraps in OSC 8 is underlined; Ctrl+Click opens it via
+//     ShellExecuteW. BEL (\a): response is bell_style (INI, default 1=audible); see osc8()/vt_feed().
+//     Both automatic; no host code required.
 //   - Every string API takes UTF-8 (const char*) so C++ string literals pass directly.
 //   - Self-contained: includes its own headers, does not depend on a precompiled header.
 //   - Save .h/.cpp as ASCII (comments are ASCII-only) so encoding is unambiguous.
@@ -76,6 +79,13 @@
 #define NTDDI_VERSION 0x0A000006       // NTDDI_WIN10_RS5 (ConPTY minimum)
 #endif
 
+// Emulator identity reported to the child in the XTVERSION reply (CSI > 0 q -> DCS > | ... ST).
+// Deliberately the real name: impersonating a known emulator (XTerm etc.) would make TUIs assume
+// capabilities ConBox lacks (sixel, XTGETTCAP, kitty keyboard) and then draw garbage. Bump on
+// behavior changes a child could reasonably branch on.
+#define CONBOX_NAME     "ConBox"
+#define CONBOX_VERSION  "1.0"
+
 #include <afxwin.h>   // MFC core (CWnd, CDC, CFont); also pulls in windows.h (ConPTY HPCON etc.)
 #include <vector>
 #include <deque>
@@ -84,11 +94,13 @@
 
 // One screen cell. A double-width glyph (Korean/CJK) occupies a lead cell (CELL_WIDE set)
 // and the next cell is its trail (ch=0, skipped by the renderer). An empty cell is ch=L' '.
-// Layout: ch(2)+flags(1)+pad(1)+fg(4)+bg(4) = 12 bytes (was 16 with bool wide at the end).
+// Layout: ch(2)+flags(1)+link_id(1)+fg(4)+bg(4) = 12 bytes (was 16 with bool wide at the end).
 struct CharInfo {
     wchar_t  ch;     // UTF-16 char; 0 = trail cell of a wide glyph (render skips it)
     uint8_t  flags;  // bit field: CELL_WIDE | CELL_BOLD | CELL_ITALIC | CELL_UNDERLINE | CELL_STRIKE | CELL_BLINK | CELL_DOUBLE
-    // 1 byte compiler padding here (aligns fg to offset 4)
+    // 0 = no hyperlink; else a 1-based index into ConBox::link_table (OSC 8, see dispatch_osc/osc8).
+    // Occupies the byte that used to be pure alignment padding, so struct size is unchanged.
+    uint8_t  link_id = 0;
     COLORREF fg;
     COLORREF bg;
 };
@@ -102,6 +114,8 @@ enum {
     CELL_STRIKE    = 0x10,   // SGR 9; drawn as a 1px line at cell middle
     CELL_BLINK     = 0x20,   // SGR 5/6; glyph toggled by BLINK_TIMER
     CELL_DOUBLE    = 0x40,   // SGR 8/28; 2x-size glyph, always bold (bleeds right/upward)
+    // No CELL_DIM: SGR 2 (faint) is baked into CharInfo::fg by put_char (see DimColor), so the
+    // renderer has no dim case and dim survives copy/export like any other color.
 };
 
 typedef std::vector<CharInfo> Row;
@@ -476,6 +490,14 @@ private:
     // it has no OS clipboard access of its own and asks the terminal to do it.
     void osc52(const std::wstring& arg);
 
+    // OSC 8 (hyperlink), arg = "<params>;<URI>" (params, e.g. "id=xxx" for multi-line grouping, is
+    // ignored). Empty URI closes the current link (cur_link_id = 0); non-empty opens one, reusing an
+    // existing link_table entry with the same URI if there is one. put_char() stamps cur_link_id onto
+    // every cell written while a link is open; OnPaint underlines those cells and Ctrl+Click on one
+    // opens it via ShellExecuteW (see OnLButtonDown). link_table is capped at 255 entries (CharInfo::
+    // link_id is 1 byte); once full, further distinct links print as plain (non-clickable) text.
+    void osc8(const std::wstring& arg);
+
     // Write one glyph at the cursor (autowrapping first if past cols). A wide glyph fills the lead
     // cell and sets the next to trail (ch=0). Applies the current SGR color/attributes.
     void put_char(wchar_t wc);
@@ -794,12 +816,20 @@ private:
 
     // Current SGR attributes applied by put_char (colors use cur_fg/cur_bg).
     bool cur_bold;
+    bool cur_dim;                 // SGR 2 (faint); put_char blends the cell fg toward its bg
     bool cur_italic;
     bool cur_underline;
     bool cur_strike;
     bool cur_blink;
     bool cur_reverse;             // swap fg/bg
     bool cur_double;              // SGR 8/28; 2x-size glyph (always bold)
+
+    // OSC 8 hyperlink state (not SGR -- survives SGR resets, only changed by another OSC 8). 0 = no
+    // link; else an index into link_table stamped onto cells by put_char (see CharInfo::link_id).
+    int cur_link_id;
+    // index 0 is a reserved "" placeholder (never assigned to a cell); 1..255 map to URIs opened by
+    // osc8(). Capped at 256 entries total (CharInfo::link_id is 1 byte) -- see osc8().
+    std::vector<std::string> link_table;
 
     bool blink_on;                // blink visibility state, toggled by BLINK_TIMER
 
@@ -850,6 +880,9 @@ private:
     std::string cfg_work_dir;  // work_directory INI key (UTF-8); empty = inherit the host process's CWD
     int         cfg_lines_per_paper; // EMF export: rows per page (lines_per_paper INI key; default 50)
     int         cfg_close_kill_timeout_ms; // host-close grace period before terminate() (close_kill_timeout_ms INI key; default 250)
+    int         cfg_bell_style;      // BEL (\a) response (bell_style INI key; default 1):
+                                      // 0=none, 1=audible (MessageBeep), 2=visual (brief invert flash), 3=both
+    ULONGLONG   bell_flash_until;    // GetTickCount64() deadline for the visual bell flash; 0 = not flashing
     std::string cfg_macro_f[12];     // [macros] F1..F12 INI keys, escape-decoded (UTF-8); empty = key
                                       // keeps its normal VT sequence. Modifier state (Ctrl/Shift/Alt)
                                       // is not distinguished. F10 never reaches here (WM_SYSKEYDOWN,

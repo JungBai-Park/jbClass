@@ -106,10 +106,10 @@
       <AdditionalManifestFiles>$(ProjectDir)jbTerm.manifest</AdditionalManifestFiles>
     </Manifest>
     <PreBuildEvent>
-      <Command> ResTouch.exe $(TargetPath) $(Configuration) $(Platform)</Command>
+      <Command>ResTouch.lnk $(TargetPath) $(Configuration) $(Platform)</Command>
     </PreBuildEvent>
     <PostBuildEvent>
-      <Command> ResTouch.exe $(TargetPath) $(Configuration) $(Platform)</Command>
+      <Command>ResTouch.lnk $(TargetPath) $(Configuration) $(Platform)</Command>
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
@@ -130,10 +130,10 @@
       <AdditionalManifestFiles>$(ProjectDir)jbTerm.manifest</AdditionalManifestFiles>
     </Manifest>
     <PreBuildEvent>
-      <Command> ResTouch.exe $(TargetPath) $(Configuration) $(Platform)</Command>
+      <Command>ResTouch.lnk $(TargetPath) $(Configuration) $(Platform)</Command>
     </PreBuildEvent>
     <PostBuildEvent>
-      <Command> ResTouch.exe $(TargetPath) $(Configuration) $(Platform)</Command>
+      <Command>ResTouch.lnk $(TargetPath) $(Configuration) $(Platform)</Command>
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
@@ -152,10 +152,10 @@
       <AdditionalManifestFiles>$(ProjectDir)jbTerm.manifest</AdditionalManifestFiles>
     </Manifest>
     <PreBuildEvent>
-      <Command> ResTouch.exe $(TargetPath) $(Configuration) $(Platform)</Command>
+      <Command>ResTouch.lnk $(TargetPath) $(Configuration) $(Platform)</Command>
     </PreBuildEvent>
     <PostBuildEvent>
-      <Command> ResTouch.exe $(TargetPath) $(Configuration) $(Platform)</Command>
+      <Command>ResTouch.lnk $(TargetPath) $(Configuration) $(Platform)</Command>
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -176,10 +176,10 @@
       <AdditionalManifestFiles>$(ProjectDir)jbTerm.manifest</AdditionalManifestFiles>
     </Manifest>
     <PreBuildEvent>
-      <Command> ResTouch.exe $(TargetPath) $(Configuration) $(Platform)</Command>
+      <Command>ResTouch.lnk $(TargetPath) $(Configuration) $(Platform)</Command>
     </PreBuildEvent>
     <PostBuildEvent>
-      <Command> ResTouch.exe $(TargetPath) $(Configuration) $(Platform)</Command>
+      <Command>ResTouch.lnk $(TargetPath) $(Configuration) $(Platform)</Command>
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemGroup>

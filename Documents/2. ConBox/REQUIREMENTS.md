@@ -51,14 +51,15 @@
 - CSI support includes cursor control such as CUU, CUD, and CUP.
 - CSI support includes erase operations such as ED, EL, and ECH.
 - CSI support includes scroll region control.
-- SGR attributes include Bold, Italic, Underline, Strikethrough, Blink, and Reverse.
+- SGR attributes include Bold, Dim, Italic, Underline, Strikethrough, Blink, and Reverse. Dim (SGR 2) blends the foreground color halfway toward the background color at write time (not toward black), so contrast is reduced consistently on light and dark backgrounds alike; SGR 22 clears both Bold and Dim, per the "normal intensity" standard.
 - Blink uses a 500 ms cycle.
 - SGR 8 enables double-size rendering, and SGR 28 disables it.
 - Double-size rendering draws text on the logical grid at a 2x horizontal and vertical scale, overlapping upward and rightward. This uses the standard SGR 8 code because conhost does not discard it in the middle of the stream.
 - 256-color and True Color output are supported by default.
 - Two-byte ESC support includes ESC 7/8 (DECSC/DECRC), RI (`M`), and RIS (`c`).
 - Private sequence extensions that are likely to cause incorrect behavior are excluded.
-- OSC 0/2 (set window title) is parsed; the decoded UTF-8 title text is forwarded to the host via `set_title_cb`. Other OSC codes (icon name, color queries, hyperlinks, etc.) are dropped.
+- OSC 0/2 (set window title) is parsed; the decoded UTF-8 title text is forwarded to the host via `set_title_cb`. OSC 52 (clipboard set/query) is parsed; see section 12. Other OSC codes (icon name, color queries, hyperlinks, etc.) are dropped.
+- Terminal queries are answered: DSR (`ESC[6n` -> cursor position report, `ESC[5n` -> status OK), Primary DA (`ESC[c` -> `ESC[?62;22c`, VT220 class + ANSI color -- lists only genuinely supported extensions, e.g. no sixel/ReGIS/DRCS/selective-erase), and XTVERSION (`ESC[>0q` -> a DCS reply naming ConBox and its version). The XTVERSION reply deliberately never impersonates a known terminal (xterm, etc.): doing so would make capability-sniffing TUIs assume features ConBox lacks (sixel, kitty keyboard protocol) and then draw garbage.
 
 ### 6. Input Mapping and IME Commit Handling
 
@@ -97,6 +98,7 @@
   - the child exits naturally (`handle_child_exit`) -> the pending close is completed immediately (re-posts `WM_CLOSE` to the parent), or
   - the timer expires -> `terminate()` force-kills the child, then the close is completed the same way.
 - This is automatic for any `ConBox` registered as a `FrameBox` child (`AddNew`) -- no host application code is required. Multiple `ConBox` instances under one `FrameBox` are handled independently (each answers `WM_JBCLOSEQUERY` for itself).
+- **System shutdown/logoff (`WM_ENDSESSION`)**: the `CLOSE_TIMER` grace period above is asynchronous and may never elapse if Windows tears the process down before it fires, leaving the child as an orphan. This is NOT automatic -- a host must call `terminate()` synchronously from its own `WM_ENDSESSION` handler when `wParam != 0` (session actually ending). See `Build/jbTerm/main.cpp` (`cJbTermFrame::WindowProc`) for the pattern. `WM_QUERYENDSESSION` is deliberately left unhandled (default allows the session to end) so a shutdown later cancelled by another app does not still kill the child.
 
 ### 10. Host Notification Callbacks
 
@@ -131,3 +133,16 @@
   byte -- the only way to embed a literal `;` in a value, since the INI parser cuts a value at the
   first raw `;` before this decoding ever runs). No octal escapes. Byte-wise, so multi-byte UTF-8
   (Korean etc.) passes through unaffected.
+
+### 12. Mouse Reporting (xterm) and OSC 52 Clipboard
+
+- When the child enables xterm mouse tracking (`?1000`/`?1002`/`?1003`) together with SGR encoding
+  (`?1006`, the only encoding ConBox emits), left/middle clicks, drags, motion, and wheel notches are
+  forwarded to the child as SGR mouse sequences instead of driving local selection/scrollback --
+  letting a full-screen TUI (Claude Code, vim, htop) scroll and select on its own.
+- Holding Shift forces the local behavior back (xterm/wt.exe convention); right click always pastes
+  locally regardless of mode.
+- The overlay scrollbar is hidden outright while mouse reporting is active, matching wt.exe.
+- OSC 52 lets the child read (`?` payload) or write (base64 payload) the Windows clipboard on its own
+  behalf -- how a TUI that owns the mouse copies a selection it drew itself, since it has no OS
+  clipboard access of its own.
