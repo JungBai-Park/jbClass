@@ -10,6 +10,7 @@
 #include <string>
 #include <sstream>
 #include <map>
+#include <set>              // recognized-key tracking in setup() (report unknown settings keys)
 #include <cmath>            // std::fabs (overlay scrollbar antialiasing)
 #include <climits>          // INT_MIN (ParseTriggers "cool not given" sentinel)
 #include <imm.h>            // Korean IME (Input Method Manager)
@@ -514,8 +515,8 @@ static std::wstring ResolveExeRelativePath(const char* utf8)
     ::MultiByteToWideChar(CP_UTF8, 0, utf8, -1, &w[0], n);
     if (!w.empty() && w.back() == 0) w.pop_back();   // strip the null terminator
 
-    // Absolute path: has a drive letter (x:\...) or starts with a UNC slash.
-    bool absolute = (w.size() >= 2 && w[1] == L':') || (!w.empty() && w[0] == L'\\');
+    // Absolute path: has a drive letter (x:\... or x:/...) or starts with a UNC slash (\\ or //).
+    bool absolute = (w.size() >= 2 && w[1] == L':') || (!w.empty() && (w[0] == L'\\' || w[0] == L'/'));
     if (absolute) return w;
 
     // Relative: prepend the directory that contains the EXE.
@@ -527,13 +528,26 @@ static std::wstring ResolveExeRelativePath(const char* utf8)
     return dir + w;
 }
 
+// Decode escapes in a raw INI value (defined below; forward-declared here so ParseIniLine, which
+// comes first in the file, can apply it to every value it extracts). See the definition for the
+// full escape table.
+static std::string DecodeEscapes(const std::string& raw);
+
 // Parse one already-extracted line as "key = value" per ConBox's INI conventions: leading
 // whitespace trimmed; a line starting with ';', '#', or '[' (comment/section) is not a key=value
 // line; key is lower-cased; value is leading-trimmed, cut at the first raw ';' (inline comment;
-// ConBox INI values never contain a literal ';' -- use \x3b), then trailing-trimmed. Returns false
-// (key_out/val_out untouched) for a blank/comment/section/no-'='/empty-key line.
-static bool ParseIniLine(const std::string& line_in, std::string& key_out, std::string& val_out)
+// ConBox INI values never contain a literal ';' -- use \x3b), trailing-trimmed, then escape-decoded
+// via DecodeEscapes -- every value, for every key, comes out of this function already decoded, so
+// no caller needs (or should attempt) to decode it again. Returns false (key_out/val_out untouched)
+// for a blank/comment/section/no-'='/empty-key line.
+// malformed_out (optional): set to true only when the line has real content but is NOT a valid
+// key=value line (no '=' at all, or an empty key) -- i.e. a line the caller should probably report
+// as a mistake. Left false for a blank/comment/section line, since skipping those is normal, not
+// a mistake.
+static bool ParseIniLine(const std::string& line_in, std::string& key_out, std::string& val_out,
+                          bool* malformed_out = nullptr)
 {
+    if (malformed_out) *malformed_out = false;
     size_t start = 0;
     while (start < line_in.size() && (line_in[start] == ' ' || line_in[start] == '\t')) ++start;
     if (start >= line_in.size() || line_in[start] == ';' || line_in[start] == '#' || line_in[start] == '[')
@@ -541,12 +555,18 @@ static bool ParseIniLine(const std::string& line_in, std::string& key_out, std::
 
     std::string line = line_in.substr(start);
     size_t eq_pos = line.find('=');
-    if (eq_pos == std::string::npos) return false;
+    if (eq_pos == std::string::npos) {
+        if (malformed_out) *malformed_out = true;
+        return false;
+    }
 
     std::string key = line.substr(0, eq_pos);
     while (!key.empty() && (key.back() == ' ' || key.back() == '\t')) key.pop_back();
     for (char& c : key) c = (char)tolower((unsigned char)c);
-    if (key.empty()) return false;
+    if (key.empty()) {
+        if (malformed_out) *malformed_out = true;
+        return false;
+    }
 
     std::string val = line.substr(eq_pos + 1);
     size_t val_start = 0;
@@ -557,7 +577,7 @@ static bool ParseIniLine(const std::string& line_in, std::string& key_out, std::
     while (!val.empty() && (val.back() == '\r' || val.back() == '\n' || val.back() == ' ')) val.pop_back();
 
     key_out = std::move(key);
-    val_out = std::move(val);
+    val_out = DecodeEscapes(val);
     return true;
 }
 
@@ -574,8 +594,9 @@ static const char* SkipUtf8Bom(const char* contents)
 // Parse INI-format contents (key=value, one per line) into a key->value map (last occurrence of a
 // repeated key wins). contents: UTF-8 string with \n line endings. If nullptr, returns empty map.
 // Section headers are silently ignored so the caller can match keys regardless of which section
-// they appear in.
-static std::map<std::string, std::string> ParseIni(const char* contents)
+// they appear in. problems_out (optional): a malformed line (real content, but no '=' or an empty
+// key -- see ParseIniLine) appends a report to it instead of being silently dropped.
+static std::map<std::string, std::string> ParseIni(const char* contents, std::string* problems_out = nullptr)
 {
     std::map<std::string, std::string> m;
     if (!contents) return m;
@@ -583,16 +604,25 @@ static std::map<std::string, std::string> ParseIni(const char* contents)
 
     std::istringstream ss(contents);
     std::string line, key, val;
-    while (std::getline(ss, line))
-        if (ParseIniLine(line, key, val)) m[key] = val;
+    while (std::getline(ss, line)) {
+        bool malformed = false;
+        if (ParseIniLine(line, key, val, &malformed))
+            m[key] = val;
+        else if (malformed && problems_out)
+            *problems_out += "ConBox: ignored malformed settings line (no '='): \"" + line + "\"\r\n";
+    }
     return m;
 }
 
-// Decode a [macros] INI value's escapes: \r \b \a \t \n \f \v \\ \" \' \? and \xHH (2-digit hex,
+// Decode escapes in an INI value: \r \b \a \t \n \f \v \\ \" \' \? and \xHH (2-digit hex,
 // case-insensitive, any byte). No octal escapes. An unrecognized \X keeps X literally (backslash
 // dropped). Byte-wise scan (not wchar_t), so multi-byte UTF-8 (Korean etc.) passes through
 // untouched -- none of its bytes equal the ASCII backslash that triggers an escape.
-static std::string DecodeMacroEscapes(const std::string& raw)
+// Applied to EVERY value by ParseIniLine (single point, see above) -- not just [macros]/[triggers].
+// A path/cmdline value that needs a literal backslash must double it ("\\"), same as a C string
+// literal; a plain "/" needs no escaping at all and is accepted everywhere a path is used (Win32
+// path APIs and ResolveExeRelativePath's absolute-path check both treat "/" like "\").
+static std::string DecodeEscapes(const std::string& raw)
 {
     std::string out;
     out.reserve(raw.size());
@@ -634,10 +664,10 @@ static std::string DecodeMacroEscapes(const std::string& raw)
 // it before the next "match" (or EOF). A group is discarded (not registered) if, by then, "match"
 // or "send" is empty or missing -- same "empty INI value == unset" convention as e.g.
 // work_directory above (an empty suffix would match every line, so match is checked too). A group
-// with no "cool" (or an empty one) defaults to -1 (fire once). match/send both go through
-// DecodeMacroEscapes, same as [macros]. Appends newly found rules to `out` -- never clears or
-// replaces existing entries, so a layered setup()/setup_from_ini() call can only add triggers (see
-// setup()'s layering comment).
+// with no "cool" (or an empty one) defaults to -1 (fire once). match/send arrive already
+// escape-decoded (ParseIniLine does it for every value) -- do not decode them again here. Appends
+// newly found rules to `out` -- never clears or replaces existing entries, so a layered
+// setup()/setup_from_ini() call can only add triggers (see setup()'s layering comment).
 static void ParseTriggers(const char* contents, std::vector<Trigger>& out)
 {
     if (!contents) return;
@@ -649,7 +679,7 @@ static void ParseTriggers(const char* contents, std::vector<Trigger>& out)
 
     auto flush = [&]() {
         if (have_group && !match.empty() && !send.empty())
-            out.push_back({ DecodeMacroEscapes(match), DecodeMacroEscapes(send), (cool == INT_MIN ? -1 : cool) });
+            out.push_back({ match, send, (cool == INT_MIN ? -1 : cool) });
         have_group = false; match.clear(); send.clear(); cool = INT_MIN;
     };
 
@@ -683,11 +713,13 @@ static COLORREF ParseColor(const std::string& s, COLORREF def)
 // include_titlebar: write the [titlebar] block only if the host has already registered
 // set_titlebar_color_cb (otherwise those keys would have no way to take effect, so omitting them
 // keeps a fresh default INI from suggesting a feature that is not wired up).
-static void CreateDefaultIni(const wchar_t* path, bool include_titlebar)
+// Returns false if the file could not be created (e.g. an invalid path) so the caller can report
+// the failure instead of claiming success.
+static bool CreateDefaultIni(const wchar_t* path, bool include_titlebar)
 {
     FILE* f = nullptr;
     _wfopen_s(&f, path, L"w");
-    if (!f) return;
+    if (!f) return false;
     static const unsigned char utf8_bom[3] = { 0xEF, 0xBB, 0xBF };
     fwrite(utf8_bom, 1, sizeof(utf8_bom), f);   // text mode only rewrites \n; raw BOM bytes pass through untouched
     fputs(
@@ -811,6 +843,7 @@ static void CreateDefaultIni(const wchar_t* path, bool include_titlebar)
         "cool  =                 ; 사용된 후 재사용 될 때까지의 대기시간 (비워져 있으면 1회성으로 사용됨)\n",
         f);
     fclose(f);
+    return true;
 }
 
 // Apply INI-format settings from a string. contents: UTF-8 with \n line endings.
@@ -828,8 +861,14 @@ void ConBox::setup(const char* contents)
     bool first = !setup_ran;
     setup_ran = true;
 
-    std::map<std::string, std::string> m = ParseIni(contents);
+    // problems: malformed lines (ParseIni) plus unrecognized keys (below, once every known key has
+    // been looked up) are appended to ini_msg -- the same deferred message setup_from_ini() uses, so
+    // either source (a file or a direct setup() call, e.g. jbTerm's command-line settings) is printed
+    // the same way once the window exists (see open()).
+    std::map<std::string, std::string> m = ParseIni(contents, &ini_msg);
+    std::set<std::string> recognized;   // every key name looked up below, via get()/geti() or [triggers]
     auto get = [&](const char* k) -> const std::string* {
+        recognized.insert(k);
         auto it = m.find(k);
         return (it != m.end()) ? &it->second : nullptr;
     };
@@ -925,19 +964,31 @@ void ConBox::setup(const char* contents)
     cfg_close_kill_timeout_ms = geti("close_kill_timeout_ms", first ? 250 : cfg_close_kill_timeout_ms);
     if (cfg_close_kill_timeout_ms < 0) cfg_close_kill_timeout_ms = 0;
 
-    // [macros] F1..F12: raw text -> escape-decoded macro (empty = no macro for that key).
+    // [macros] F1..F12: value is already escape-decoded by ParseIniLine (empty = no macro for that key).
     static const char* const fkeys[12] = {
         "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11", "f12"
     };
     for (int i = 0; i < 12; ++i)
-        if (const std::string* s = get(fkeys[i])) cfg_macro_f[i] = DecodeMacroEscapes(*s);
+        if (const std::string* s = get(fkeys[i])) cfg_macro_f[i] = *s;
 
     // [triggers]: append this layer's match=/send=/cool= groups (see ParseTriggers). Unlike every
     // setting above, a later layer can only add triggers -- it cannot remove or override ones an
-    // earlier layer already registered.
+    // earlier layer already registered. match/send/cool are parsed by ParseTriggers directly (not
+    // via get() above), so mark them recognized by hand or they would be falsely reported as unknown.
+    recognized.insert("match");
+    recognized.insert("send");
+    recognized.insert("cool");
     size_t triggers_before = cfg_triggers.size();
     ParseTriggers(contents, cfg_triggers);
     active_trigger_count += (int)(cfg_triggers.size() - triggers_before);
+
+    // Report any key this layer's text defined that nothing above ever looked up -- a typo'd or
+    // unsupported setting name, otherwise silently ignored. Deferred into ini_msg like every other
+    // diagnostic here (see the ParseIni() call above).
+    for (const auto& kv : m) {
+        if (recognized.find(kv.first) == recognized.end())
+            ini_msg += "ConBox: ignored unrecognized setting key: \"" + kv.first + " = " + kv.second + "\"\r\n";
+    }
 }
 
 // Load settings from an INI file.  Sections are ignored; keys are matched by name only.
@@ -945,6 +996,8 @@ void ConBox::setup(const char* contents)
 // - File not found: auto-created with compiled-in defaults at the resolved path; a status message is
 //   appended to ini_msg and printed by open() once the window exists. Settings stay at whatever the
 //   previous setup()/setup_from_ini() call resolved (constructor defaults on the very first call).
+//   If creation also fails (e.g. the path is not a valid filename), ini_msg reports that instead of
+//   claiming success, so a bad path is visible rather than silently swallowed.
 // - File found but cannot be opened: same deferred append-and-print path, no settings changed.
 // Calling this more than once (e.g. a global INI then a local override INI) appends each call's
 // status message rather than replacing it, so a "file not found" from an earlier call is not lost
@@ -964,8 +1017,10 @@ void ConBox::setup_from_ini(const char* path)
     };
 
     if (::GetFileAttributesW(wide_path.c_str()) == INVALID_FILE_ATTRIBUTES) {
-        CreateDefaultIni(wide_path.c_str(), titlebar_color_cb != nullptr);
-        ini_msg += "ConBox: INI file not found. Created with defaults:\r\n" + w2u(wide_path) + "\r\n";
+        if (CreateDefaultIni(wide_path.c_str(), titlebar_color_cb != nullptr))
+            ini_msg += "ConBox: INI file not found. Created with defaults:\r\n" + w2u(wide_path) + "\r\n";
+        else
+            ini_msg += "ConBox: INI file not found and could not be created (check the path/filename):\r\n" + w2u(wide_path) + "\r\n";
         return;
     }
 
@@ -4439,6 +4494,35 @@ std::vector<std::string> ConBox::get_text_lines() const
     return result;
 }
 
+// save_text: writes get_text_lines() to path as UTF-8 with BOM, CRLF line endings.
+// The BOM lets Windows text editors (Notepad included) auto-detect UTF-8 instead of
+// misreading the file as the system ANSI codepage.
+bool ConBox::save_text(const char* path)
+{
+    if (!path || !*path) return false;
+
+    int wlen = ::MultiByteToWideChar(CP_UTF8, 0, path, -1, NULL, 0);
+    if (wlen <= 0) return false;
+    std::vector<wchar_t> wpath(wlen);
+    ::MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath.data(), wlen);
+
+    HANDLE hf = ::CreateFileW(wpath.data(), GENERIC_WRITE, 0, NULL,
+                              CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hf == INVALID_HANDLE_VALUE) return false;
+
+    static const unsigned char bom[3] = { 0xEF, 0xBB, 0xBF };
+    DWORD written;
+    ::WriteFile(hf, bom, sizeof(bom), &written, NULL);
+
+    std::vector<std::string> lines = get_text_lines();
+    for (const std::string& line : lines) {
+        ::WriteFile(hf, line.c_str(), (DWORD)line.size(), &written, NULL);
+        ::WriteFile(hf, "\r\n", 2, &written, NULL);
+    }
+    ::CloseHandle(hf);
+    return true;
+}
+
 
 // Open or close the raw child-output log file. Bytes are written in pump() before VT parsing so
 // VT codes are preserved exactly as the child emitted them (no conversion, no CR/LF translation).
@@ -4506,19 +4590,63 @@ static std::vector<wchar_t> Utf8ToWide(const char* s)
     return out;
 }
 
+// Format a Win32 error code into a UTF-8, single-line message via FormatMessageW (system locale
+// text, e.g. Korean on this OS's default locale; trailing CR/LF the system message often carries is
+// trimmed). Falls back to a bare "error <n>" if the system has no text for the code.
+static std::string FormatWin32Error(DWORD err)
+{
+    wchar_t* buf = nullptr;
+    DWORD len = ::FormatMessageW(
+        FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+        NULL, err, 0, (LPWSTR)&buf, 0, NULL);
+    std::string msg;
+    if (len > 0 && buf != nullptr) {
+        while (len > 0 && (buf[len - 1] == L'\r' || buf[len - 1] == L'\n')) --len;
+        int n = ::WideCharToMultiByte(CP_UTF8, 0, buf, (int)len, nullptr, 0, nullptr, nullptr);
+        if (n > 0) {
+            msg.resize(n);
+            ::WideCharToMultiByte(CP_UTF8, 0, buf, (int)len, &msg[0], n, nullptr, nullptr);
+        }
+    }
+    if (buf != nullptr) ::LocalFree(buf);
+    if (msg.empty()) {
+        char fallback[32];
+        sprintf_s(fallback, sizeof(fallback), "error %lu", (unsigned long)err);
+        msg = fallback;
+    }
+    return msg;
+}
+
+// Format an HRESULT (e.g. from CreatePseudoConsole) into a UTF-8 message. Most failures here wrap a
+// plain Win32 error (FACILITY_WIN32), so those are unwrapped and rendered via FormatWin32Error; any
+// other HRESULT (no readable system text for it) falls back to its bare hex value.
+static std::string FormatHResultError(HRESULT hr)
+{
+    if (HRESULT_FACILITY(hr) == FACILITY_WIN32)
+        return FormatWin32Error((DWORD)HRESULT_CODE(hr));
+    char buf[32];
+    sprintf_s(buf, sizeof(buf), "hr 0x%08lX", (unsigned long)hr);
+    return buf;
+}
+
 // Make the input/output pipe pair and a pseudo console (CreatePseudoConsole). The PTY-side ends (the
 // child's input read end, output write end) are closed by the caller after spawn. The ends we keep
-// (in_write, out_read) are returned for the members.
+// (in_write, out_read) are returned for the members. On failure, err_out gets a human-readable
+// diagnostic (GetLastError()/HRESULT captured immediately at each failing call, before any cleanup
+// CloseHandle can overwrite it) so the caller can show the caller why ConPTY setup failed.
 static bool CreatePtyPipes(int cols, int rows,
     HPCON& h_pc_out, HANDLE& in_write_out, HANDLE& out_read_out,
-    HANDLE& pty_in_read_out, HANDLE& pty_out_write_out)
+    HANDLE& pty_in_read_out, HANDLE& pty_out_write_out, std::string& err_out)
 {
     HANDLE in_read = nullptr, in_write = nullptr;
     HANDLE out_read = nullptr, out_write = nullptr;
 
-    if (!::CreatePipe(&in_read, &in_write, NULL, 0))
+    if (!::CreatePipe(&in_read, &in_write, NULL, 0)) {
+        err_out = "CreatePipe: " + FormatWin32Error(::GetLastError());
         return false;
+    }
     if (!::CreatePipe(&out_read, &out_write, NULL, 0)) {
+        err_out = "CreatePipe: " + FormatWin32Error(::GetLastError());
         ::CloseHandle(in_read);
         ::CloseHandle(in_write);
         return false;
@@ -4530,6 +4658,7 @@ static bool CreatePtyPipes(int cols, int rows,
     HPCON pc = nullptr;
     HRESULT hr = ::CreatePseudoConsole(size, in_read, out_write, 0, &pc);
     if (FAILED(hr)) {
+        err_out = "CreatePseudoConsole: " + FormatHResultError(hr);
         ::CloseHandle(in_read);
         ::CloseHandle(in_write);
         ::CloseHandle(out_read);
@@ -4556,10 +4685,19 @@ bool ConBox::start()
 // pump: PeekNamedPipe -> ReadFile -> print. Exit detection: ConPTY keeps output pipe open after
 // child exits (no EOF); poll WaitForSingleObject instead -> handle_child_exit -> stop -> exit_cb.
 // OnDestroy calls stop(). With no start(), ConPTY members stay dormant (pure view mode).
+// Every failure branch below prints a diagnostic to the screen before returning false (window always
+// exists here -- start() runs after open()), so a failed launch is visible instead of silently inert.
+// Where the failing API sets one, its GetLastError()/HRESULT is captured immediately at the failing
+// call, before any cleanup call (CloseHandle/HeapFree/...) that could overwrite it; HeapAlloc (does
+// not reliably set one) and the UTF-8 conversion (not a Win32 API call) use a fixed message instead.
 bool ConBox::start(const char* cmdline)
 {
     // Restart if already running.
     stop();
+
+    // Safe for display in the failure messages below even if the caller passed nullptr (Utf8ToWide
+    // tolerates null too, but the std::string concatenations here do not).
+    const char* cmdline_disp = cmdline ? cmdline : "(null)";
 
     // Size the child console to the current grid (always matched).
     int c = this->cols;
@@ -4569,8 +4707,10 @@ bool ConBox::start(const char* cmdline)
 
     // Pipes + pseudo console. The PTY-side ends are closed after spawn.
     HANDLE pty_in_read = nullptr, pty_out_write = nullptr;
-    if (!CreatePtyPipes(c, r, h_pc, in_write, out_read, pty_in_read, pty_out_write)) {
+    std::string pipe_err;
+    if (!CreatePtyPipes(c, r, h_pc, in_write, out_read, pty_in_read, pty_out_write, pipe_err)) {
         stop();
+        print(("ConBox: failed to start \"" + std::string(cmdline_disp) + "\": " + pipe_err + "\r\n").c_str());
         return false;
     }
 
@@ -4588,16 +4728,22 @@ bool ConBox::start(const char* cmdline)
         ::CloseHandle(pty_in_read);
         ::CloseHandle(pty_out_write);
         stop();
+        // HeapAlloc does not reliably set GetLastError() on failure, so this is a fixed message
+        // rather than a FormatWin32Error() lookup.
+        print(("ConBox: failed to start \"" + std::string(cmdline_disp) + "\": HeapAlloc out of memory\r\n").c_str());
         return false;
     }
     if (!::InitializeProcThreadAttributeList(si.lpAttributeList, 1, 0, &attr_bytes) ||
         !::UpdateProcThreadAttribute(si.lpAttributeList, 0,
             PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE_HANDLE,
             h_pc, sizeof(h_pc), NULL, NULL)) {
+        DWORD attr_err = ::GetLastError();   // capture before HeapFree/CloseHandle below can overwrite it
         ::HeapFree(::GetProcessHeap(), 0, si.lpAttributeList);
         ::CloseHandle(pty_in_read);
         ::CloseHandle(pty_out_write);
         stop();
+        print(("ConBox: failed to start \"" + std::string(cmdline_disp) + "\": " +
+               FormatWin32Error(attr_err) + " (error " + std::to_string(attr_err) + ")\r\n").c_str());
         return false;
     }
 
@@ -4609,6 +4755,8 @@ bool ConBox::start(const char* cmdline)
         ::CloseHandle(pty_in_read);
         ::CloseHandle(pty_out_write);
         stop();
+        // Not a Win32 API failure (cmdline was empty or not valid UTF-8) -- no GetLastError() to report.
+        print(("ConBox: failed to start: cmdline \"" + std::string(cmdline_disp) + "\" is empty or not valid UTF-8\r\n").c_str());
         return false;
     }
 
@@ -4632,6 +4780,8 @@ bool ConBox::start(const char* cmdline)
         work_dir_arg,    // lpCurrentDirectory: NULL = inherit this process's CWD
         &si.StartupInfo,
         &child_proc);
+    // Capture immediately: DeleteProcThreadAttributeList/HeapFree/CloseHandle below can overwrite it.
+    DWORD create_err = ok ? 0 : ::GetLastError();
 
     ::DeleteProcThreadAttributeList(si.lpAttributeList);
     ::HeapFree(::GetProcessHeap(), 0, si.lpAttributeList);
@@ -4644,6 +4794,11 @@ bool ConBox::start(const char* cmdline)
     if (!ok) {
         ZeroMemory(&child_proc, sizeof(child_proc));
         stop();
+        // Report the failure on screen (the window always exists here -- start() runs after open()) so
+        // a bad cmdline (typo, missing exe, no permission, ...) is visible instead of silently inert.
+        std::string msg = "ConBox: failed to start \"" + std::string(cmdline_disp) + "\": " +
+                           FormatWin32Error(create_err) + " (error " + std::to_string(create_err) + ")\r\n";
+        print(msg.c_str());
         return false;
     }
 

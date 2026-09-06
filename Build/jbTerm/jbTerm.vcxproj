@@ -105,6 +105,12 @@
     <Manifest>
       <AdditionalManifestFiles>$(ProjectDir)jbTerm.manifest</AdditionalManifestFiles>
     </Manifest>
+    <PreBuildEvent>
+      <Command> ResTouch.exe $(TargetPath) $(Configuration) $(Platform)</Command>
+    </PreBuildEvent>
+    <PostBuildEvent>
+      <Command> ResTouch.exe $(TargetPath) $(Configuration) $(Platform)</Command>
+    </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
     <ClCompile>
@@ -123,6 +129,12 @@
     <Manifest>
       <AdditionalManifestFiles>$(ProjectDir)jbTerm.manifest</AdditionalManifestFiles>
     </Manifest>
+    <PreBuildEvent>
+      <Command> ResTouch.exe $(TargetPath) $(Configuration) $(Platform)</Command>
+    </PreBuildEvent>
+    <PostBuildEvent>
+      <Command> ResTouch.exe $(TargetPath) $(Configuration) $(Platform)</Command>
+    </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <ClCompile>
@@ -139,6 +151,12 @@
     <Manifest>
       <AdditionalManifestFiles>$(ProjectDir)jbTerm.manifest</AdditionalManifestFiles>
     </Manifest>
+    <PreBuildEvent>
+      <Command> ResTouch.exe $(TargetPath) $(Configuration) $(Platform)</Command>
+    </PreBuildEvent>
+    <PostBuildEvent>
+      <Command> ResTouch.exe $(TargetPath) $(Configuration) $(Platform)</Command>
+    </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <ClCompile>
@@ -157,6 +175,12 @@
     <Manifest>
       <AdditionalManifestFiles>$(ProjectDir)jbTerm.manifest</AdditionalManifestFiles>
     </Manifest>
+    <PreBuildEvent>
+      <Command> ResTouch.exe $(TargetPath) $(Configuration) $(Platform)</Command>
+    </PreBuildEvent>
+    <PostBuildEvent>
+      <Command> ResTouch.exe $(TargetPath) $(Configuration) $(Platform)</Command>
+    </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="..\..\Source\ConBox.cpp" />
@@ -166,6 +190,9 @@
   <ItemGroup>
     <ClInclude Include="..\..\Source\ConBox.h" />
     <ClInclude Include="..\..\Source\FrameBox.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="jbTerm.rc" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

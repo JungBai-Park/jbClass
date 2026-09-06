@@ -953,6 +953,10 @@ bool FrameBox::create_window(DWORD exStyle, DWORD style, CWnd* parent, const CRe
         wc.style         = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS; // DBLCLKS: edit-mode commit
         wc.lpfnWndProc   = ::DefWindowProcW;
         wc.hInstance     = AfxGetInstanceHandle();
+        // Resource ID 128 is the project convention for the app's main icon (matches the
+        // classic MFC AppWizard's IDR_MAINFRAME default); missing resource ID 128 in the
+        // calling exe leaves hIcon null (no icon), which is harmless.
+        wc.hIcon         = ::LoadIconW(AfxGetInstanceHandle(), MAKEINTRESOURCEW(128));
         wc.hCursor       = ::LoadCursorW(nullptr, (LPCWSTR)IDC_ARROW);
         wc.lpszClassName = L"FrameBox";
         ::RegisterClassExW(&wc);

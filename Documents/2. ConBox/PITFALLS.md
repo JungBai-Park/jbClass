@@ -166,3 +166,18 @@
   then added `ParseTriggers()` which walks the raw INI text in line order (not through the map) and
   groups `match=`/`send=`/`cool=` runs itself. `ParseIni()`'s map is still used for every other
   (non-repeating) key.
+
+### 16. setup_from_ini() Auto-Creates a Default File on a Missing Path -- Do Not Probe Existence With It
+
+- `setup_from_ini(path)` treats "file not found" as "first run": it writes a fresh default INI to the
+  resolved path via `CreateDefaultIni()` and defers a status message, then returns WITHOUT applying any
+  settings from that call. It is not a passive existence check.
+- Implication for a host that wants a priority list of candidate config paths (e.g. an exe-local file
+  overriding a shared one): calling `setup_from_ini()` speculatively on the higher-priority candidate
+  just to "see if it's there" creates that file on the very first run and permanently shadows every
+  lower-priority candidate on every later run. Check existence with `GetFileAttributesW` (or similar)
+  FIRST, and only call `setup_from_ini()` on a path already confirmed to exist.
+- `CreateDefaultIni()` returns `bool` (false if `_wfopen_s` fails, e.g. an invalid path). Previously the
+  failure was swallowed and `setup_from_ini()` unconditionally reported "Created with defaults" even
+  when nothing was written; it now reports the failure distinctly so a bad path is visible instead of
+  silently assumed to have succeeded.

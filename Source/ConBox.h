@@ -221,6 +221,10 @@ public:
     // setup_from_ini(): the first call ever made (to either function) establishes compiled-in
     // defaults for absent keys; subsequent calls keep the previous layer's resolved value for any
     // key the new contents does not mention.
+    // Two more problem classes append to ini_msg the same way as setup_from_ini()'s own messages
+    // (deferred print() once the window exists): a line with real content but no '=' at all, and a
+    // "key=value" line whose key nothing in setup() recognizes (e.g. a typo) -- both previously
+    // failed or applied with no feedback.
     void setup(const char* contents);
 
     // Export all content (scrollback + screen) to a series of EMF vector files in dir (UTF-8 path).
@@ -250,6 +254,10 @@ public:
     //   Double English (CELL_DOUBLE):           2 cells (lead + 1 blank from 2x advance).
     //   Double Korean  (CELL_WIDE|CELL_DOUBLE): 4 cells (lead + trail + 2 blanks from 4x advance).
     std::vector<std::string> get_text_lines() const;
+
+    // Save get_text_lines() to a plain text file (UTF-8 with BOM, CRLF line endings).
+    // path: UTF-8 output file path. Returns false if the file could not be created.
+    bool save_text(const char* path);
 
     // Start or stop raw child-output logging. file_name (UTF-8 path): open/create the file and begin
     // logging; each raw byte from the child (VT codes intact, no CR/LF conversion, no encoding
@@ -302,7 +310,10 @@ public:
     // INI key) if set -- a relative value is resolved against the EXE directory, same as an INI
     // path -- otherwise the child inherits this process's current directory (CreateProcessW default).
     // The no-arg overload uses cfg_cmdline set by setup_from_ini() (also called automatically by
-    // open() when cfg_cmdline is non-empty).
+    // open() when cfg_cmdline is non-empty). On ANY failure along the way (ConPTY pipe/attribute
+    // setup or the final CreateProcessW) prints a diagnostic to the screen before returning false, so
+    // a bad cmdline (typo, missing exe, no permission, ...) is visible, not silently inert; where the
+    // failing API sets one, the message includes its GetLastError()/HRESULT system text.
     bool start();
     bool start(const char* cmdline);
 
@@ -798,7 +809,7 @@ private:
                                           // Append-only: every setup()/setup_from_ini() layer can only
                                           // add rules, never remove or override ones already loaded.
     int         active_trigger_count;    // count of cfg_triggers not yet permanently fired (see Trigger)
-    std::string ini_msg;             // deferred message from setup_from_ini(); printed by open() once the window exists
+    std::string ini_msg;             // deferred message from setup_from_ini()/setup(); printed by open() once the window exists
     bool        setup_ran;           // false until setup() first applies content; see setup()'s layering comment
 
     // Double-buffer cache reused by OnPaint (not recreated each frame).

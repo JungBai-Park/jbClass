@@ -141,3 +141,14 @@ This project adopts a modular architecture, with the PITFALLS.md files located a
   but only produces a harmless 1-line blip on its own.
 - This is a CBM/tree-sitter parsing limitation, not a project code defect (all affected files
   compile cleanly).
+
+### 15. Command-Line Arguments: `__argv` Is Not UTF-8, Use `__wargv`
+
+- `main(int argc, const char* argv[])` fed from `__argc`/`__argv` (narrow) receives command-line text
+  in the process's ANSI codepage (e.g. CP949 on Korean Windows), NOT UTF-8, even though every other
+  string boundary in this project is UTF-8. Passing `argv[i]` straight into a UTF-8-expecting function
+  garbles any non-ASCII (Korean) argument.
+- Use the parallel CRT global `__wargv` (wide, correctly Unicode-decoded regardless of codepage) and
+  convert each argument to UTF-8 with `WideCharToMultiByte(CP_UTF8, ...)` before use.
+- `__wargv` is populated automatically by the CRT startup alongside `__argv`/`__argc` -- no extra init
+  needed, even in an MFC app entered via `WinMain`/`CWinApp` rather than a `wmain`.
