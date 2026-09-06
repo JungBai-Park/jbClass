@@ -25,6 +25,12 @@
 //     set_resize_sink) BEFORE setup()/setup_from_ini(): set_titlebar_color_cb in particular must be
 //     registered first, or a freshly created default INI (no file existed yet) omits [titlebar]
 //     (see CreateDefaultIni/set_titlebar_color_cb).
+//   - Mouse: local drag-selection/overlay scrollbar by default. When the child turns on xterm mouse
+//     tracking (?1000/?1002/?1003 with ?1006 SGR encoding, as Claude Code / vim / htop do), clicks,
+//     drags and wheel notches go to the CHILD instead, the overlay scrollbar is hidden, and the
+//     child scrolls its own view -- holding Shift forces the local behavior back (xterm/wt.exe
+//     convention). Right click always pastes locally. OSC 52 lets the child read/write the Windows
+//     clipboard (that is how a TUI copies a selection it drew itself). All automatic; no host code.
 //   - Every string API takes UTF-8 (const char*) so C++ string literals pass directly.
 //   - Self-contained: includes its own headers, does not depend on a precompiled header.
 //   - Save .h/.cpp as ASCII (comments are ASCII-only) so encoding is unambiguous.
@@ -359,6 +365,8 @@ protected:
     afx_msg void OnMouseLeave();   // clears gutter hover so the overlay scrollbar can fade
     // Right click pastes the clipboard to the child stdin.
     afx_msg void OnRButtonDown(UINT flags, CPoint pt);
+    afx_msg void OnMButtonDown(UINT flags, CPoint pt);   // forwarded to the child while mouse_reporting()
+    afx_msg void OnMButtonUp(UINT flags, CPoint pt);
     // Drag-and-drop: sends dropped file paths to child stdin (quoted if the path contains spaces).
     afx_msg void OnDropFiles(HDROP hdrop);
     afx_msg void OnTimer(UINT_PTR id);
@@ -456,9 +464,17 @@ private:
 
     // Parse the accumulated OSC payload (osc_buf, "Ps;Pt") on BEL/ST. Ps 0 or 2 (set window title,
     // the xterm convention Claude Code and most shells use) decodes Pt to UTF-8 and forwards it via
-    // title_cb; any other Ps (icon name, color queries, etc.) is dropped -- ConBox has no
-    // representation for those. A payload with no ';' is ignored.
+    // title_cb; Ps 52 goes to osc52(). Any other Ps (icon name, color queries, etc.) is dropped --
+    // ConBox has no representation for those. A payload with no ';' is ignored.
     void dispatch_osc();
+
+    // OSC 52 (clipboard access by the child), arg = "<targets>;<payload>" (targets c/p/s... ignored;
+    // everything maps to the single Windows clipboard).
+    //   payload "?"  : query -- reply ESC ] 52 ; c ; <base64> ST with the clipboard's current text.
+    //   payload else : base64 of UTF-8 text to put on the clipboard (empty payload clears it).
+    // This is how a TUI that owns the mouse (see mouse_report) copies a selection it made itself:
+    // it has no OS clipboard access of its own and asks the terminal to do it.
+    void osc52(const std::wstring& arg);
 
     // Write one glyph at the cursor (autowrapping first if past cols). A wide glyph fills the lead
     // cell and sets the next to trail (ch=0). Applies the current SGR color/attributes.
@@ -558,6 +574,26 @@ private:
     void hit_test(CPoint pt, int& abs_row, int& col) const;
     void copy_selection();
     void clear_selection();
+
+    // === Mouse reporting (xterm mouse tracking) ===
+    // True while the child has asked for mouse events AND for SGR encoding (?1006), the only
+    // encoding ConBox emits. Every local mouse gesture (selection, overlay scrollbar, wheel
+    // scrollback) defers to the child while this holds, EXCEPT when Shift is down (xterm/wt.exe
+    // convention: Shift forces the terminal's own handling) and except the right button, which
+    // stays a local paste. The overlay scrollbar is hidden outright (sbar_geometry returns false),
+    // so a scrolling TUI is driven by the wheel alone -- same as wt.exe.
+    bool mouse_reporting() const;
+
+    // Client pixel coords -> 0-based cell column/row of the VISIBLE screen (clamped to the grid).
+    // Unlike hit_test this never indexes scrollback: the child only knows about its own screen.
+    // Returns false when the grid metrics are not ready yet (cell_w/cell_h still 0).
+    bool mouse_cell(CPoint pt, int& row, int& col) const;
+
+    // Encode one event as SGR (?1006) -- ESC [ < Cb ; col ; row M (press) / m (release) -- and send
+    // it to the child. btn: 0=left 1=middle 2=right, 3=none (motion with no button), 64/65=wheel
+    // up/down; caller adds 32 for motion. Alt/Ctrl modifier bits are added here; Shift never is
+    // (a Shift gesture is handled locally and never reaches this).
+    void mouse_report(int btn, bool press, CPoint pt);
 
     // If an IME composition is in progress, force-commit it so the completed glyph's UTF-8 reaches the
     // child first. Call right before sending a composition-ending trigger (arrows/Home/End/Delete/
@@ -770,6 +806,19 @@ private:
     // Input modes the child turns on via DEC private modes; change key encoding / paste.
     bool app_cursor_keys;         // DECCKM (?1): arrows as ESC O x instead of ESC [ x
     bool bracketed_paste;         // ?2004: wrap pastes in ESC[200~ ... ESC[201~
+
+    // === Mouse reporting state (see mouse_reporting()) ===
+    // Full-screen TUIs (Claude Code, vim, htop) turn tracking on to run their own selection and
+    // scrolling; without it a wheel notch does nothing on the alt screen, since the terminal's own
+    // scrollback is frozen there and the child never hears about the wheel.
+    int  mouse_track;             // 0=off, or the active tracking mode: 1000 (clicks only),
+                                  // 1002 (clicks + motion while a button is held), 1003 (all motion)
+    bool mouse_sgr;               // ?1006: SGR encoding. Only encoding emitted, so reporting needs it.
+    int  mouse_btn;               // button currently held and being reported (0/1), -1 = none. Also
+                                  // marks "this press was forwarded", so its release is too even if
+                                  // the child turned tracking off mid-drag.
+    int  mouse_last_row;          // last cell reported by motion; motion is sent only on a cell change
+    int  mouse_last_col;          // (a pixel-level report per WM_MOUSEMOVE would flood the child)
 
     // === Mouse drag selection state ===
     // anchor = drag start cell (fixed on button down), end = current drag cell (live). Stored

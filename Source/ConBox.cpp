@@ -368,6 +368,11 @@ ConBox::ConBox()
     vt_priv = false;
     vt_gtlt = false;
     vt_space = false;
+    mouse_track = 0;
+    mouse_sgr = false;
+    mouse_btn = -1;
+    mouse_last_row = -1;
+    mouse_last_col = -1;
     ime_committed = false;
     cur_bold = false;
     cur_italic = false;
@@ -2301,6 +2306,7 @@ void ConBox::vt_feed(wchar_t wc)
             scroll_top = 0; scroll_bot = rows - 1;
             app_cursor_keys = false;
             bracketed_paste = false;
+            mouse_track = 0; mouse_sgr = false; mouse_btn = -1;
             cursor_visible = true;
             cur_fg = default_fg; cur_bg = default_bg;
             cur_bold = cur_italic = cur_underline = cur_strike = cur_blink = cur_reverse = false;
@@ -2354,21 +2360,137 @@ void ConBox::vt_feed(wchar_t wc)
     }
 }
 
+static const char BASE64_ALPHA[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+// Base64 (RFC 4648) for OSC 52 payloads. Encode always pads; decode skips any char outside the
+// alphabet (whitespace, '=' padding) so a payload split across lines still decodes.
+static std::string Base64Encode(const std::string& in)
+{
+    std::string out;
+    out.reserve((in.size() + 2) / 3 * 4);
+    size_t i = 0;
+    while (i + 2 < in.size()) {
+        unsigned v = ((unsigned char)in[i] << 16) | ((unsigned char)in[i+1] << 8) | (unsigned char)in[i+2];
+        out += BASE64_ALPHA[(v >> 18) & 63]; out += BASE64_ALPHA[(v >> 12) & 63];
+        out += BASE64_ALPHA[(v >>  6) & 63]; out += BASE64_ALPHA[v & 63];
+        i += 3;
+    }
+    if (i < in.size()) {
+        unsigned v = (unsigned char)in[i] << 16;
+        bool two = (i + 1 < in.size());
+        if (two) v |= (unsigned char)in[i+1] << 8;
+        out += BASE64_ALPHA[(v >> 18) & 63];
+        out += BASE64_ALPHA[(v >> 12) & 63];
+        out += two ? BASE64_ALPHA[(v >> 6) & 63] : '=';
+        out += '=';
+    }
+    return out;
+}
+
+static std::string Base64Decode(const std::string& in)
+{
+    std::string out;
+    unsigned acc = 0;
+    int bits = 0;
+    for (size_t i = 0; i < in.size(); ++i) {
+        const char* p = strchr(BASE64_ALPHA, in[i]);
+        if (p == nullptr || in[i] == '\0') continue;   // padding / whitespace / stray byte
+        acc = (acc << 6) | (unsigned)(p - BASE64_ALPHA);
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out += (char)((acc >> bits) & 0xFF);
+        }
+    }
+    return out;
+}
+
+// OSC 52: clipboard access requested by the child (see the header for the payload forms). A TUI that
+// took the mouse over (mouse_reporting) draws and tracks its own selection, so this is its only way
+// to put that text on the Windows clipboard -- and to read it back.
+void ConBox::osc52(const std::wstring& arg)
+{
+    // arg = "<targets>;<payload>"; targets (c/p/s/0-7, possibly several) all map to the one Windows
+    // clipboard, so only the payload matters.
+    size_t semi = arg.find(L';');
+    if (semi == std::wstring::npos) return;
+    std::wstring wpayload = arg.substr(semi + 1);
+
+    // The payload is base64 (or "?"), i.e. ASCII; drop anything else rather than mangling it.
+    std::string payload;
+    payload.reserve(wpayload.size());
+    for (size_t i = 0; i < wpayload.size(); ++i)
+        if (wpayload[i] < 128) payload += (char)wpayload[i];
+
+    if (payload == "?") {
+        // Query: hand the child the clipboard's text back, base64 of UTF-8, terminated with ST.
+        if (input_sink == nullptr) return;
+        std::string utf8;
+        if (::OpenClipboard(m_hWnd)) {
+            HANDLE h = ::GetClipboardData(CF_UNICODETEXT);
+            if (h != NULL) {
+                const wchar_t* p = (const wchar_t*)::GlobalLock(h);
+                if (p != NULL) {
+                    int n = ::WideCharToMultiByte(CP_UTF8, 0, p, (int)wcslen(p), nullptr, 0, nullptr, nullptr);
+                    if (n > 0) {
+                        utf8.resize(n);
+                        ::WideCharToMultiByte(CP_UTF8, 0, p, (int)wcslen(p), &utf8[0], n, nullptr, nullptr);
+                    }
+                    ::GlobalUnlock(h);
+                }
+            }
+            ::CloseClipboard();
+        }
+        std::string reply = "\x1b]52;c;" + Base64Encode(utf8) + "\x1b\\";
+        send_input_bytes(reply.c_str(), (int)reply.size());
+        return;
+    }
+
+    // Write: base64 of UTF-8 text -> Windows clipboard. An empty payload clears it (xterm behavior).
+    std::string utf8 = Base64Decode(payload);
+    std::wstring text;
+    if (!utf8.empty()) {
+        int n = ::MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), (int)utf8.size(), nullptr, 0);
+        if (n <= 0) return;
+        text.resize(n);
+        ::MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), (int)utf8.size(), &text[0], n);
+    }
+
+    if (!::OpenClipboard(m_hWnd)) return;
+    ::EmptyClipboard();
+    if (!text.empty()) {
+        size_t bytes = (text.size() + 1) * sizeof(wchar_t);
+        HGLOBAL hg = ::GlobalAlloc(GMEM_MOVEABLE, bytes);
+        if (hg) {
+            wchar_t* p = (wchar_t*)::GlobalLock(hg);
+            if (p) {
+                memcpy(p, text.c_str(), text.size() * sizeof(wchar_t));
+                p[text.size()] = L'\0';
+                ::GlobalUnlock(hg);
+                ::SetClipboardData(CF_UNICODETEXT, hg);
+            }
+        }
+    }
+    ::CloseClipboard();
+}
+
 // Parse osc_buf ("Ps;Pt") on OSC termination. Ps 0 ("icon name + title") and 2 ("title" only) are
 // the xterm codes shells/CLIs use to set the window title; Pt is decoded to UTF-8 and forwarded via
-// title_cb. Any other Ps (icon name=1, color queries=4/10/11, hyperlinks=8, etc.) is dropped --
-// ConBox has no representation for those and no callback fires. A payload missing the ';' separator
-// (malformed, or an empty OSC) is ignored.
+// title_cb. Ps 52 is clipboard access (osc52()). Any other Ps (icon name=1, color queries=4/10/11,
+// hyperlinks=8, etc.) is dropped -- ConBox has no representation for those and no callback fires.
+// A payload missing the ';' separator (malformed, or an empty OSC) is ignored.
 void ConBox::dispatch_osc()
 {
-    if (!title_cb) return;
-
     size_t semi = osc_buf.find(L';');
     if (semi == std::wstring::npos) return;
 
     int ps;
     try { ps = std::stoi(osc_buf.substr(0, semi)); } catch (...) { return; }
+
+    if (ps == 52) { osc52(osc_buf.substr(semi + 1)); return; }
+
     if (ps != 0 && ps != 2) return;
+    if (!title_cb) return;
 
     std::wstring text = osc_buf.substr(semi + 1);
     int n = ::WideCharToMultiByte(CP_UTF8, 0, text.c_str(), (int)text.size(), nullptr, 0, nullptr, nullptr);
@@ -2545,6 +2667,25 @@ void ConBox::dispatch_csi(wchar_t fin)
                 if (set) { saved_cur = { cur_row, cur_col }; }
                 else { cur_row = saved_cur.row; cur_col = saved_cur.col; clamp_cursor(); }
             }
+            else if (n == 1000 || n == 1002 || n == 1003 || n == 1006) {
+                // Mouse tracking. A TUI usually turns several on at once (?1000h ?1002h ?1003h ?1006h);
+                // the last tracking mode set wins, and turning one off ends tracking entirely.
+                // ?1006 (SGR encoding) is tracked separately -- see mouse_reporting().
+                bool was = mouse_reporting();
+                if (n == 1006) mouse_sgr = set;
+                else           mouse_track = set ? n : 0;
+                if (mouse_reporting() != was) {
+                    // Handing the mouse over (or taking it back) invalidates any local gesture in
+                    // flight and flips the overlay scrollbar's visibility.
+                    if (selecting || sbar_dragging) {
+                        selecting = false; sbar_dragging = false;
+                        if (::GetCapture() == m_hWnd) ::ReleaseCapture();
+                    }
+                    mouse_btn = -1;
+                    clear_selection();
+                    if (::IsWindow(m_hWnd)) Invalidate();
+                }
+            }
             // Other private modes (?7 autowrap is always on, etc.) ignored.
         }
         break;
@@ -2653,6 +2794,10 @@ UINT ConBox::OnGetDlgCode()
 bool ConBox::sbar_geometry(CRect& track, CRect& thumb) const
 {
     if (alt_active)
+        return false;
+    // The child owns the mouse: hide the bar outright (wt.exe does the same -- a scrolling TUI is
+    // driven by the wheel alone). Every gutter gesture is gated on this, so nothing stays clickable.
+    if (mouse_reporting())
         return false;
     int total = (int)scrollback.size() + rows;
     int maxtop = total - rows;            // == scrollback size
@@ -2875,8 +3020,59 @@ void ConBox::draw_overlay_scrollbar(CDC& dc)
     }
 }
 
+// ===== Mouse reporting (xterm mouse tracking, SGR encoding) =====
+
+bool ConBox::mouse_reporting() const
+{
+    return mouse_track != 0 && mouse_sgr;
+}
+
+bool ConBox::mouse_cell(CPoint pt, int& row, int& col) const
+{
+    if (cell_w <= 0 || cell_h <= 0 || cols <= 0 || rows <= 0)
+        return false;
+    col = (pt.x - origin_x) / cell_w;
+    row = (pt.y - origin_y) / cell_h;
+    if (col < 0) col = 0;
+    if (col > cols - 1) col = cols - 1;
+    if (row < 0) row = 0;
+    if (row > rows - 1) row = rows - 1;
+    return true;
+}
+
+void ConBox::mouse_report(int btn, bool press, CPoint pt)
+{
+    if (input_sink == nullptr)
+        return;
+    int row, col;
+    if (!mouse_cell(pt, row, col))
+        return;
+
+    // Modifier bits (xterm): +8 alt/meta, +16 ctrl. Shift (+4) never appears -- a Shift gesture is
+    // handled locally and never reaches here.
+    if (::GetKeyState(VK_MENU)    & 0x8000) btn += 8;
+    if (::GetKeyState(VK_CONTROL) & 0x8000) btn += 16;
+
+    char buf[48];
+    int len = wsprintfA(buf, "\x1b[<%d;%d;%d%c", btn, col + 1, row + 1, press ? 'M' : 'm');
+    send_input_bytes(buf, len);
+}
+
 BOOL ConBox::OnMouseWheel(UINT flags, short zDelta, CPoint pt)
 {
+    // Child owns the mouse: forward each notch as SGR button 64 (up) / 65 (down) so it scrolls its
+    // own view. This is what makes a full-screen TUI (Claude Code etc.) scrollable at all -- the
+    // terminal's own scrollback is frozen while it runs. Shift keeps the local scrollback path.
+    if (mouse_reporting() && !(flags & MK_SHIFT)) {
+        CPoint cp = pt;
+        ScreenToClient(&cp);   // WM_MOUSEWHEEL delivers SCREEN coords, unlike the other mouse messages
+        int notches = abs((int)zDelta) / WHEEL_DELTA;
+        if (notches < 1) notches = 1;
+        for (int i = 0; i < notches; ++i)
+            mouse_report(zDelta > 0 ? 64 : 65, true, cp);
+        return TRUE;
+    }
+
     // Scrollback view is frozen on the alt screen (the child owns the screen); ignore the wheel.
     if (alt_active)
         return TRUE;
@@ -3042,6 +3238,17 @@ void ConBox::OnLButtonDown(UINT flags, CPoint pt)
     finalize_composition();
     ime_committed = false;   // a click is not an arrow; don't let it enable the arrow correction
 
+    // Child owns the mouse: forward the press instead of starting a local selection (the child runs
+    // its own selection UI and copies via OSC 52). Shift keeps the local path, as in xterm/wt.exe.
+    if (mouse_reporting() && !(flags & MK_SHIFT)) {
+        clear_selection();
+        mouse_btn = 0;
+        mouse_cell(pt, mouse_last_row, mouse_last_col);
+        SetCapture();   // keep receiving motion/release once the drag leaves the window
+        mouse_report(0, true, pt);
+        return;
+    }
+
     // Overlay scrollbar: a press anywhere in the gutter drives the bar, not text selection.
     // Buttons scroll 1 line; thumb drag; track click pages. Done before sel state so a scroll
     // gesture never starts/clears a selection.
@@ -3105,6 +3312,17 @@ void ConBox::OnLButtonDblClk(UINT flags, CPoint pt)
     // one-cell selection + SetCapture); we supersede it here by clearing selecting/capture first.
     if (selecting) { ReleaseCapture(); selecting = false; }
 
+    // Child owns the mouse: the window class has CS_DBLCLKS, so a fast second press arrives here
+    // instead of OnLButtonDown -- report it as a plain press (xterm reports no double-click of its
+    // own; the child does that timing itself) so a double-click gesture is not swallowed.
+    if (mouse_reporting() && !(flags & MK_SHIFT)) {
+        mouse_btn = 0;
+        mouse_cell(pt, mouse_last_row, mouse_last_col);
+        SetCapture();
+        mouse_report(0, true, pt);
+        return;
+    }
+
     // Gutter click: ignore (same gate as OnLButtonDown).
     CRect track, thumb;
     if (sbar_geometry(track, thumb)) {
@@ -3148,6 +3366,16 @@ void ConBox::OnLButtonDblClk(UINT flags, CPoint pt)
 
 void ConBox::OnLButtonUp(UINT flags, CPoint pt)
 {
+    // Release of a press that was forwarded to the child. Keyed on mouse_btn, not mouse_reporting(),
+    // so a child that turns tracking off mid-drag still gets a matching release (and we still drop
+    // the capture we took).
+    if (mouse_btn == 0) {
+        mouse_btn = -1;
+        ReleaseCapture();
+        mouse_report(0, false, pt);
+        return;
+    }
+
     // End a thumb drag (if any) before the selection path.
     if (sbar_dragging) {
         sbar_dragging = false;
@@ -3177,6 +3405,23 @@ void ConBox::OnLButtonUp(UINT flags, CPoint pt)
 
 void ConBox::OnMouseMove(UINT flags, CPoint pt)
 {
+    // Child owns the mouse: report motion per its tracking mode -- 1002 only while a button is held
+    // (drag), 1003 always, 1000 never. One report per cell change, not per pixel, or a wide window
+    // would flood the child with near-duplicate events.
+    if (mouse_reporting() && !(flags & MK_SHIFT)) {
+        bool held = (mouse_btn >= 0);
+        if (mouse_track == 1003 || (mouse_track == 1002 && held)) {
+            int row, col;
+            if (mouse_cell(pt, row, col) && (row != mouse_last_row || col != mouse_last_col)) {
+                mouse_last_row = row;
+                mouse_last_col = col;
+                // +32 = motion flag; button 3 = "no button held" (xterm's motion-without-drag code).
+                mouse_report((held ? mouse_btn : 3) + 32, true, pt);
+            }
+        }
+        return;   // no local hover/selection while the child has the mouse
+    }
+
     // Dragging the overlay thumb: map the cursor y to view_top (inverse of sbar_geometry's thumb_y).
     if (sbar_dragging) {
         CRect track, thumb;
@@ -3252,8 +3497,32 @@ void ConBox::OnRButtonDown(UINT flags, CPoint pt)
     finalize_composition();
     ime_committed = false;   // a click is not an arrow; don't let it enable the arrow correction
     clear_selection();
-    // Paste the clipboard to the child stdin.
+    // Paste the clipboard to the child stdin. Deliberately NOT forwarded while mouse_reporting():
+    // right-click-pastes is the terminal's own convention (wt.exe behaves the same), and the child
+    // gets the text as ordinary typed input, at its own input cursor, wherever the click landed.
     paste_clipboard();
+}
+
+// Middle button has no local meaning, so it is simply forwarded whenever the child is tracking.
+void ConBox::OnMButtonDown(UINT flags, CPoint pt)
+{
+    if (!mouse_reporting() || (flags & MK_SHIFT))
+        return;
+    finalize_composition();
+    ime_committed = false;
+    mouse_btn = 1;
+    mouse_cell(pt, mouse_last_row, mouse_last_col);
+    SetCapture();
+    mouse_report(1, true, pt);
+}
+
+void ConBox::OnMButtonUp(UINT flags, CPoint pt)
+{
+    if (mouse_btn != 1)
+        return;
+    mouse_btn = -1;
+    ReleaseCapture();
+    mouse_report(1, false, pt);
 }
 
 void ConBox::OnDropFiles(HDROP hdrop)
@@ -3288,7 +3557,7 @@ void ConBox::OnDropFiles(HDROP hdrop)
 // Korean IME: committed part (GCS_RESULTSTR) sent to child; uncommitted (GCS_COMPSTR) held in
 // comp_str, drawn by ConBox (hollow outline at cursor; return 0 suppresses system inline+WM_CHAR).
 // Mid-line: ScrollDC shifts line right to preview insertion. finalize_composition force-commits
-// before trigger keys (order: [committed][trigger]). ime_committed gates Left/Right correction
+// before trigger keys (order: [committed][trigger]). ime_committed gates the arrow correction
 // after a commit (MS IME pre-commits before the arrow WM_KEYDOWN; finalize return value unusable).
 LRESULT ConBox::OnImeStart(WPARAM w, LPARAM l)
 {
@@ -3668,19 +3937,20 @@ void ConBox::OnKeyDown(UINT vk, UINT rep, UINT flags)
         }
         ime_committed = false;   // consumed: only a commit immediately before this key counts
 
-        // IME compose-finalize horizontal-arrow fix: committing the glyph inserts it and advances the
-        // child cursor one glyph to the RIGHT, so a plain Left/Right then lands one glyph off from the
-        // glyph's visible (composing) cell. Make the arrow act relative to that cell:
-        //   Right: the commit already moved right one glyph (== the intended right move) -> swallow it.
-        //   Left : send Left once more so the extra Left cancels the commit's advance and the normal
-        //          Left below then moves one glyph left (net -1).
+        // IME compose-finalize arrow fix: committing the glyph inserts it and advances the child
+        // cursor one glyph to the RIGHT, so a plain arrow then acts one glyph off from the glyph's
+        // visible (composing) cell. Make the arrow act relative to that cell:
+        //   Right       : the commit already moved right one glyph (== the intended right move) -> swallow it.
+        //   Left/Up/Down: send Left once more so the extra Left cancels the commit's advance; the real
+        //                 key below then acts from the composing cell (Left: net one glyph left;
+        //                 Up/Down: lands on the composing glyph's column, not one glyph past it).
         // Only for unmodified arrows; Ctrl/Shift+arrow (word move / selection) keep their raw behavior.
         bool plain = !tctrl && !tshift;
         if (committed && plain && vk == VK_RIGHT) {
             bump_cursor();
             return;
         }
-        if (committed && plain && vk == VK_LEFT)
+        if (committed && plain && (vk == VK_LEFT || vk == VK_UP || vk == VK_DOWN))
             terminal_keydown(VK_LEFT, false, false);    // extra Left offsets the commit's right advance
 
         if (terminal_keydown(vk, tctrl, tshift))
@@ -3763,7 +4033,11 @@ void ConBox::OnPaint()
     // All drawing below targets the memory DC.
     CDC& dc = back_dc;
 
-    dc.FillSolidRect(rc, cur_bg);
+    // Whole client rect (margin/bezel included) gets the terminal's fixed default background, NOT
+    // cur_bg (the per-cell "current SGR background for the next glyph" state, which can transiently
+    // hold a highlight color -- e.g. while the child is redrawing a mouse-driven selection with a
+    // colored background -- and must never leak outside the actual cell grid).
+    dc.FillSolidRect(rc, default_bg);
 
     // Glyphs: fill the cell background, then draw transparent. TA_BASELINE aligns Korean and English baselines.
     dc.SetBkMode(TRANSPARENT);
@@ -5016,6 +5290,8 @@ BEGIN_MESSAGE_MAP(ConBox, CWnd)
     ON_WM_MOUSEMOVE()
     ON_WM_MOUSELEAVE()
     ON_WM_RBUTTONDOWN()
+    ON_WM_MBUTTONDOWN()
+    ON_WM_MBUTTONUP()
     ON_WM_DROPFILES()
     ON_WM_SETFOCUS()
     ON_WM_KILLFOCUS()
