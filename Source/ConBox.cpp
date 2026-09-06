@@ -45,6 +45,13 @@ static const UINT_PTR CLOSE_TIMER = 5;
 // final Invalidate to end the flash) in OnTimer once BELL_FLASH_MS has passed.
 static const UINT_PTR BELL_TIMER = 6;
 static const UINT     BELL_FLASH_MS = 120;
+// Auto-repeat for a held overlay-scrollbar arrow/track press (thumb drag needs none -- it already
+// tracks continuously via OnMouseMove). Two-stage like a native scrollbar/spin control: SetTimer is
+// first armed at the slower SBAR_REPEAT_DELAY_MS so a plain click never double-fires, then re-armed
+// at the faster SBAR_REPEAT_MS on the first tick (OnTimer) for continuous repeat while held.
+static const UINT_PTR SBAR_REPEAT_TIMER     = 7;
+static const UINT     SBAR_REPEAT_DELAY_MS  = 300;   // held-but-not-yet-repeating delay
+static const UINT     SBAR_REPEAT_MS        = 50;    // steady repeat interval once armed
 
 // Overlay scrollbar geometry/tuning (px / ms / alpha). Tuned to read like wt.exe: while scrollable it
 // is ALWAYS visible as a slim translucent bar hugging the right edge (no fade-out); on hover/drag or
@@ -499,6 +506,11 @@ ConBox::ConBox()
     sbar_hover = false;
     sbar_dragging = false;
     sbar_drag_off = 0;
+    sbar_repeat_active = false;
+    sbar_repeat_fast = false;
+    sbar_repeat_up = false;
+    sbar_repeat_arrow = false;
+    sbar_repeat_pt = CPoint(0, 0);
 
     // Double-buffer cache is created on the first OnPaint.
     back_bmp_saved = nullptr;
@@ -1640,6 +1652,19 @@ void ConBox::OnTimer(UINT_PTR id)
         Invalidate(FALSE);
         return;
     }
+    if (id == SBAR_REPEAT_TIMER) {
+        // First tick lands after the initial (slower) SBAR_REPEAT_DELAY_MS. Fire once, then re-arm the
+        // SAME timer id at the faster SBAR_REPEAT_MS -- just once (sbar_repeat_fast guards it) -- and
+        // from then on SetTimer's own periodic re-firing keeps it going at that rate with no further
+        // Kill/SetTimer calls per tick.
+        sbar_fire(sbar_repeat_up, sbar_repeat_arrow, sbar_repeat_pt);
+        if (!sbar_repeat_fast) {
+            sbar_repeat_fast = true;
+            KillTimer(SBAR_REPEAT_TIMER);
+            SetTimer(SBAR_REPEAT_TIMER, SBAR_REPEAT_MS, NULL);
+        }
+        return;
+    }
     if (id == SBAR_TIMER) {
         // Overlay scrollbar fade in/out. The expanded form ramps toward a target opacity: 255 while
         // hovering/dragging or within the hold window (fade in / stay), 0 once the hold expires (fade
@@ -2770,8 +2795,9 @@ void ConBox::dispatch_csi(wchar_t fin)
                 if (mouse_reporting() != was) {
                     // Handing the mouse over (or taking it back) invalidates any local gesture in
                     // flight and flips the overlay scrollbar's visibility.
-                    if (selecting || sbar_dragging) {
+                    if (selecting || sbar_dragging || sbar_repeat_active) {
                         selecting = false; sbar_dragging = false;
+                        if (sbar_repeat_active) { sbar_repeat_active = false; KillTimer(SBAR_REPEAT_TIMER); }
                         if (::GetCapture() == m_hWnd) ::ReleaseCapture();
                     }
                     mouse_btn = -1;
@@ -2889,19 +2915,16 @@ UINT ConBox::OnGetDlgCode()
 
 // Compute the gutter (track) and thumb rects for the current view. Returns false when there is nothing
 // to scroll (no scrollback, or the alt screen owns the surface), in which case the bar is not drawn.
+//
+// THUMBLESS MODE: while the child is mouse-reporting this returns true with an EMPTY thumb
+// (thumb.IsRectEmpty()). The child owns the scroll position then -- it scrolls its own view in
+// response to forwarded wheel notches, so ConBox knows neither the total extent nor where in it the
+// view currently sits, and any thumb it drew would be a lie. The track and arrow buttons stay valid,
+// because "scroll up/down by one notch" needs no position at all. Every caller must handle the empty
+// thumb: skip drawing it (draw_overlay_scrollbar) and turn presses into forwarded notches rather than
+// local view_top moves (sbar_hit callers).
 bool ConBox::sbar_geometry(CRect& track, CRect& thumb) const
 {
-    if (alt_active)
-        return false;
-    // The child owns the mouse: hide the bar outright (wt.exe does the same -- a scrolling TUI is
-    // driven by the wheel alone). Every gutter gesture is gated on this, so nothing stays clickable.
-    if (mouse_reporting())
-        return false;
-    int total = (int)scrollback.size() + rows;
-    int maxtop = total - rows;            // == scrollback size
-    if (maxtop <= 0)
-        return false;
-
     CRect rc;
     GetClientRect(&rc);
     if (rc.Height() <= 0 || rc.Width() <= 0)
@@ -2914,6 +2937,23 @@ bool ConBox::sbar_geometry(CRect& track, CRect& thumb) const
     int track_h = track.Height();
     if (track_h <= 0)
         return false;
+
+    // Child owns the mouse (and with it the scroll position): thumbless bar, see the note above.
+    // Checked before alt_active on purpose -- a full-screen TUI is usually on the alt screen AND
+    // mouse-reporting, and there the forwarding bar is exactly what is wanted.
+    if (mouse_reporting()) {
+        thumb.SetRectEmpty();
+        return true;
+    }
+    // Alt screen without mouse reporting: nothing to scroll locally and nobody to forward to.
+    if (alt_active)
+        return false;
+
+    int total = (int)scrollback.size() + rows;
+    int maxtop = total - rows;            // == scrollback size
+    if (maxtop <= 0)
+        return false;
+
     int thumb_h = (int)((double)track_h * rows / total);
     int min_thumb = to_px(SBAR_MIN_THUMB);
     if (thumb_h < min_thumb) thumb_h = min_thumb;
@@ -2928,6 +2968,80 @@ bool ConBox::sbar_geometry(CRect& track, CRect& thumb) const
     int tx = track.left + (track.Width() - thumb_w) / 2;
     thumb.SetRect(tx, thumb_y, tx + thumb_w, thumb_y + thumb_h);
     return true;
+}
+
+// The full-width gutter rect (buttons + track), used for hit-testing and for invalidating the strip.
+// Always SBAR_W wide even in the slim state, so the thin idle bar stays easy to grab.
+CRect ConBox::sbar_gutter() const
+{
+    CRect rc;
+    GetClientRect(&rc);
+    return CRect(rc.right - to_px(SBAR_W), rc.top, rc.right, rc.bottom);
+}
+
+// Geometry is recomputed fresh on every call (not cached from the initial press) because scrollback
+// can keep growing for as long as an arrow/track is held, which shifts maxtop; a stale maxtop would
+// clamp the wrong way. mode/direction, in contrast, are fixed at the initial press by the caller.
+void ConBox::sbar_fire(bool up, bool arrow, CPoint pt)
+{
+    CRect track, thumb;
+    if (!sbar_geometry(track, thumb))
+        return;   // scrollback drained or the child let go of the mouse mid-hold -- nothing to do
+    if (thumb.IsRectEmpty()) {
+        // Thumbless mode: forward wheel notches, same as a single press (see OnLButtonDown).
+        int notches = arrow ? 1 : (rows / 4);
+        if (notches < 1) notches = 1;
+        for (int i = 0; i < notches; ++i)
+            mouse_report(up ? 64 : 65, true, pt);
+        return;
+    }
+    int maxtop = (int)scrollback.size();
+    int step = arrow ? 1 : rows;
+    int nt = view_top + (up ? -step : step);
+    if (nt < 0) nt = 0;
+    if (nt > maxtop) nt = maxtop;
+    if (nt != view_top) { view_top = nt; update_scrollbar(); Invalidate(); }
+}
+
+// True when a press at pt belongs to the overlay bar rather than to text selection or to the child,
+// filling in the geometry for the caller. In thumbless mode (child owns the mouse) the gutter is live
+// ONLY while it is actually on screen, i.e. sbar_hover: the bar draws nothing at rest there, and an
+// invisible strip must not steal a click the TUI expects in its own last column. Entering the gutter
+// always sets sbar_hover first (OnMouseMove), so a deliberate click on the arrows still lands.
+bool ConBox::sbar_hit(CPoint pt, CRect& track, CRect& thumb) const
+{
+    if (!sbar_geometry(track, thumb))
+        return false;
+    if (thumb.IsRectEmpty() && !sbar_hover)
+        return false;
+    return sbar_gutter().PtInRect(pt) != FALSE;
+}
+
+// Update sbar_hover for the current pointer position: entering the gutter shows the bar and arms
+// WM_MOUSELEAVE, leaving it lets the hold/fade run. Called from both OnMouseMove paths -- the gutter
+// is the terminal's own UI, so it keeps hovering even while the child owns the rest of the surface.
+void ConBox::sbar_track_hover(CPoint pt)
+{
+    CRect track, thumb;
+    bool has = sbar_geometry(track, thumb);
+    bool in  = has && sbar_gutter().PtInRect(pt);
+    if (in && !sbar_hover) {
+        sbar_hover = true;
+        TRACKMOUSEEVENT tme;
+        tme.cbSize = sizeof(tme);
+        tme.dwFlags = TME_LEAVE;
+        tme.hwndTrack = m_hWnd;
+        tme.dwHoverTime = 0;
+        ::TrackMouseEvent(&tme);
+        sbar_show();
+    }
+    else if (!in && sbar_hover) {
+        sbar_hover = false;   // off the gutter (still in the window): let the hold/fade run
+        if (has) {
+            CRect gutter_rc = sbar_gutter();
+            InvalidateRect(&gutter_rc, FALSE);
+        }
+    }
 }
 
 // Arm the expanded overlay: (re)start the hold window and the fade timer, which ramps sbar_fade up
@@ -3100,13 +3214,18 @@ void ConBox::draw_overlay_scrollbar(CDC& dc)
     // hugging the right edge, SBAR_SLIM_OP opacity) and the full thumb (sbar_fade 255: SBAR_THUMB_W
     // wide, centered in the gutter, opcap opacity). Width, x-position and opacity interpolate linearly
     // with sbar_fade, so it visibly thins/thickens and slides instead of cross-fading two shapes.
-    int slim_right = rc_full.right - to_px(SBAR_SLIM_GAP);
-    int slim_left  = slim_right - to_px(SBAR_SLIM_W);
-    int bl = slim_left  + (thumb.left  - slim_left ) * sbar_fade / 255;
-    int br = slim_right + (thumb.right - slim_right) * sbar_fade / 255;
-    int op = SBAR_SLIM_OP + (opcap - SBAR_SLIM_OP) * sbar_fade / 255;
-    CRect bar(bl, thumb.top, br, thumb.bottom);
-    DrawRoundedThumb(dc, bar, thumb_color, op, to_px(SBAR_RADIUS), 255);
+    // Skipped entirely in thumbless mode (see sbar_geometry): with no honest position to point at,
+    // there is also no slim idle bar -- the gutter + arrows below are the whole bar, so it shows on
+    // hover and fades back to nothing, instead of leaving a permanent strip that means nothing.
+    if (!thumb.IsRectEmpty()) {
+        int slim_right = rc_full.right - to_px(SBAR_SLIM_GAP);
+        int slim_left  = slim_right - to_px(SBAR_SLIM_W);
+        int bl = slim_left  + (thumb.left  - slim_left ) * sbar_fade / 255;
+        int br = slim_right + (thumb.right - slim_right) * sbar_fade / 255;
+        int op = SBAR_SLIM_OP + (opcap - SBAR_SLIM_OP) * sbar_fade / 255;
+        CRect bar(bl, thumb.top, br, thumb.bottom);
+        DrawRoundedThumb(dc, bar, thumb_color, op, to_px(SBAR_RADIUS), 255);
+    }
 
     // Arrow buttons fade in/out with the gutter.
     if (sbar_fade > 0) {
@@ -3360,6 +3479,45 @@ void ConBox::OnLButtonDown(UINT flags, CPoint pt)
         }
     }
 
+    // Overlay scrollbar: a press anywhere in the gutter drives the bar, not text selection and not a
+    // click forwarded to the child. Buttons scroll 1 line; thumb drag; track click pages. Done before
+    // the mouse-reporting forward below (the gutter is the terminal's own UI, not the child's surface)
+    // and before sel state, so a scroll gesture never starts/clears a selection.
+    CRect track, thumb;
+    if (sbar_hit(pt, track, thumb)) {
+        CRect gutter = sbar_gutter();
+        int bh = to_px(SBAR_BTN_H);
+        CRect btn_up(gutter.left, gutter.top, gutter.right, gutter.top + bh);
+        CRect btn_dn(gutter.left, gutter.bottom - bh, gutter.right, gutter.bottom);
+        if (!thumb.IsRectEmpty() && thumb.PtInRect(pt)) {
+            // Grab the thumb; keep the grab offset so it does not jump under the cursor. Continuous
+            // drag already tracks in OnMouseMove, so no auto-repeat timer is needed here.
+            sbar_dragging = true;
+            sbar_drag_off = pt.y - thumb.top;
+            SetCapture();
+        } else {
+            // Arrow or track: fire once immediately, then arm auto-repeat while the button stays down
+            // (native scrollbar/spin-control convention -- see SBAR_REPEAT_DELAY_MS/SBAR_REPEAT_MS).
+            // Direction/kind are fixed here at the initial press; sbar_fire() re-reads live geometry
+            // on every repeat so it keeps working if scrollback grows or the mode flips mid-hold.
+            bool up    = btn_up.PtInRect(pt) ? true
+                       : btn_dn.PtInRect(pt) ? false
+                       : thumb.IsRectEmpty() ? (pt.y < track.CenterPoint().y)
+                                             : (pt.y < thumb.top);
+            bool arrow = btn_up.PtInRect(pt) || btn_dn.PtInRect(pt);
+            sbar_fire(up, arrow, pt);
+            sbar_repeat_active = true;
+            sbar_repeat_fast   = false;
+            sbar_repeat_up     = up;
+            sbar_repeat_arrow  = arrow;
+            sbar_repeat_pt     = pt;
+            SetTimer(SBAR_REPEAT_TIMER, SBAR_REPEAT_DELAY_MS, NULL);
+            SetCapture();   // so ButtonUp still stops the repeat even if the cursor drifts off the button
+        }
+        sbar_show();
+        return;
+    }
+
     // Child owns the mouse: forward the press instead of starting a local selection (the child runs
     // its own selection UI and copies via OSC 52). Shift keeps the local path, as in xterm/wt.exe.
     if (mouse_reporting() && !(flags & MK_SHIFT)) {
@@ -3369,46 +3527,6 @@ void ConBox::OnLButtonDown(UINT flags, CPoint pt)
         SetCapture();   // keep receiving motion/release once the drag leaves the window
         mouse_report(0, true, pt);
         return;
-    }
-
-    // Overlay scrollbar: a press anywhere in the gutter drives the bar, not text selection.
-    // Buttons scroll 1 line; thumb drag; track click pages. Done before sel state so a scroll
-    // gesture never starts/clears a selection.
-    CRect track, thumb;
-    if (sbar_geometry(track, thumb)) {
-        CRect full;
-        GetClientRect(&full);
-        CRect gutter(full.right - to_px(SBAR_W), full.top, full.right, full.bottom);
-        if (gutter.PtInRect(pt)) {
-            int maxtop = (int)scrollback.size();
-            int bh = to_px(SBAR_BTN_H);
-            CRect btn_up(gutter.left, gutter.top, gutter.right, gutter.top + bh);
-            CRect btn_dn(gutter.left, gutter.bottom - bh, gutter.right, gutter.bottom);
-            if (btn_up.PtInRect(pt)) {
-                // Arrow up: scroll one line toward older content.
-                int nt = view_top - 1;
-                if (nt < 0) nt = 0;
-                if (nt != view_top) { view_top = nt; update_scrollbar(); Invalidate(); }
-            } else if (btn_dn.PtInRect(pt)) {
-                // Arrow down: scroll one line toward newer content.
-                int nt = view_top + 1;
-                if (nt > maxtop) nt = maxtop;
-                if (nt != view_top) { view_top = nt; update_scrollbar(); Invalidate(); }
-            } else if (thumb.PtInRect(pt)) {
-                // Grab the thumb; keep the grab offset so it does not jump under the cursor.
-                sbar_dragging = true;
-                sbar_drag_off = pt.y - thumb.top;
-                SetCapture();
-            } else {
-                // Press in the empty track: page toward the click.
-                int nt = view_top + ((pt.y < thumb.top) ? -rows : rows);
-                if (nt < 0) nt = 0;
-                if (nt > maxtop) nt = maxtop;
-                if (nt != view_top) { view_top = nt; update_scrollbar(); Invalidate(); }
-            }
-            sbar_show();
-            return;
-        }
     }
 
     sel_active = false;
@@ -3434,6 +3552,12 @@ void ConBox::OnLButtonDblClk(UINT flags, CPoint pt)
     // one-cell selection + SetCapture); we supersede it here by clearing selecting/capture first.
     if (selecting) { ReleaseCapture(); selecting = false; }
 
+    // Gutter click: ignore (same gate as OnLButtonDown, and ahead of the forward below for the same
+    // reason -- the second click of a double-click on the arrows must not reach the child either).
+    CRect track, thumb;
+    if (sbar_hit(pt, track, thumb))
+        return;
+
     // Child owns the mouse: the window class has CS_DBLCLKS, so a fast second press arrives here
     // instead of OnLButtonDown -- report it as a plain press (xterm reports no double-click of its
     // own; the child does that timing itself) so a double-click gesture is not swallowed.
@@ -3443,14 +3567,6 @@ void ConBox::OnLButtonDblClk(UINT flags, CPoint pt)
         SetCapture();
         mouse_report(0, true, pt);
         return;
-    }
-
-    // Gutter click: ignore (same gate as OnLButtonDown).
-    CRect track, thumb;
-    if (sbar_geometry(track, thumb)) {
-        CRect full; GetClientRect(&full);
-        if (CRect(full.right - to_px(SBAR_W), full.top, full.right, full.bottom).PtInRect(pt))
-            return;
     }
 
     int abs_row, col;
@@ -3506,6 +3622,15 @@ void ConBox::OnLButtonUp(UINT flags, CPoint pt)
         return;
     }
 
+    // End an arrow/track auto-repeat (if any).
+    if (sbar_repeat_active) {
+        sbar_repeat_active = false;
+        KillTimer(SBAR_REPEAT_TIMER);
+        ReleaseCapture();
+        sbar_show();   // restart the hold/fade now that the repeat stopped
+        return;
+    }
+
     if (!selecting) return;
 
     hit_test(pt, sel_end_row, sel_end_col);
@@ -3531,8 +3656,13 @@ void ConBox::OnMouseMove(UINT flags, CPoint pt)
     // (drag), 1003 always, 1000 never. One report per cell change, not per pixel, or a wide window
     // would flood the child with near-duplicate events.
     if (mouse_reporting() && !(flags & MK_SHIFT)) {
+        // The overlay gutter stays the terminal's own UI even here: keep tracking hover so the
+        // thumbless bar can appear/fade (it draws nothing at rest, so hover is the only way to see
+        // it), and while the pointer is on it do NOT report motion -- the user is aiming at our
+        // scrollbar, not at the child's last column.
+        sbar_track_hover(pt);
         bool held = (mouse_btn >= 0);
-        if (mouse_track == 1003 || (mouse_track == 1002 && held)) {
+        if (!sbar_hover && (mouse_track == 1003 || (mouse_track == 1002 && held))) {
             int row, col;
             if (mouse_cell(pt, row, col) && (row != mouse_last_row || col != mouse_last_col)) {
                 mouse_last_row = row;
@@ -3541,7 +3671,7 @@ void ConBox::OnMouseMove(UINT flags, CPoint pt)
                 mouse_report((held ? mouse_btn : 3) + 32, true, pt);
             }
         }
-        return;   // no local hover/selection while the child has the mouse
+        return;   // no local selection while the child has the mouse
     }
 
     // Dragging the overlay thumb: map the cursor y to view_top (inverse of sbar_geometry's thumb_y).
@@ -3562,31 +3692,8 @@ void ConBox::OnMouseMove(UINT flags, CPoint pt)
 
     // Hover anywhere in the gutter (buttons + track; when not selecting): show the bar and arm
     // WM_MOUSELEAVE so it fades on exit.
-    if (!selecting) {
-        CRect track, thumb;
-        bool has = sbar_geometry(track, thumb);
-        CRect gutter_rc;
-        if (has) {
-            CRect full;
-            GetClientRect(&full);
-            gutter_rc.SetRect(full.right - to_px(SBAR_W), full.top, full.right, full.bottom);
-        }
-        bool in = has && gutter_rc.PtInRect(pt);
-        if (in && !sbar_hover) {
-            sbar_hover = true;
-            TRACKMOUSEEVENT tme;
-            tme.cbSize = sizeof(tme);
-            tme.dwFlags = TME_LEAVE;
-            tme.hwndTrack = m_hWnd;
-            tme.dwHoverTime = 0;
-            ::TrackMouseEvent(&tme);
-            sbar_show();
-        }
-        else if (!in && sbar_hover) {
-            sbar_hover = false;   // off the gutter (still in the window): let the hold/fade run
-            if (has) InvalidateRect(&gutter_rc, FALSE);
-        }
-    }
+    if (!selecting)
+        sbar_track_hover(pt);
 
     if (!selecting) return;
 
@@ -5396,6 +5503,7 @@ void ConBox::OnDestroy()
     KillTimer(BLINK_TIMER);
     KillTimer(SBAR_TIMER);
     KillTimer(BELL_TIMER);
+    KillTimer(SBAR_REPEAT_TIMER);
     CWnd::OnDestroy();
 }
 

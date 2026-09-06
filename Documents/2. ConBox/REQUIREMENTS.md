@@ -38,7 +38,7 @@
 - The cell grid uses a fully fixed-width unit.
 - CJK characters, including Korean characters, occupy two cell columns: lead and trail.
 - Instead of the default `WS_VSCROLL`, which consumes client pixels, `ConBox` renders a custom rounded overlay scrollbar at the edge of the view.
-- The overlay scrollbar is wt.exe-like: while scrollable it is ALWAYS visible, but only as a slim bar at rest (a thin translucent bar hugging the right edge, no gutter/arrows). On hover, drag, or a scroll it EXPANDS to the full gutter + rounded thumb + arrow buttons for a hold window, then collapses again. (TableBox's overlay still uses the older auto-show-then-fade-to-nothing behavior; this slim/expand idle state is ConBox-specific.)
+- The overlay scrollbar is wt.exe-like: while scrollable it is ALWAYS visible (except in the thumbless mouse-reporting mode, see section 12, where it shows on hover only), but only as a slim bar at rest (a thin translucent bar hugging the right edge, no gutter/arrows). On hover, drag, or a scroll it EXPANDS to the full gutter + rounded thumb + arrow buttons for a hold window, then collapses again. (TableBox's overlay still uses the older auto-show-then-fade-to-nothing behavior; this slim/expand idle state is ConBox-specific.)
 - The expand/collapse is a single-shape MORPH, not a cross-fade of two shapes: the bar itself interpolates width / x-position / opacity between the slim bar and the full thumb, while the gutter strip and arrow buttons fade in/out. Hit-testing always uses the full gutter width even in the slim state, so the thin bar stays easy to grab.
 - The overlay scrollbar's rounded thumb and arrow buttons are antialiased, and its gutter strip is filled with a background-contrasting color. ConBox has only the vertical axis.
 - The mouse cursor remains `IDC_ARROW`, matching Windows Terminal behavior.
@@ -142,7 +142,21 @@
   letting a full-screen TUI (Claude Code, vim, htop) scroll and select on its own.
 - Holding Shift forces the local behavior back (xterm/wt.exe convention); right click always pastes
   locally regardless of mode.
-- The overlay scrollbar is hidden outright while mouse reporting is active, matching wt.exe.
+- The overlay scrollbar goes THUMBLESS while mouse reporting is active (matching wt.exe), instead of
+  being hidden: the child owns the scroll position -- it moves its own view in response to forwarded
+  notches -- so ConBox knows neither the total extent nor where the view sits in it, and any thumb it
+  drew would be a lie. `sbar_geometry()` therefore returns a valid track/arrow geometry with an EMPTY
+  thumb rect, which is the flag every caller keys on.
+  - Nothing is drawn at rest (there is no slim idle bar without a thumb); hovering the gutter fades in
+    the gutter strip + arrow buttons, and leaving fades them back out through the normal hold/fade path.
+  - Arrow and track presses become forwarded wheel notches rather than local `view_top` moves: one
+    notch for an arrow, `rows / 4` (min 1) for a track half. A notch is worth ~3 lines by the usual
+    convention (the local wheel path also uses 3), so a track half lands just under one screen; sending
+    a full `rows` would overshoot by ~3x. An arrow cannot be made finer than one notch -- that is the
+    protocol's smallest step, so it does not match the 1-line arrow of the local path.
+  - The gutter is live for clicks ONLY while it is actually on screen (`sbar_hover`), so an invisible
+    strip never steals a click the TUI expects in its own last column. Motion is not reported to the
+    child while the pointer is over the gutter.
 - OSC 52 lets the child read (`?` payload) or write (base64 payload) the Windows clipboard on its own
   behalf -- how a TUI that owns the mouse copies a selection it drew itself, since it has no OS
   clipboard access of its own.

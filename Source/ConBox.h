@@ -463,10 +463,23 @@ private:
     void update_scrollbar();
 
     // Overlay scrollbar helpers (auto-hide/fade). geometry: compute the gutter (track) and thumb rects
-    // from the current view; false when nothing to scroll (no scrollback or alt screen). show: make the
-    // bar fully opaque and (re)start the fade timer. draw: AlphaBlend it into the back buffer in OnPaint.
+    // from the current view; false when nothing to scroll (no scrollback or alt screen), and true with
+    // an EMPTY thumb while the child is mouse-reporting -- it owns the scroll position then, so only
+    // "scroll by one notch" gestures (arrows / track halves) are meaningful and they get forwarded to
+    // the child instead of moving view_top. show: make the bar fully opaque and (re)start the fade
+    // timer. draw: AlphaBlend it into the back buffer in OnPaint.
     bool sbar_geometry(CRect& track, CRect& thumb) const;
+    CRect sbar_gutter() const;
+    bool sbar_hit(CPoint pt, CRect& track, CRect& thumb) const;
+    void sbar_track_hover(CPoint pt);
     void sbar_show();
+
+    // Perform one unit of an overlay-scrollbar gesture -- one arrow step or one track page -- exactly
+    // as a single press does: local view_top move, or forwarded wheel notches in thumbless mode
+    // (see sbar_geometry). Shared by OnLButtonDown (first press) and the SBAR_REPEAT_TIMER tick, so
+    // holding an arrow/track keeps moving instead of firing once. A no-op once view_top/notches can no
+    // longer move (e.g. already at an end), so a held button harmlessly idles there.
+    void sbar_fire(bool up, bool arrow, CPoint pt);
     void draw_overlay_scrollbar(CDC& dc);
 
     // VT parser: feed one char (or control byte) into the state machine. Interprets ESC/CSI/OSC and
@@ -602,8 +615,9 @@ private:
     // encoding ConBox emits. Every local mouse gesture (selection, overlay scrollbar, wheel
     // scrollback) defers to the child while this holds, EXCEPT when Shift is down (xterm/wt.exe
     // convention: Shift forces the terminal's own handling) and except the right button, which
-    // stays a local paste. The overlay scrollbar is hidden outright (sbar_geometry returns false),
-    // so a scrolling TUI is driven by the wheel alone -- same as wt.exe.
+    // stays a local paste. The overlay scrollbar stays usable but goes THUMBLESS (sbar_geometry
+    // returns an empty thumb): it shows only on hover, draws just the gutter + arrow buttons, and
+    // its arrow / track-half presses are forwarded to the child as wheel notches -- same as wt.exe.
     bool mouse_reporting() const;
 
     // Client pixel coords -> 0-based cell column/row of the VISIBLE screen (clamped to the grid).
@@ -872,6 +886,11 @@ private:
     bool sbar_hover;         // mouse is over the gutter (held visible while true)
     bool sbar_dragging;      // dragging the thumb (held visible; SetCapture active)
     int sbar_drag_off;       // px from thumb top to the grab point (so the thumb does not jump)
+    bool sbar_repeat_active; // holding an arrow/track press (SBAR_REPEAT_TIMER running; SetCapture active)
+    bool sbar_repeat_fast;   // false until the first repeat tick switches SBAR_REPEAT_TIMER to the faster rate
+    bool sbar_repeat_up;     // direction fixed at the initial press; unaffected by pointer movement while held
+    bool sbar_repeat_arrow;  // true = arrow (1 line/1 notch per fire), false = track (1 page/rows-4 notches)
+    CPoint sbar_repeat_pt;   // cell target for mouse_report while forwarding (thumbless mode)
 
     // config() result cache: grid size, cmdline, and export settings stored for the host to query.
     int         cfg_cols;

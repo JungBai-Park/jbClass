@@ -152,3 +152,18 @@ This project adopts a modular architecture, with the PITFALLS.md files located a
   convert each argument to UTF-8 with `WideCharToMultiByte(CP_UTF8, ...)` before use.
 - `__wargv` is populated automatically by the CRT startup alongside `__argv`/`__argc` -- no extra init
   needed, even in an MFC app entered via `WinMain`/`CWinApp` rather than a `wmain`.
+
+### 16. `git add` Rejects LF-Only Files (core.safecrlf) -- Not a File Corruption
+
+- The global git config here is `core.autocrlf=true` + `core.safecrlf=true`, and every tracked text file
+  in this repo is CRLF in the working tree. A file that is LF-only instead is refused on staging with
+  `fatal: LF would be replaced by CRLF in <path>` (plain `git diff` only warns), because the
+  store-then-checkout round trip would not reproduce the current bytes.
+- This is a config/line-ending mismatch, NOT damage to the file: check with `file <path>` (reports
+  "with CRLF line terminators" or not) rather than assuming the content is broken.
+- Known case: `.claude/skills/*/SKILL.md` were committed LF-only and no-BOM (they are Claude Code
+  config, outside the project's UTF-8-with-BOM source/document convention), so editing one and staging
+  it hits this every time.
+- Workaround that keeps both the file and the user's global config untouched:
+  `git -c core.safecrlf=false add <path>`. Do not "fix" it by converting the file to CRLF -- that
+  rewrites every line and buries the real diff.

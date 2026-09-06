@@ -190,3 +190,27 @@
   the selection-highlight color, which then leaked into the margin area on the next repaint.
 - Fix: fill the client background with `default_bg` unconditionally. `cur_bg` is per-cell state
   consumed by `put_char`, never a stand-in for "the terminal's background color."
+
+### 18. The Mouse-Reporting Path in OnMouseMove Returns Early -- Local Hover Never Runs
+
+- `OnMouseMove` forwards motion to the child and `return`s while `mouse_reporting()` holds, BEFORE the
+  gutter-hover block further down. So anything that needs local hover state while the child owns the
+  mouse (the thumbless overlay scrollbar needs `sbar_hover` both to appear and to accept clicks) is
+  silently dead: the hover flag never turns on, so the bar never shows and its hit-test never arms.
+- Same shape in `OnLButtonDown`/`OnLButtonDblClk`: the forward-to-child block sits ahead of the gutter
+  handling, so a gutter press reached the child instead of the bar until the gutter check was moved in
+  front of it.
+- Rule: a local UI element that must stay usable during mouse reporting has to be handled BEFORE the
+  forwarding block in every mouse handler, not after it. Grep for `mouse_reporting()` and check the
+  ordering at each site when adding one.
+
+### 19. SGR Mouse Reporting Cannot Express a Line Count -- Only Notches
+
+- Forwarded scrolling is quantized to wheel notches (`ESC[<64` up / `<65` down); there is no way to say
+  "scroll N lines" or "go to position P". How many lines a notch is worth is decided by the CHILD
+  (~3 by the common convention, which is also what ConBox's own local wheel path uses).
+- Consequences when translating a scrollbar gesture into notches: an arrow cannot be finer than 1 notch
+  (so it moves ~3 lines, not the 1 line the local path gives), and a "page" must be divided down --
+  `rows` notches would move ~3 screens, not one. ConBox sends `rows / 4`.
+- Do NOT compensate by sending multiple notches per physical wheel click: 1 notch per click already
+  matches the local path's 3 lines, and every other terminal (xterm, wt.exe) sends exactly one.
