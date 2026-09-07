@@ -157,10 +157,21 @@
   to the child that had it). In that state Esc closes the whole app and Enter is silently
   swallowed.
 - Fix pattern (see `cJbTermFrame::PreTranslateMessage` in `Build/jbTerm/main.cpp`): override
-  `PreTranslateMessage` in the host subclass, and for `WM_KEYDOWN` Esc/Enter, `SendMessage` them
-  directly to the child and `return TRUE` -- unconditionally, without consulting `GetFocus()` at
-  all -- before falling through to `FrameBox::PreTranslateMessage`. Delivery then no longer
-  depends on whatever state focus happens to be in.
+  `PreTranslateMessage` in the host subclass and, for `WM_KEYDOWN`/`WM_CHAR`, force focus onto
+  the child with `SetFocus()` whenever `GetFocus()` is not already it, THEN fall through to
+  `FrameBox::PreTranslateMessage` as usual. With focus guaranteed to be on the child and
+  `DLGC_WANTALLKEYS` always reported, FrameBox's own check now always takes its
+  `CWnd::PreTranslateMessage` path (normal `TranslateMessage`/`DispatchMessage`) instead of ever
+  reaching the Esc/Enter branches -- delivery no longer depends on whatever state focus happened
+  to be in, without needing to special-case either key.
+- Trap already hit once: do NOT try to fix this by `SendMessage`-ing `WM_KEYDOWN` straight to the
+  child and returning `TRUE` from `PreTranslateMessage` to consume the original message. That
+  skips `TranslateMessage` entirely, so `WM_CHAR` never fires for that keystroke -- and `ConBox`
+  sends the actual Esc (`0x1B`)/Enter (`\r`) bytes to the child from `OnChar` (`WM_CHAR`), not
+  `OnKeyDown` (`terminal_keydown()` has no case for `VK_ESCAPE`/`VK_RETURN` and returns `false`
+  for both). The symptom is `OnKeyDown` running (IME/cursor bookkeeping looks fine) while Esc and
+  Enter never reach the child at all. Deferring to the normal dispatch path (above) avoids this
+  because it lets `TranslateMessage` produce `WM_CHAR` as usual.
 
 ### 17. Frameless Mode (Custom Caption Buttons)
 
