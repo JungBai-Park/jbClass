@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(& \"C:\\\\Program Files\\\\Microsoft Visual Studio\\\\2022\\\\Community\\\\MSBuild\\\\Current\\\\Bin\\\\MSBuild.exe\" \"Project\\\\jbClass.sln\" /t:Build /p:Configuration=Debug /p:Platform=x64 /v:minimal 2>&1 | Select-Object -Last 5)",
+      "PowerShell(& \"C:\\\\Program Files\\\\Microsoft Visual Studio\\\\2022\\\\Community\\\\MSBuild\\\\Current\\\\Bin\\\\MSBuild.exe\" \"Project\\\\jbClass.sln\" /t:Build /p:Configuration=Debug /p:Platform=x64 /nologo /v:minimal)",
+      "PowerShell(& \"C:\\\\Program Files\\\\Microsoft Visual Studio\\\\2022\\\\Community\\\\MSBuild\\\\Current\\\\Bin\\\\MSBuild.exe\" \"Project\\\\jbClass.sln\" /t:Build /p:Configuration=Debug /p:Platform=x64 /v:minimal /nologo)",
+      "PowerShell(Tail *)",
+      "PowerShell(& \"C:\\\\Program Files\\\\Microsoft Visual Studio\\\\2022\\\\Community\\\\MSBuild\\\\Current\\\\Bin\\\\MSBuild.exe\" \"Project\\\\jbClass.sln\" /t:Build /p:Configuration=Debug /p:Platform=x64 /v:minimal 2>&1 | Select-Object -Last 20)",
+      "WebSearch",
+      "PowerShell(& \"C:\\\\Program Files\\\\Microsoft Visual Studio\\\\2022\\\\Community\\\\MSBuild\\\\Current\\\\Bin\\\\MSBuild.exe\" \"D:\\\\Work\\\\Study\\\\jbClass\\\\Project\\\\jbBox.sln\" /t:Build /p:Configuration=Debug /p:Platform=x64 /v:minimal 2>&1)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "PowerShell(gh --version)",
+      "PowerShell(gh auth status)",
+      "PowerShell(gh repo create jbClass --public --source \"D:\\\\Work\\\\Study\\\\jbClass\" --remote origin --push)",
+      "PowerShell(& \"C:\\\\Program Files\\\\Microsoft Visual Studio\\\\2022\\\\Community\\\\MSBuild\\\\Current\\\\Bin\\\\MSBuild.exe\" \"Project\\\\jbBox.sln\" /t:Build /p:Configuration=Debug /p:Platform=x64 /v:m /nologo)",
+      "PowerShell(Get-Process jbBox -ErrorAction SilentlyContinue)",
+      "PowerShell(Stop-Process -Force)"
+    ]
+  }
+}

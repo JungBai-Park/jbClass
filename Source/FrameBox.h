@@ -402,6 +402,10 @@ protected:
     int       zoom_pm;  // zoom x1000 (1000=1.0x); range [500,3000]; Ctrl+Wheel adjusts
     int       eff_dpi() const { return max(1, ::MulDiv(dpi, zoom_pm, 1000)); }
     virtual void apply_zoom(int new_pm, bool cursor_anchor); // Ctrl+Wheel zoom: update zoom_pm, resize, rescale
+    // Registered Win32 window class name for this top-level window; override to make
+    // the class visible under an app-specific name (e.g. in Spy++) instead of the
+    // shared default. Each distinct name is registered once per process on first use.
+    virtual const wchar_t* window_class_name() const { return L"FrameBox"; }
 
 private:
     // Registry entry: wnd==nullptr means borrowed (add_asitis) -- destroy nothing.

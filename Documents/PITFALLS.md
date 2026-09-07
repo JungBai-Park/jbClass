@@ -167,3 +167,16 @@ This project adopts a modular architecture, with the PITFALLS.md files located a
 - Workaround that keeps both the file and the user's global config untouched:
   `git -c core.safecrlf=false add <path>`. Do not "fix" it by converting the file to CRLF -- that
   rewrites every line and buries the real diff.
+
+### 17. Never Kill jbTerm.exe by Process Name Before Building
+
+- This Claude Code session commonly runs hosted inside jbTerm.exe itself (ConPTY child process),
+  so the DemoApp-style pre-build workaround in pitfall #1 (`Get-Process X | Stop-Process -Force`
+  to dodge `LNK1168`) is unsafe for jbTerm: it can kill the very process running the current
+  session, not just a stray test copy.
+- `Stop-Process`/`taskkill` match by process **name** only, not by path or working directory.
+  Running a test copy of jbTerm.exe from a different folder does NOT make killing-by-name safe --
+  it still matches (and kills) any other jbTerm.exe, including the session's own host process.
+- Do not preemptively kill jbTerm.exe before MSBuild. If the link step fails with `LNK1168`, that
+  means the file at the actual build output path (`Build\jbTerm\Debug.64\jbTerm.exe`) is locked by
+  a running instance at that exact path -- identify that specific process before killing anything.

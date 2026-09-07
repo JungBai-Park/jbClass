@@ -47,6 +47,10 @@ class cJbTermFrame : public FrameBox {
 public:
     ConBox* con_box = nullptr;
 
+    // Register under "jbTerm" instead of the shared "FrameBox" default, so the
+    // window class name is visible as "jbTerm" in tools like Spy++.
+    const wchar_t* window_class_name() const override { return L"jbTerm"; }
+
     void setup_sysmenu() {
         HMENU hSys = ::GetSystemMenu(m_hWnd, FALSE);
         if (!hSys) return;
@@ -56,6 +60,23 @@ public:
         ::AppendMenuW(hSys, MF_STRING, ID_SAVE_EMF,  L"EMF로 저장...");
         ::AppendMenuW(hSys, MF_SEPARATOR, 0, nullptr);
         ::AppendMenuW(hSys, MF_STRING, ID_LOG,       L"기록 시작...");
+    }
+
+    // Esc must not close jbTerm the way FrameBox::PreTranslateMessage closes a
+    // generic dialog-like frame: consume it here before it reaches the base class.
+    BOOL PreTranslateMessage(MSG* pMsg) override {
+        // Keyboard input must always reach ConBox: with nothing else in the client area
+        // ever needing it instead, any drift away (unclicked at startup, or focus landing
+        // on the frame after a system-menu dialog closes with hwndOwner == m_hWnd) is
+        // corrected here before the message is processed further. Once focus is on
+        // ConBox, FrameBox::PreTranslateMessage's own DLGC_WANTALLKEYS check already
+        // defers to normal TranslateMessage/DispatchMessage (which is what generates
+        // WM_CHAR for Esc/Enter -- ConBox::OnChar, not OnKeyDown, sends those bytes to
+        // the child) -- no special-casing of individual keys needed here.
+        if (con_box && (pMsg->message == WM_KEYDOWN || pMsg->message == WM_CHAR) &&
+            GetFocus() != con_box)
+            con_box->SetFocus();
+        return FrameBox::PreTranslateMessage(pMsg);
     }
 
     LRESULT WindowProc(UINT msg, WPARAM wp, LPARAM lp) override {
@@ -232,10 +253,12 @@ static std::string EscapeForAutoCmdline(const std::string& raw) {
 }
 
 int main(int argc, const char* argv[]) {
-    const int width = 900, height = 600;   // placeholder only (picks the startup DPI monitor);
-                                            // fit_to_children() below sets the real size from jbTerm.ini
+    const int width = 900, height = 600;   // placeholder only (fit_to_children() below sets
+                                            // the real size from jbTerm.ini)
 
-    Top.OpenFrame(&App, 0, 0, width, height);   // created hidden; shown on the first wait() below
+    // CW_USEDEFAULT: let the system pick the top-left (and thereby the startup DPI monitor)
+    // instead of hardcoding (0,0); see FrameBox::open_core() for how this is resolved.
+    Top.OpenFrame(&App, CW_USEDEFAULT, CW_USEDEFAULT, width, height);  // created hidden; shown on the first wait() below
 
     // Normal dialog-style frame: title bar + close/minimize; maximize box shown but
     // disabled (WS_MAXIMIZEBOX omitted while WS_MINIMIZEBOX stays); fixed size, no
@@ -315,7 +338,6 @@ int main(int argc, const char* argv[]) {
     Top.con_box = conBox;
     Top.setup_sysmenu();                     // title-bar icon menu: Save EMF/Text/PDF, Start Logging
     Top.fit_to_children();                   // resize Top to wrap conBox exactly (uses ConBox's computed size)
-    Top.CenterWindow();                      // now that the final size is known
 
     while (::IsWindow(Top)) {
         CWnd* ev = Top.wait();

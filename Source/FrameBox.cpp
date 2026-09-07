@@ -943,12 +943,14 @@ void FrameBox::close() {
     if (::IsWindow(m_hWnd)) DestroyWindow();
 }
 
-// Register the shared "FrameBox" window class once, then create the window via
-// the AfxHookWindowCreate path (full MFC message-map support, no SubclassWindow
-// side effects). Background is painted in WindowProc (WM_ERASEBKGND).
+// Register the window_class_name() class once (default "FrameBox", overridable by
+// subclass), then create the window via the AfxHookWindowCreate path (full MFC
+// message-map support, no SubclassWindow side effects). Background is painted in
+// WindowProc (WM_ERASEBKGND).
 bool FrameBox::create_window(DWORD exStyle, DWORD style, CWnd* parent, const CRect& rc) {
+    const wchar_t* class_name = window_class_name();
     WNDCLASSEXW wc = {};
-    if (!::GetClassInfoExW(AfxGetInstanceHandle(), L"FrameBox", &wc)) {
+    if (!::GetClassInfoExW(AfxGetInstanceHandle(), class_name, &wc)) {
         wc.cbSize        = sizeof(wc);
         wc.style         = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS; // DBLCLKS: edit-mode commit
         wc.lpfnWndProc   = ::DefWindowProcW;
@@ -958,11 +960,11 @@ bool FrameBox::create_window(DWORD exStyle, DWORD style, CWnd* parent, const CRe
         // calling exe leaves hIcon null (no icon), which is harmless.
         wc.hIcon         = ::LoadIconW(AfxGetInstanceHandle(), MAKEINTRESOURCEW(128));
         wc.hCursor       = ::LoadCursorW(nullptr, (LPCWSTR)IDC_ARROW);
-        wc.lpszClassName = L"FrameBox";
+        wc.lpszClassName = class_name;
         ::RegisterClassExW(&wc);
     }
     AfxHookWindowCreate(this);
-    HWND hwnd = ::CreateWindowExW(exStyle, L"FrameBox", L"", style,
+    HWND hwnd = ::CreateWindowExW(exStyle, class_name, L"", style,
         rc.left, rc.top, rc.Width(), rc.Height(),
         parent ? parent->GetSafeHwnd() : nullptr, nullptr, AfxGetInstanceHandle(), nullptr);
     if (!AfxUnhookWindowCreate())
@@ -993,26 +995,49 @@ bool FrameBox::open_core(CWnd* p, int x0, int y0, int x1, int y1, const char* fi
     parent = p;
     DWORD style = p ? (WS_POPUP | WS_CAPTION | WS_SYSMENU) : WS_OVERLAPPEDWINDOW;
     if (!::IsWindow(m_hWnd)) {
-        // Create at logical coords (source-code 96 DPI values), then query actual
-        // DPI and scale to physical pixels before ShowWindow.
-        // Determine target-monitor DPI from the center of the intended rect BEFORE
-        // creating the window. GetDpiForWindow right after creation can return the
-        // owner's DPI for a popup whose owner is on a different-DPI monitor;
-        // MonitorFromPoint is always correct regardless of ownership.
-        {
+        // x0 == CW_USEDEFAULT: let the system pick the top-left instead of a source-code
+        // coordinate. Only meaningful for an owner-less top-level window -- WS_POPUP windows
+        // resolve CW_USEDEFAULT to (0,0) per Win32 docs, so this path requires p == nullptr.
+        // x1/y1 are then read as width/height (not absolute right/bottom), since the real
+        // right/bottom are unknown until after creation reveals where the system placed it.
+        if (x0 == CW_USEDEFAULT && p == nullptr) {
+            int w = x1, h = y1;
+            if (!create_window(0, style, p,
+                    CRect(CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT + w, CW_USEDEFAULT + h)))
+                return false;
+            // No owner exists to confuse the monitor here, so GetDpiForWindow (unlike the
+            // pre-creation MonitorFromPoint used below) is safe to call right after creation.
+            CRect rc;
+            ::GetWindowRect(m_hWnd, &rc);
+            dpi = (int)::GetDpiForWindow(m_hWnd);
+            x0 = MulDiv(rc.left, 96, dpi);
+            y0 = MulDiv(rc.top, 96, dpi);
+            x1 = x0 + w;
+            y1 = y0 + h;
+            ::SetWindowPos(m_hWnd, nullptr,
+                MulDiv(x0, dpi, 96), MulDiv(y0, dpi, 96), MulDiv(w, dpi, 96), MulDiv(h, dpi, 96),
+                SWP_NOZORDER | SWP_NOACTIVATE);
+        } else {
+            // Create at logical coords (source-code 96 DPI values), then query actual
+            // DPI and scale to physical pixels before ShowWindow.
+            // Determine target-monitor DPI from the center of the intended rect BEFORE
+            // creating the window. GetDpiForWindow right after creation can return the
+            // owner's DPI for a popup whose owner is on a different-DPI monitor;
+            // MonitorFromPoint is always correct regardless of ownership.
             POINT center = { (x0 + x1) / 2, (y0 + y1) / 2 };
             HMONITOR mon = ::MonitorFromPoint(center, MONITOR_DEFAULTTONEAREST);
             UINT mdpi = 96, dummy = 0;
             ::GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &mdpi, &dummy);
             dpi = (int)mdpi;
-        }
-        if (!create_window(0, style, p, CRect(x0, y0, x1, y1)))
-            return false;
-        if (dpi != 96) {
-            ::SetWindowPos(m_hWnd, nullptr,
-                MulDiv(x0, dpi, 96), MulDiv(y0, dpi, 96),
-                MulDiv(x1 - x0, dpi, 96), MulDiv(y1 - y0, dpi, 96),
-                SWP_NOZORDER | SWP_NOACTIVATE);
+
+            if (!create_window(0, style, p, CRect(x0, y0, x1, y1)))
+                return false;
+            if (dpi != 96) {
+                ::SetWindowPos(m_hWnd, nullptr,
+                    MulDiv(x0, dpi, 96), MulDiv(y0, dpi, 96),
+                    MulDiv(x1 - x0, dpi, 96), MulDiv(y1 - y0, dpi, 96),
+                    SWP_NOZORDER | SWP_NOACTIVATE);
+            }
         }
         if (sys_font) { ::DeleteObject(sys_font); }
         sys_font = make_dpi_font(dpi);

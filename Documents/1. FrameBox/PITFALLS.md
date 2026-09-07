@@ -143,7 +143,26 @@
 - `Graphics::DrawImage(Image*, x, y)` has both `(INT,INT)` and `(REAL,REAL)` overloads. Passing
   `CRect::left/top` (type `LONG`) is ambiguous (C2668). Cast explicitly: `DrawImage(&buf, (INT)x, (INT)y)`.
 
-### 16. Frameless Mode (Custom Caption Buttons)
+### 16. Dialog-Style Esc/Enter Bypass for a Host Whose Only Child Wants All Keys
+
+- `FrameBox::PreTranslateMessage` implements dialog-like defaults: Esc posts `WM_CLOSE`,
+  Enter simulates a button click (or yields to an `ES_MULTILINE|ES_WANTRETURN` edit). Both
+  branches are only reached when `GetFocus()`'s `WM_GETDLGCODE` does NOT include
+  `DLGC_WANTALLKEYS` -- when it does (e.g. `ConBox::OnGetDlgCode` always returns it), the base
+  class already forwards the key normally before reaching them.
+- A host whose ONLY child needs Esc/Enter unconditionally (jbTerm/ConBox) is still exposed
+  whenever focus itself drifts off that child: right after `OpenFrame` (a `CWnd`-based frame has
+  no `CDialog`-style `GotoDlgCtrl`, so nothing gives the child initial focus), or after a
+  system-menu common dialog closes with `hwndOwner == m_hWnd` (focus returns to the frame, not
+  to the child that had it). In that state Esc closes the whole app and Enter is silently
+  swallowed.
+- Fix pattern (see `cJbTermFrame::PreTranslateMessage` in `Build/jbTerm/main.cpp`): override
+  `PreTranslateMessage` in the host subclass, and for `WM_KEYDOWN` Esc/Enter, `SendMessage` them
+  directly to the child and `return TRUE` -- unconditionally, without consulting `GetFocus()` at
+  all -- before falling through to `FrameBox::PreTranslateMessage`. Delivery then no longer
+  depends on whatever state focus happens to be in.
+
+### 17. Frameless Mode (Custom Caption Buttons)
 
 - `frameless()` strips `WS_CAPTION|WS_SYSMENU|WS_THICKFRAME|WS_MINIMIZEBOX|WS_MAXIMIZEBOX|WS_BORDER|WS_DLGFRAME`, adds `WS_POPUP`, then `SetWindowPos(SWP_FRAMECHANGED)`. Must run after the window exists.
 - Removing `WS_CAPTION` enlarges the client area (no title bar), so an `open_image` window's client grows by the former caption height and the cached background stretches to fill it -- acceptable, not corrected.
