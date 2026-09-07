@@ -264,8 +264,15 @@ int main(int argc, const char* argv[]) {
     // disabled (WS_MAXIMIZEBOX omitted while WS_MINIMIZEBOX stays); fixed size, no
     // resize border (WS_THICKFRAME dropped). Set before fit_to_children() so its
     // AdjustWindowRectEx call sees the final frame style.
+    // WS_CLIPCHILDREN: ConBox covers the client area exactly (margin 0), so excluding it
+    // from the frame's own paint/erase region avoids a visible flash of FrameBox's default
+    // WM_ERASEBKGND fill (COLOR_BTNFACE) whenever the frame is invalidated (e.g. uncovered
+    // by another window) before ConBox's own double-buffered repaint catches up. Not the
+    // FrameBox default (see Documents/1. FrameBox/PITFALLS.md #14: transparent AddStatic
+    // controls elsewhere rely on the parent painting under them) -- safe here since jbTerm's
+    // only child is the opaque, fully-covering ConBox.
     LONG_PTR style = ::GetWindowLongPtrW(Top.m_hWnd, GWL_STYLE);
-    style = (style & ~(WS_THICKFRAME | WS_MAXIMIZEBOX)) | WS_MINIMIZEBOX;
+    style = (style & ~(WS_THICKFRAME | WS_MAXIMIZEBOX)) | WS_MINIMIZEBOX | WS_CLIPCHILDREN;
     ::SetWindowLongPtrW(Top.m_hWnd, GWL_STYLE, style);
     ::SetWindowPos(Top.m_hWnd, nullptr, 0, 0, 0, 0,
                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);

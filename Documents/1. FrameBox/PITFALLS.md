@@ -180,3 +180,23 @@
 - GDI+ must be initialized even when no background image is used: `frameless()` calls `gdip_addref()` once (guarded by the `fless_opt < 0` -> first-call transition) and `close()` releases it via the `fless_gdip` flag. Without this, a frameless `OpenFrame` (no `open_image`) window would create GDI+ objects in `fless_draw` with GDI+ not started.
 - `WM_NCHITTEST` returns `HTCAPTION` for empty client area (OS drag-move) and `HTCLIENT` over a button circle (so `WM_MOUSEMOVE`/`WM_LBUTTONUP` reach the frame). Hit test is circular (distance <= radius), not the bounding rect.
 - All caption-button handling is gated on `fless_opt >= 0`; a normal titled window keeps its original `WindowProc` behavior untouched.
+
+### 18. Parent WM_ERASEBKGND Flash Behind a Fully-Covering Child
+
+- `FrameBox::WindowProc`'s default `WM_ERASEBKGND` (no `bg_image`/`bg_color_set`) fills the
+  whole client rect with `GetSysColorBrush(COLOR_BTNFACE)` (dialog-face gray). A child that
+  fully covers the client area (e.g. `ConBox` in jbTerm, margin 0) hides this normally, but
+  the frame and the child are separate HWNDs repainted asynchronously: whenever the FRAME's
+  own region gets invalidated (e.g. uncovered by another window, a resize/zoom full
+  repaint), its gray fill can reach the screen before the child's own repaint catches up,
+  producing a brief white/gray flash. The child's own painting is not the cause even if it
+  is already flicker-free (double-buffered, `OnEraseBkgnd` a no-op) -- the flash is the
+  PARENT's erase showing through for one frame.
+- `WS_CLIPCHILDREN` on the frame is the standard fix (excludes child-covered pixels from the
+  parent's own paint/erase region entirely), but is NOT applied to `FrameBox` itself: pitfall
+  #14's transparent `AddStatic` controls rely on the parent painting their background, which
+  `WS_CLIPCHILDREN` would leave unpainted.
+- Fix pattern for a host whose child(ren) fully tile the client area with no transparent
+  controls (see `main.cpp`'s `WS_MINIMIZEBOX`/`WS_THICKFRAME` style block in jbTerm): OR in
+  `WS_CLIPCHILDREN` on that specific window's `GWL_STYLE` after `OpenFrame`, not in
+  `FrameBox` itself.
