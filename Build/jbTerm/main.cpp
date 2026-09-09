@@ -180,7 +180,19 @@ public:
                 return 0;
             }
         }
-        return FrameBox::WindowProc(msg, wp, lp);
+        LRESULT result = FrameBox::WindowProc(msg, wp, lp);
+        // Clicking the title bar (non-client area) reactivates this top-level window
+        // without any client-area mouse message ever reaching con_box, so nothing calls
+        // SetFocus on it -- FrameBox is a plain CWnd (not CFrameWnd), which has no
+        // built-in last-focus save/restore on WM_ACTIVATE. con_box is the only control
+        // in the client area, so focus always belongs to it: force it unconditionally
+        // whenever this window becomes active. Must run AFTER the base WindowProc call
+        // above (which reaches DefWindowProc for WM_ACTIVATE) -- DefWindowProc's own
+        // default WM_ACTIVATE handling sets focus to this top-level window itself, so
+        // calling SetFocus(con_box) before it just gets overwritten by that default.
+        if (msg == WM_ACTIVATE && LOWORD(wp) != WA_INACTIVE && con_box)
+            con_box->SetFocus();
+        return result;
     }
 };
 
@@ -213,18 +225,25 @@ static void OnTitlebarColor(COLORREF caption, COLORREF text, COLORREF border) {
     if (border  != CLR_INVALID) ::DwmSetWindowAttribute(Top.m_hWnd, DWMWA_BORDER_COLOR,  &border,  sizeof(border));
 }
 
-// Directory containing this EXE (trailing backslash), for locating the primary global INI candidate.
-static std::wstring GetExeDirectoryW() {
-    wchar_t exe[MAX_PATH] = {};
-    ::GetModuleFileNameW(nullptr, exe, MAX_PATH);
-    std::wstring dir(exe);
-    size_t slash = dir.rfind(L'\\');
-    if (slash != std::wstring::npos) dir.resize(slash + 1);
-    return dir;
-}
+// RCDATA id embedded in jbTerm.rc (jbTerm.ini content as of build time). No resource.h in this
+// project -- keep this value in sync with the numeric id used in jbTerm.rc's "129 RCDATA ..." line.
+static const int IDR_DEFAULT_INI = 129;
 
-static bool FileExistsW(const wchar_t* path) {
-    return ::GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
+// Read the embedded default jbTerm.ini back out as a UTF-8 string (raw resource bytes -- content
+// is whatever jbTerm.ini held at build time, BOM included; ConBox::setup()/ParseIni() already skip
+// a leading UTF-8 BOM so no stripping is needed here). Returns empty string if the resource is
+// missing for some reason (e.g. a build with a stale jbTerm.rc), in which case the caller ends up
+// applying no extra settings and ConBox's compiled-in constructor defaults stand.
+static std::string LoadEmbeddedDefaultIni() {
+    HMODULE mod = ::GetModuleHandleW(nullptr);
+    HRSRC res = ::FindResourceW(mod, MAKEINTRESOURCEW(IDR_DEFAULT_INI), RT_RCDATA);
+    if (!res) return std::string();
+    HGLOBAL data = ::LoadResource(mod, res);
+    if (!data) return std::string();
+    const char* ptr = static_cast<const char*>(::LockResource(data));
+    DWORD size = ::SizeofResource(mod, res);
+    if (!ptr || size == 0) return std::string();
+    return std::string(ptr, size);
 }
 
 static std::string WideToUtf8(const wchar_t* w) {
@@ -256,30 +275,11 @@ int main(int argc, const char* argv[]) {
     const int width = 900, height = 600;   // placeholder only (fit_to_children() below sets
                                             // the real size from jbTerm.ini)
 
-    // CW_USEDEFAULT: let the system pick the top-left (and thereby the startup DPI monitor)
-    // instead of hardcoding (0,0); see FrameBox::open_core() for how this is resolved.
-    Top.OpenFrame(&App, CW_USEDEFAULT, CW_USEDEFAULT, width, height);  // created hidden; shown on the first wait() below
-
-    // Normal dialog-style frame: title bar + close/minimize; maximize box shown but
-    // disabled (WS_MAXIMIZEBOX omitted while WS_MINIMIZEBOX stays); fixed size, no
-    // resize border (WS_THICKFRAME dropped). Set before fit_to_children() so its
-    // AdjustWindowRectEx call sees the final frame style.
-    // WS_CLIPCHILDREN: ConBox covers the client area exactly (margin 0), so excluding it
-    // from the frame's own paint/erase region avoids a visible flash of FrameBox's default
-    // WM_ERASEBKGND fill (COLOR_BTNFACE) whenever the frame is invalidated (e.g. uncovered
-    // by another window) before ConBox's own double-buffered repaint catches up. Not the
-    // FrameBox default (see Documents/1. FrameBox/PITFALLS.md #14: transparent AddStatic
-    // controls elsewhere rely on the parent painting under them) -- safe here since jbTerm's
-    // only child is the opaque, fully-covering ConBox.
-    LONG_PTR style = ::GetWindowLongPtrW(Top.m_hWnd, GWL_STYLE);
-    style = (style & ~(WS_THICKFRAME | WS_MAXIMIZEBOX)) | WS_MINIMIZEBOX | WS_CLIPCHILDREN;
-    ::SetWindowLongPtrW(Top.m_hWnd, GWL_STYLE, style);
-    ::SetWindowPos(Top.m_hWnd, nullptr, 0, 0, 0, 0,
-                   SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
-
-    ::SetWindowTextW(Top.m_hWnd, L"jbTerm");
-    Top.set_margin(0);                       // keep the frame snug around ConBox (also on zoom/DPI changes)
-
+    // ConBox is created and configured (settings resolved) BEFORE Top.OpenFrame() below, purely
+    // so the start_x/start_y INI keys are available in time to pass to OpenFrame's x/y args. This
+    // is safe: setup()/setup_from_ini() only parse strings into fields (ConBox's own window is not
+    // created yet either -- that happens later, at conBox->open(&Top, ...)), and the callbacks
+    // registered here reference Top.m_hWnd only when actually invoked, long after Top exists.
     ConBox* conBox = new ConBox;
     // Callbacks registered before setup_from_ini(): set_titlebar_color_cb must be registered first,
     // or a freshly created default INI (jbTerm.ini not found yet) omits the [titlebar] block.
@@ -287,19 +287,11 @@ int main(int argc, const char* argv[]) {
     conBox->set_title_cb(OnTitleChanged);              // reflect the shell's OSC title in the title bar
     conBox->set_titlebar_color_cb(OnTitlebarColor);    // apply the ini's title-bar colors (Win11+)
 
-    // Global settings: <exe dir>\jbTerm.ini takes priority; "..\..\..\Documents\jbTerm.ini" (shared
-    // with DemoApp) is the fallback. setup_from_ini() auto-creates a default file and reports a
-    // status message when its target is missing, so existence is checked here FIRST -- calling it
-    // speculatively on the primary candidate would create it there on first run and permanently
-    // shadow the fallback on every later run. If neither exists, compiled-in defaults apply with no
-    // file created and no message.
-    std::wstring exe_dir = GetExeDirectoryW();
-    std::wstring global_primary  = exe_dir + L"jbTerm.ini";
-    std::wstring global_fallback = exe_dir + L"..\\..\\..\\Documents\\jbTerm.ini";
-    if (FileExistsW(global_primary.c_str()))
-        conBox->setup_from_ini(WideToUtf8(global_primary.c_str()).c_str());
-    else if (FileExistsW(global_fallback.c_str()))
-        conBox->setup_from_ini(WideToUtf8(global_fallback.c_str()).c_str());
+    // Global settings come exclusively from the jbTerm.ini embedded in jbTerm.rc (see
+    // IDR_DEFAULT_INI above) -- no external file is consulted for the global tier, so a single
+    // jbTerm.exe is fully self-contained. Only an explicit "@file" argument (below) loads
+    // settings from disk.
+    conBox->setup(LoadEmbeddedDefaultIni().c_str());
 
     // Local settings: command-line arguments (argv[1..]) layer on top of the global settings above.
     // __wargv is used (not argv) so non-ASCII values survive intact -- the console/command-line text
@@ -340,11 +332,42 @@ int main(int argc, const char* argv[]) {
     if (!kv_args.empty())
         conBox->setup(kv_args.c_str());
 
+    // start_x/start_y INI keys (config_start_x/y()) resolve to CW_USEDEFAULT when unset, which
+    // OpenFrame passes straight through to CreateWindow -- same as the previous hardcoded
+    // CW_USEDEFAULT, letting the system pick the top-left (and thereby the startup DPI monitor);
+    // see FrameBox::open_core() for how CW_USEDEFAULT is resolved there.
+    Top.OpenFrame(&App, conBox->config_start_x(), conBox->config_start_y(), width, height);  // created hidden; shown on the first wait() below
+
+    // Normal dialog-style frame: title bar + close/minimize; maximize box shown but
+    // disabled (WS_MAXIMIZEBOX omitted while WS_MINIMIZEBOX stays); fixed size, no
+    // resize border (WS_THICKFRAME dropped). Set before fit_to_children() so its
+    // AdjustWindowRectEx call sees the final frame style.
+    // WS_CLIPCHILDREN: ConBox covers the client area exactly (margin 0), so excluding it
+    // from the frame's own paint/erase region avoids a visible flash of FrameBox's default
+    // WM_ERASEBKGND fill (COLOR_BTNFACE) whenever the frame is invalidated (e.g. uncovered
+    // by another window) before ConBox's own double-buffered repaint catches up. Not the
+    // FrameBox default (see Documents/1. FrameBox/PITFALLS.md #14: transparent AddStatic
+    // controls elsewhere rely on the parent painting under them) -- safe here since jbTerm's
+    // only child is the opaque, fully-covering ConBox.
+    LONG_PTR style = ::GetWindowLongPtrW(Top.m_hWnd, GWL_STYLE);
+    style = (style & ~(WS_THICKFRAME | WS_MAXIMIZEBOX)) | WS_MINIMIZEBOX | WS_CLIPCHILDREN;
+    ::SetWindowLongPtrW(Top.m_hWnd, GWL_STYLE, style);
+    ::SetWindowPos(Top.m_hWnd, nullptr, 0, 0, 0, 0,
+                   SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+
+    ::SetWindowTextW(Top.m_hWnd, L"jbTerm");
+    Top.set_margin(0);                       // keep the frame snug around ConBox (also on zoom/DPI changes)
+
     conBox->open(&Top, 0, 0);                // sizes itself from the ini's font/rows/cols/margin
     Top.AddNew(0, 0, 0, 0, conBox);          // attach-only: register without moving/resizing it
     Top.con_box = conBox;
     Top.setup_sysmenu();                     // title-bar icon menu: Save EMF/Text/PDF, Start Logging
     Top.fit_to_children();                   // resize Top to wrap conBox exactly (uses ConBox's computed size)
+    conBox->SetFocus();                      // start with the cursor showing -- the WM_ACTIVATE-driven
+                                              // focus fix (see WindowProc's WM_ACTIVATE handling) does not
+                                              // reliably fire on the very first ShowWindow(SW_SHOW) below
+                                              // (inside Top.wait()), so focus would otherwise sit on Top
+                                              // until the user clicks the title bar or presses a key
 
     while (::IsWindow(Top)) {
         CWnd* ev = Top.wait();

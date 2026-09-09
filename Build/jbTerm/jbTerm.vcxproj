@@ -192,7 +192,9 @@
     <ClInclude Include="..\..\Source\FrameBox.h" />
   </ItemGroup>
   <ItemGroup>
-    <ResourceCompile Include="jbTerm.rc" />
+    <ResourceCompile Include="jbTerm.rc">
+      <AdditionalDependencies>jbTerm.ini;%(AdditionalDependencies)</AdditionalDependencies>
+    </ResourceCompile>
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

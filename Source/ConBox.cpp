@@ -466,6 +466,8 @@ ConBox::ConBox()
     max_scrollback = 5000;
     cfg_cols = 96;
     cfg_rows = 32;
+    cfg_start_x = CW_USEDEFAULT;
+    cfg_start_y = CW_USEDEFAULT;
     cfg_cmdline = "";
     cfg_work_dir = "";
     cfg_lines_per_paper = 50;
@@ -577,7 +579,10 @@ static bool ParseIniLine(const std::string& line_in, std::string& key_out, std::
 {
     if (malformed_out) *malformed_out = false;
     size_t start = 0;
-    while (start < line_in.size() && (line_in[start] == ' ' || line_in[start] == '\t')) ++start;
+    // '\r' included here: callers split CRLF text on '\n' only (std::getline), so a blank line in a
+    // CRLF-encoded INI arrives as a lone '\r' -- without this it is mistaken for real content with
+    // no '=' and falsely reported as malformed.
+    while (start < line_in.size() && (line_in[start] == ' ' || line_in[start] == '\t' || line_in[start] == '\r')) ++start;
     if (start >= line_in.size() || line_in[start] == ';' || line_in[start] == '#' || line_in[start] == '[')
         return false;
 
@@ -777,6 +782,11 @@ static bool CreateDefaultIni(const wchar_t* path, bool include_titlebar)
         "grid_cols     = 96              ; 가로 칸 수\n"
         "grid_rows     = 32              ; 세로 줄 수\n"
         "snap_mode     = 2               ; DPI 변경시 창 스냅: 0=센터링만(작으면 우/하단 짤림), 1=작을때만 확대, 2=margin 확보후 항상 스냅\n"
+        "\n"
+        "[window]\n"
+        "; 시작 위치(px, 가상 화면 좌표). 비워두면 시스템이 기본 위치를 정합니다.\n"
+        "start_x       =                 ; 시작 위치 X\n"
+        "start_y       =                 ; 시작 위치 Y\n"
         "\n"
         "[screen]\n"
         "; 색상 형식: #RRGGBB\n"
@@ -988,6 +998,10 @@ void ConBox::setup(const char* contents)
     // Host-consumed values (stored; accessed via config_cols/rows/cmdline)
     cfg_cols = geti("grid_cols", first ? 96 : cfg_cols);
     cfg_rows = geti("grid_rows", first ? 32 : cfg_rows);
+    // Window start position (config_start_x/y): absent/empty key keeps CW_USEDEFAULT (ctor
+    // default on the first call, or whatever a previous layer resolved on a later call).
+    cfg_start_x = geti("start_x", first ? CW_USEDEFAULT : cfg_start_x);
+    cfg_start_y = geti("start_y", first ? CW_USEDEFAULT : cfg_start_y);
     if (const std::string* s = get("cmdline")) { if (!s->empty()) cfg_cmdline = *s; }
     if (const std::string* s = get("work_directory")) { if (!s->empty()) cfg_work_dir = *s; }
     cfg_lines_per_paper = geti("lines_per_paper", first ? 50 : cfg_lines_per_paper);
@@ -5188,6 +5202,45 @@ bool ConBox::start()
     return start(cfg_cmdline.c_str());
 }
 
+// Builds a CREATE_UNICODE_ENVIRONMENT block for the child: a copy of this process's own
+// environment (GetEnvironmentStringsW) with PROMPT and JBTERM set/overridden. PROMPT resets SGR
+// and cursor/mouse-reporting modes before drawing the shell's own prompt (defends against a child
+// program leaving the terminal in a state that swallows or mis-renders that prompt); JBTERM lets a
+// child program identify jbTerm and reach the two windows via SendMessage/PostMessage (main window
+// -- GetParent(), the host frame the child's own console UI would otherwise activate/resize -- and
+// this ConBox, both formatted "%08X %08X" for direct use with a HWND-parsing sscanf/strtoul).
+static std::vector<wchar_t> BuildChildEnvironmentBlock(HWND main_hwnd, HWND con_hwnd)
+{
+    std::vector<wchar_t> env;
+    LPWCH block = ::GetEnvironmentStringsW();
+    if (block != nullptr) {
+        const wchar_t* p = block;
+        while (*p != L'\0') {
+            size_t len = wcslen(p);
+            // Drop any pre-existing PROMPT/JBTERM so the entries appended below are the only ones.
+            if (_wcsnicmp(p, L"PROMPT=", 7) != 0 && _wcsnicmp(p, L"JBTERM=", 7) != 0)
+                env.insert(env.end(), p, p + len + 1);   // include the terminating L'\0'
+            p += len + 1;
+        }
+        ::FreeEnvironmentStringsW(block);
+    }
+
+    wchar_t jbterm_val[40];
+    ::wsprintfW(jbterm_val, L"%08X %08X", (unsigned)(DWORD_PTR)main_hwnd, (unsigned)(DWORD_PTR)con_hwnd);
+
+    std::wstring prompt_entry =
+        L"PROMPT=$E[0m$E[?25h$E[?1000l$E[?1002l$E[?1003l$E[?1006l$P$G ";
+    std::wstring jbterm_entry = std::wstring(L"JBTERM=") + jbterm_val;
+
+    env.insert(env.end(), prompt_entry.begin(), prompt_entry.end());
+    env.push_back(L'\0');
+    env.insert(env.end(), jbterm_entry.begin(), jbterm_entry.end());
+    env.push_back(L'\0');
+    env.push_back(L'\0');   // final double-null block terminator
+
+    return env;
+}
+
 // ConPTY child: CreatePtyPipes (pipes+CreatePseudoConsole) -> STARTUPINFOEX -> CreateProcessW ->
 // close PTY-side ends -> set_input_sink/set_resize_sink -> SetTimer(PUMP_TIMER).
 // pump: PeekNamedPipe -> ReadFile -> print. Exit detection: ConPTY keeps output pipe open after
@@ -5278,13 +5331,20 @@ bool ConBox::start(const char* cmdline)
         work_dir_arg = work_dir_w.c_str();
     }
 
+    // Main window HWND: GetParent() is the host frame ConBox is attached under (jbTerm's
+    // cJbTermFrame), not necessarily true for every possible host, but matches the convention
+    // already used elsewhere in this file (see handle_child_exit's OnCloseQuery post-back).
+    CWnd* host = GetParent();
+    HWND main_hwnd = (host != nullptr) ? host->GetSafeHwnd() : nullptr;
+    std::vector<wchar_t> child_env = BuildChildEnvironmentBlock(main_hwnd, m_hWnd);
+
     BOOL ok = ::CreateProcessW(
         NULL,            // find the module from the command line
         cmd.data(),      // mutable command-line buffer
         NULL, NULL,
         FALSE,           // do not inherit handles (only the console via the pseudoconsole attribute)
-        EXTENDED_STARTUPINFO_PRESENT,
-        NULL,            // lpEnvironment: inherit this process's environment
+        EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+        child_env.data(),  // lpEnvironment: this process's environment plus PROMPT/JBTERM overrides
         work_dir_arg,    // lpCurrentDirectory: NULL = inherit this process's CWD
         &si.StartupInfo,
         &child_proc);

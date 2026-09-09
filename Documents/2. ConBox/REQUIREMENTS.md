@@ -19,6 +19,10 @@
 - Margins are 96 DPI LOGICAL padding used ONLY to compute the initial window size and to derive rows/cols on resize (scaled to physical via the window DPI); `adjust` padding stays in raw physical pixels. The grid is NOT drawn at the margin offset: it is centered in the client area, and when it overflows it is drawn from the top-left and clipped at the bottom/right.
 - Because cell pixels do not scale by the exact DPI ratio (integer font rounding), a preserved grid may not fit the linearly-scaled window after a DPI change. The `snap_mode` ini option controls the response: 0 = centering only (clip if too small); 1 = grow the window only when the grid would be clipped; 2 (default) = always snap the window to the exact grid+margin size. Snapping keeps the upper-left corner fixed and moves the right/bottom edges, and never resizes the pseudo-console.
 - **Zoom via `WM_JBZOOM`**: On receipt, ConBox sets `zoom_pm` and `zoom_resize = true`. The next `OnSize` (triggered by FrameBox `rescale_children` → `MoveWindow`) detects `zoom_resize` and takes the `relayout_for_dpi()` + `snap_to_grid()` path — identical to a real DPI change — preserving the logical grid without calling `update_metrics` or `resize_sink` (no PTY resize). `build_font()` applies `zoom_pm` through `eff_dpi()` so fonts scale with zoom exactly as they do with DPI changes.
+- `start_x`/`start_y` INI keys (host-consumed, read via `config_start_x()`/`config_start_y()`): the
+  host's top-level window start position. ConBox does not position any window itself -- it only parses
+  and stores the values so the host can pass them to its own `CreateWindow` call. Absent/empty resolves
+  to `CW_USEDEFAULT`, same as the previous hardcoded default.
 
 ### 3. Font and Cell Metrics
 

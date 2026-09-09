@@ -221,6 +221,13 @@ public:
     // Current screen grid size (rows, cols). Valid after open().
     GridSize grid_size() const { return { rows, cols }; }
 
+    // Top-level window start position from the start_x/start_y INI keys (host-consumed: ConBox
+    // does not position any window itself). CW_USEDEFAULT if the key is absent or empty -- the
+    // host should pass that straight through to CreateWindow so the system picks the position.
+    // Valid after setup()/setup_from_ini(); call before creating the host's top-level window.
+    int config_start_x() const { return cfg_start_x; }
+    int config_start_y() const { return cfg_start_y; }
+
     // Load settings from an INI file (section-agnostic key matching). path is UTF-8; a relative
     // path is resolved against the EXE directory (not the working directory). nullptr defaults to
     // "ConBox.ini". If the file does not exist, it is created with compiled-in defaults and a
@@ -895,6 +902,11 @@ private:
     // config() result cache: grid size, cmdline, and export settings stored for the host to query.
     int         cfg_cols;
     int         cfg_rows;
+    int         cfg_start_x;   // start_x INI key: top-level window's initial left (px, virtual-screen
+                                // coords). CW_USEDEFAULT (Windows' sentinel) if unset -- host lets the
+                                // system choose. Not used by ConBox itself; the host reads it via
+                                // config_start_x()/config_start_y() before creating its top-level window.
+    int         cfg_start_y;   // start_y INI key; see cfg_start_x
     std::string cfg_cmdline;
     std::string cfg_work_dir;  // work_directory INI key (UTF-8); empty = inherit the host process's CWD
     int         cfg_lines_per_paper; // EMF export: rows per page (lines_per_paper INI key; default 50)

@@ -1,4 +1,4 @@
-﻿# jbClass 사용자 매뉴얼
+﻿# jbBox 클래스 라이브러리 사용자 매뉴얼
 
 ## 목차
 
@@ -12,11 +12,11 @@
 
 ## 1. 라이브러리 개요
 
-jbClass는 MFC(Microsoft Foundation Classes) 기반 C++ 클래스 라이브러리로, 세 가지 독립 모듈로 구성됩니다.
+jbBox는 MFC(Microsoft Foundation Classes) 기반 C++ 클래스 라이브러리로, 세 가지 독립 모듈로 구성됩니다.
 
 ```mermaid
 graph LR
-    subgraph jbClass
+    subgraph jbBox
         FB["FrameBox\n레이아웃 호스트"]
         CB["ConBox\n터미널 컨트롤"]
         TB["TableBox\n가상 그리드 컨트롤"]
@@ -691,4 +691,4 @@ void DemoMain() {
 
 ---
 
-*jbClass - MFC 기반 컨트롤 라이브러리 / 개발 중*
+*jbBox - MFC 기반 컨트롤 라이브러리 / 개발 중*

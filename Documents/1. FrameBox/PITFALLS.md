@@ -76,7 +76,7 @@
   ```xml
   <ItemDefinitionGroup>
     <Manifest>
-      <AdditionalManifestFiles>jbClass.manifest</AdditionalManifestFiles>
+      <AdditionalManifestFiles>jbBox.manifest</AdditionalManifestFiles>
     </Manifest>
   </ItemDefinitionGroup>
   ```
@@ -200,3 +200,24 @@
   controls (see `main.cpp`'s `WS_MINIMIZEBOX`/`WS_THICKFRAME` style block in jbTerm): OR in
   `WS_CLIPCHILDREN` on that specific window's `GWL_STYLE` after `OpenFrame`, not in
   `FrameBox` itself.
+
+### 19. WM_ACTIVATE Focus Restore Must Run AFTER the Base WindowProc Call
+
+- `FrameBox` is a plain `CWnd` (not `CFrameWnd`), so it has no built-in save/restore of the
+  last-focused child across activation. A host that wants "clicking the title bar always
+  refocuses my one real child control" (e.g. jbTerm's `ConBox`) must add this itself in a
+  `WindowProc` override on `WM_ACTIVATE` (`LOWORD(wParam) != WA_INACTIVE`).
+- Calling the child's `SetFocus()` BEFORE forwarding the message to `FrameBox::WindowProc`
+  (-> eventually `DefWindowProc`) does not stick: `DefWindowProc`'s own default `WM_ACTIVATE`
+  handling sets focus back to the top-level window itself, silently undoing it. Confirmed by
+  sending a synthetic `WM_ACTIVATE(WA_CLICKACTIVE)` to a running instance and reading
+  `GetGUIThreadInfo().hwndFocus` before/after each ordering.
+- Fix: call the base `WindowProc` FIRST, keep its result, THEN call the child's `SetFocus()`,
+  then return the saved result.
+- This ordering issue is specific to real `WM_ACTIVATE` delivery through the full message
+  chain (synthetic or genuine). It does not, by itself, guarantee focus at initial window
+  creation -- the first `ShowWindow(SW_SHOW)` (e.g. inside `FrameBox::wait()`/`show()`) was
+  observed to leave focus on the top-level window even with this ordering fixed, so a host
+  that wants the child focused immediately at startup should also call the child's
+  `SetFocus()` explicitly once, right after attaching it, rather than relying on `WM_ACTIVATE`
+  alone.

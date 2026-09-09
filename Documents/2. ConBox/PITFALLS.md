@@ -214,3 +214,13 @@
   `rows` notches would move ~3 screens, not one. ConBox sends `rows / 4`.
 - Do NOT compensate by sending multiple notches per physical wheel click: 1 notch per click already
   matches the local path's 3 lines, and every other terminal (xterm, wt.exe) sends exactly one.
+
+### 20. ParseIniLine Treated a CRLF Blank Line as Malformed
+
+- `ParseIni`/`ParseTriggers` split INI text on `\n` only (`std::getline`), so a blank line in a
+  CRLF-encoded file (every INI in this project) arrives as a lone `"\r"`, not an empty string.
+- `ParseIniLine`'s leading-whitespace skip only recognized `' '`/`'\t'`, so that lone `\r` was treated
+  as real content with no `=` and reported as `"ignored malformed settings line (no '=')"` -- one such
+  warning per blank line in the file (12 in `jbTerm.ini`, matching its 12 section-separator blank
+  lines), even though nothing was actually wrong.
+- Fixed by also skipping `'\r'` in that leading-whitespace loop.
