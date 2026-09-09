@@ -167,20 +167,16 @@
   groups `match=`/`send=`/`cool=` runs itself. `ParseIni()`'s map is still used for every other
   (non-repeating) key.
 
-### 16. setup_from_ini() Auto-Creates a Default File on a Missing Path -- Do Not Probe Existence With It
+### 16. setup_from_ini() No Longer Auto-Creates a File on a Missing Path
 
-- `setup_from_ini(path)` treats "file not found" as "first run": it writes a fresh default INI to the
-  resolved path via `CreateDefaultIni()` and defers a status message, then returns WITHOUT applying any
-  settings from that call. It is not a passive existence check.
-- Implication for a host that wants a priority list of candidate config paths (e.g. an exe-local file
-  overriding a shared one): calling `setup_from_ini()` speculatively on the higher-priority candidate
-  just to "see if it's there" creates that file on the very first run and permanently shadows every
-  lower-priority candidate on every later run. Check existence with `GetFileAttributesW` (or similar)
-  FIRST, and only call `setup_from_ini()` on a path already confirmed to exist.
-- `CreateDefaultIni()` returns `bool` (false if `_wfopen_s` fails, e.g. an invalid path). Previously the
-  failure was swallowed and `setup_from_ini()` unconditionally reported "Created with defaults" even
-  when nothing was written; it now reports the failure distinctly so a bad path is visible instead of
-  silently assumed to have succeeded.
+- The behavior this entry used to warn about (a missing path silently auto-created a default INI,
+  making a speculative existence probe dangerous) was removed: `setup_from_ini()` on a missing path
+  now only appends a status message and leaves settings unchanged -- see
+  `Documents/2. ConBox/REQUIREMENTS.md` #13 for the current behavior. Probing a candidate path by
+  calling `setup_from_ini()` directly is now safe.
+- `CreateDefaultIni()` (the function that used to write that file) was replaced by
+  `ConBox::create_current_ini()`, a public member that returns the CURRENT resolved settings as INI
+  text instead of writing a fixed default to a file (REQUIREMENTS #13).
 
 ### 17. OnPaint Background Fill Used cur_bg (Per-Cell SGR State), Not default_bg
 
@@ -224,3 +220,42 @@
   warning per blank line in the file (12 in `jbTerm.ini`, matching its 12 section-separator blank
   lines), even though nothing was actually wrong.
 - Fixed by also skipping `'\r'` in that leading-whitespace loop.
+
+### 21. Testing stdin/stdout Redirection: Two Automation Gotchas
+
+- A `>`-redirected destination file is created EMPTY at process launch, before the child ever writes
+  to it -- `Test-Path`/existence alone races the real write. Poll until the file's size stops
+  changing, not merely until it exists (worse right after copying+resource-patching a fresh exe, e.g.
+  jbTerm's clone-to-exe menu action: that exe's first-ever launch can be slowed by a real-time
+  antivirus scan).
+- When scripting a launch of `jbTerm.exe` for a test, never kill it by bare process name (see root
+  `PITFALLS.md` #17 -- this Claude Code session can itself be hosted inside a `jbTerm.exe` ConPTY
+  process). Resolve the exact PID via the process tree of the specific launch the script started
+  (e.g. `Win32_Process.ParentProcessId`) and kill only that PID.
+- `cmd.exe` does not wait for a launched GUI-subsystem (`/SUBSYSTEM:WINDOWS`) process the way it
+  waits for a console one -- `cmd /c "gui.exe ..."` returns almost immediately regardless of whether
+  `gui.exe` is still starting up or has already exited. A test that infers success/failure from
+  `cmd.exe`'s own exit code or from how long the wrapping `cmd.exe` process stays alive is measuring
+  the wrong process; poll for the target process (or its output file) directly instead.
+
+### 22. A Host Launched With Its Own stdio Redirected Broke the ConPTY Child's stdin
+
+- `start()`'s `CreateProcessW` intentionally does not set `STARTF_USESTDHANDLES` (the pseudoconsole
+  attribute is what gives the child its console -- the documented ConPTY pattern). Without that flag,
+  `CreateProcessW` still copies THIS process's current standard-handle VALUES into the child's
+  process parameters. When the host itself was launched with its own stdio redirected (e.g. jbTerm
+  run as `jbTerm.exe < settings.ini`), those values are file/pipe handles; the console subsystem does
+  not swap them for the pseudoconsole's the way it swaps real console handles, and since
+  `bInheritHandles` is `FALSE` they are not valid handles in the child's own table either.
+- Symptom looked nothing like a handle bug: the child shell started, ran its startup batch/profile
+  fine (proving the process itself launched correctly), then read EOF from its now-broken stdin on
+  its very first prompt and exited -- which fired `exit_cb` and closed the HOST window within
+  milliseconds of launch, with no crash dialog and no error-log entry (clean `WM_CLOSE`, not a fault).
+- Confirmed by making the child's stdin state directly observable: a probe batch that does `set /p
+  X=` blocks forever on a real console (the working case, e.g. `@file`) but returns immediately when
+  the host's own stdin was redirected (the broken case) -- the same INI content, only the host's
+  launch handle state differs.
+- Fix: blank `STD_INPUT/OUTPUT/ERROR_HANDLE` to `NULL` on this process for the duration of the
+  `CreateProcessW` call, restore them right after. `NULL` is the state a GUI host launched from
+  Explorer already has (the case that always worked), so this makes every launch state converge on
+  it at the one moment it matters, regardless of how the host itself was started.

@@ -22,9 +22,8 @@
 //     few seconds, force-killing via terminate() if needed) before the host actually closes.
 //     Automatic; no host code required. See terminate()/is_running() below.
 //   - Register callbacks (set_title_cb, set_titlebar_color_cb, set_exit_callback, set_input_sink,
-//     set_resize_sink) BEFORE setup()/setup_from_ini(): set_titlebar_color_cb in particular must be
-//     registered first, or a freshly created default INI (no file existed yet) omits [titlebar]
-//     (see CreateDefaultIni/set_titlebar_color_cb).
+//     set_resize_sink) BEFORE setup()/setup_from_ini(): set_titlebar_color_cb in particular gates
+//     the [titlebar] block of create_current_ini() (see create_current_ini/set_titlebar_color_cb).
 //   - Mouse: local drag-selection/overlay scrollbar by default. When the child turns on xterm mouse
 //     tracking (?1000/?1002/?1003 with ?1006 SGR encoding, as Claude Code / vim / htop do), clicks,
 //     drags and wheel notches go to the CHILD instead, the overlay scrollbar is hidden, and the
@@ -230,11 +229,11 @@ public:
 
     // Load settings from an INI file (section-agnostic key matching). path is UTF-8; a relative
     // path is resolved against the EXE directory (not the working directory). nullptr defaults to
-    // "ConBox.ini". If the file does not exist, it is created with compiled-in defaults and a
-    // notification is appended to ini_msg (printed by open() once the window exists; multiple
-    // calls accumulate their messages instead of overwriting each other). Settings stay at
-    // constructor defaults. If the file exists but cannot be opened, the same deferred print()
-    // path applies. Call before open() so fonts/margins are set before the first layout.
+    // "ConBox.ini". If the file does not exist, nothing is written: a notification is appended to
+    // ini_msg (printed by open() once the window exists; multiple calls accumulate their messages
+    // instead of overwriting each other) and every setting stays at whatever the previous layer
+    // resolved. If the file exists but cannot be opened, the same deferred print() path applies.
+    // Call before open() so fonts/margins are set before the first layout.
     // Calling this (or setup()) more than once layers settings: the first call resolves every key
     // to its compiled-in default unless the file overrides it; each later call only touches keys
     // present in that file and leaves every other setting at whatever the previous call resolved
@@ -253,6 +252,21 @@ public:
     // "key=value" line whose key nothing in setup() recognizes (e.g. a typo) -- both previously
     // failed or applied with no feedback.
     void setup(const char* contents);
+
+    // Serialize the settings currently in effect as INI text (UTF-8, '\n' line endings, no BOM),
+    // in the same section/key/comment layout setup_from_ini() reads, so the result is both
+    // human-readable and reloadable with no drift: values come from the resolved members (every
+    // setup()/setup_from_ini() layer applied so far), and string values are re-escaped so paths,
+    // macros and trigger patterns survive the round trip. The [titlebar] block is included only
+    // while set_titlebar_color_cb is registered (without it those keys cannot take effect).
+    // A host writing this to a file should prepend a UTF-8 BOM and convert '\n' to CRLF.
+    std::string create_current_ini() const;
+
+    // Queue a message for display as soon as the window exists (printed by open(), ahead of any
+    // child output). Same deferred channel setup()/setup_from_ini() use for their own status
+    // messages, so a host-side startup notice issued before open() is not lost. Text is UTF-8;
+    // end lines with "\r\n". After open() has run, use print() instead.
+    void add_message(const char* text);
 
     // Export all content (scrollback + screen) to a series of EMF vector files in dir (UTF-8 path).
     // Files are named ConBox000.emf, ConBox001.emf, ...
@@ -322,8 +336,8 @@ public:
     // the host. Any color not set in the INI is CLR_INVALID -- leave that attribute at the system
     // default. nullptr = no notification (default).
     // Register this (and every other set_*_cb/set_*_sink/set_exit_callback) BEFORE calling
-    // setup()/setup_from_ini(): CreateDefaultIni only writes the [titlebar] block into a freshly
-    // created INI when this callback is already registered at that point (see setup_from_ini).
+    // setup()/setup_from_ini(): create_current_ini() writes the [titlebar] block only while this
+    // callback is registered, so a settings dump taken before registration would omit it.
     void set_titlebar_color_cb(void (*cb)(COLORREF caption, COLORREF text, COLORREF border));
 
     // === ConPTY child runner (optional) ===

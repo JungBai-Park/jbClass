@@ -739,152 +739,270 @@ static COLORREF ParseColor(const std::string& s, COLORREF def)
     return def;
 }
 
-// Write a default INI file to path (called on first run when no config exists).
-// The generated INI text contains Korean UTF-8 comments directly in these literals.
-// Keep this source file saved as UTF-8 with BOM so MSVC reads them correctly.
-// The written file itself gets a UTF-8 BOM prepended (see below); ParseIni() skips it on read.
-// include_titlebar: write the [titlebar] block only if the host has already registered
-// set_titlebar_color_cb (otherwise those keys would have no way to take effect, so omitting them
-// keeps a fresh default INI from suggesting a feature that is not wired up).
-// Returns false if the file could not be created (e.g. an invalid path) so the caller can report
-// the failure instead of claiming success.
-static bool CreateDefaultIni(const wchar_t* path, bool include_titlebar)
+// Encode a value back into INI literal form: the exact inverse of DecodeEscapes, plus the two cases
+// ParseIniLine handles before decoding ever runs (a raw ';' starts an inline comment; leading and
+// trailing spaces are trimmed). DecodeEscapes(EncodeEscapes(s)) == s for any s, which is what lets
+// create_current_ini() emit text that reloads to the identical settings. Bytes >= 0x80 (UTF-8 Korean
+// etc.) pass through untouched, matching DecodeEscapes' byte-wise scan. Interior spaces stay literal
+// so ordinary values (font names, command lines) remain readable.
+static std::string EncodeEscapes(const std::string& raw)
 {
-    FILE* f = nullptr;
-    _wfopen_s(&f, path, L"w");
-    if (!f) return false;
-    static const unsigned char utf8_bom[3] = { 0xEF, 0xBB, 0xBF };
-    fwrite(utf8_bom, 1, sizeof(utf8_bom), f);   // text mode only rewrites \n; raw BOM bytes pass through untouched
-    fputs(
+    std::string out;
+    out.reserve(raw.size());
+    for (size_t i = 0; i < raw.size(); ++i) {
+        unsigned char c = (unsigned char)raw[i];
+        switch (c) {
+        case '\\': out += "\\\\";  break;
+        case '\r': out += "\\r";   break;
+        case '\b': out += "\\b";   break;
+        case '\a': out += "\\a";   break;
+        case '\t': out += "\\t";   break;
+        case '\n': out += "\\n";   break;
+        case '\f': out += "\\f";   break;
+        case '\v': out += "\\v";   break;
+        case ';':  out += "\\x3b"; break;   // a raw ';' would be cut as an inline comment
+        case ' ':
+            if (i == 0 || i + 1 == raw.size()) out += "\\x20";   // leading/trailing space would be trimmed
+            else out.push_back(' ');
+            break;
+        default:
+            if (c < 0x20 || c == 0x7F) {
+                char hex[8];
+                sprintf_s(hex, sizeof(hex), "\\x%02x", c);
+                out += hex;
+            } else {
+                out.push_back((char)c);
+            }
+            break;
+        }
+    }
+    return out;
+}
+
+// === create_current_ini() formatting helpers ===
+
+// "#RRGGBB". CLR_INVALID means "never set" (e.g. an unconfigured [titlebar] key), which writes an
+// empty value so the key keeps its "leave at the system default" meaning on reload.
+static std::string FormatColor(COLORREF c)
+{
+    if (c == CLR_INVALID) return std::string();
+    char buf[16];
+    sprintf_s(buf, sizeof(buf), "#%02X%02X%02X", GetRValue(c), GetGValue(c), GetBValue(c));
+    return buf;
+}
+
+static std::string FormatInt(int v)
+{
+    char buf[16];
+    sprintf_s(buf, sizeof(buf), "%d", v);
+    return buf;
+}
+
+// Point sizes print without a trailing ".0" (12.0 -> "12", 12.5 -> "12.5").
+static std::string FormatSize(float v)
+{
+    char buf[32];
+    sprintf_s(buf, sizeof(buf), "%g", (double)v);
+    return buf;
+}
+
+// One "key = value ; comment" line. key_w/val_w are the section's column widths so values and
+// comments line up; a value longer than its column just pushes its own comment right (never
+// truncated, never merged into the value). comment may be empty: the line then ends at the value.
+static void AppendIniLine(std::string& out, const char* key, const std::string& val,
+                          const char* comment, int key_w, int val_w)
+{
+    std::string line = key;
+    if ((int)line.size() < key_w) line.append(key_w - line.size(), ' ');
+    line += "= ";
+    line += val;
+    if (comment && *comment) {
+        int pad = val_w - (int)val.size();
+        line.append(pad > 0 ? pad : 1, ' ');
+        line += comment;
+    }
+    out += line;
+    out += "\n";
+}
+
+// Serialize the CURRENT settings as INI text (UTF-8, '\n' line endings, no BOM). Every value comes
+// from the resolved members -- i.e. the result of every setup()/setup_from_ini() layer applied so
+// far, including host-injected settings -- not from any source file's original text, so what is
+// written is what is actually in effect. String values are re-escaped with EncodeEscapes, so paths,
+// macros and trigger patterns round-trip through setup() unchanged.
+// The [titlebar] block is written only when the host registered set_titlebar_color_cb: ConBox has no
+// title bar of its own, so without that callback those keys could not take effect and listing them
+// would advertise a feature that is not wired up.
+// The generated text contains Korean UTF-8 comments directly in these literals; keep this source
+// file saved as UTF-8 with BOM so MSVC reads them correctly.
+std::string ConBox::create_current_ini() const
+{
+    std::string s;
+    s +=
         "; ConBox 설정 파일\n"
         "; 섹션 이름은 무시됩니다 -- 키 이름으로만 인식합니다.\n"
         "\n"
         "[font]\n"
-        "; 폰트 크기는 포인트(pt) 단위. option: B=굵게, I=기울임, 90W=너비 90%\n"
-        "efont_name    = Cascadia Mono   ; 영문 폰트 이름\n"
-        "efont_size    = 12              ; 영문 폰트 크기 (포인트)\n"
-        "efont_opts    =                 ; 영문 폰트 옵션\n"
-        "kfont_name    = Malgun Gothic   ; 한글 폰트 이름\n"
-        "kfont_size    = 0               ; 0 이하: 영문 높이에 맞춤 / 양수: 크기 직접 지정\n"
-        "kfont_opts    = B               ; 한글 폰트 옵션\n"
-        "fallback_font_name = Segoe UI Symbol ; 영문/한글 폰트에 글리프가 없는 기호의 대체 폰트\n"
+        "; 폰트 크기는 포인트(pt) 단위. option: B=굵게, I=기울임, 90W=너비 90%\n";
+    AppendIniLine(s, "efont_name", EncodeEscapes(efont_name), "; 영문 폰트 이름", 14, 16);
+    AppendIniLine(s, "efont_size", FormatSize(efont_size), "; 영문 폰트 크기 (포인트)", 14, 16);
+    AppendIniLine(s, "efont_opts", EncodeEscapes(efont_opts), "; 영문 폰트 옵션", 14, 16);
+    AppendIniLine(s, "kfont_name", EncodeEscapes(kfont_name), "; 한글 폰트 이름", 14, 16);
+    AppendIniLine(s, "kfont_size", FormatSize(kfont_size), "; 0 이하: 영문 높이에 맞춤 / 양수: 크기 직접 지정", 14, 16);
+    AppendIniLine(s, "kfont_opts", EncodeEscapes(kfont_opts), "; 한글 폰트 옵션", 14, 16);
+    AppendIniLine(s, "fallback_font_name", EncodeEscapes(fallback_font_name),
+                  "; 영문/한글 폰트에 글리프가 없는 기호의 대체 폰트", 14, 16);
+
+    s +=
         "\n"
         "[layout]\n"
-        "; 마진: 콘텐츠와 창 가장자리 사이 여백(px). adjust: 셀 크기 미세조정(px, 음수=줄임)\n"
-        "margin_top    = 10              ; 위쪽 여백\n"
-        "margin_left   = 10              ; 왼쪽 여백\n"
-        "margin_bottom = 10              ; 아래쪽 여백\n"
-        "margin_right  = 10              ; 오른쪽 여백\n"
-        "adjust_left   = 0               ; 셀 왼쪽 패딩\n"
-        "adjust_top    = -2              ; 셀 위쪽 패딩\n"
-        "adjust_right  = 0               ; 셀 오른쪽 패딩\n"
-        "adjust_bottom = 0               ; 셀 아래쪽 패딩\n"
-        "grid_cols     = 96              ; 가로 칸 수\n"
-        "grid_rows     = 32              ; 세로 줄 수\n"
-        "snap_mode     = 2               ; DPI 변경시 창 스냅: 0=센터링만(작으면 우/하단 짤림), 1=작을때만 확대, 2=margin 확보후 항상 스냅\n"
+        "; 마진: 콘텐츠와 창 가장자리 사이 여백(px). adjust: 셀 크기 미세조정(px, 음수=줄임)\n";
+    AppendIniLine(s, "margin_top", FormatInt(margin_top), "; 위쪽 여백", 14, 16);
+    AppendIniLine(s, "margin_left", FormatInt(margin_left), "; 왼쪽 여백", 14, 16);
+    AppendIniLine(s, "margin_bottom", FormatInt(margin_bottom), "; 아래쪽 여백", 14, 16);
+    AppendIniLine(s, "margin_right", FormatInt(margin_right), "; 오른쪽 여백", 14, 16);
+    AppendIniLine(s, "adjust_left", FormatInt(adjust_left), "; 셀 왼쪽 패딩", 14, 16);
+    AppendIniLine(s, "adjust_top", FormatInt(adjust_top), "; 셀 위쪽 패딩", 14, 16);
+    AppendIniLine(s, "adjust_right", FormatInt(adjust_right), "; 셀 오른쪽 패딩", 14, 16);
+    AppendIniLine(s, "adjust_bottom", FormatInt(adjust_bottom), "; 셀 아래쪽 패딩", 14, 16);
+    AppendIniLine(s, "grid_cols", FormatInt(cfg_cols), "; 가로 칸 수", 14, 16);
+    AppendIniLine(s, "grid_rows", FormatInt(cfg_rows), "; 세로 줄 수", 14, 16);
+    AppendIniLine(s, "snap_mode", FormatInt(snap_mode),
+                  "; DPI 변경시 창 스냅: 0=센터링만(작으면 우/하단 짤림), 1=작을때만 확대, 2=margin 확보후 항상 스냅", 14, 16);
+
+    // start_x/start_y: CW_USEDEFAULT is the "not set" state (host lets the system place the window),
+    // written as an empty value so a reload resolves it back to CW_USEDEFAULT rather than to a
+    // literal coordinate.
+    s +=
         "\n"
         "[window]\n"
-        "; 시작 위치(px, 가상 화면 좌표). 비워두면 시스템이 기본 위치를 정합니다.\n"
-        "start_x       =                 ; 시작 위치 X\n"
-        "start_y       =                 ; 시작 위치 Y\n"
+        "; 시작 위치(px, 가상 화면 좌표). 비워두면 시스템이 기본 위치를 정합니다.\n";
+    AppendIniLine(s, "start_x", cfg_start_x == CW_USEDEFAULT ? std::string() : FormatInt(cfg_start_x),
+                  "; 시작 위치 X", 14, 16);
+    AppendIniLine(s, "start_y", cfg_start_y == CW_USEDEFAULT ? std::string() : FormatInt(cfg_start_y),
+                  "; 시작 위치 Y", 14, 16);
+
+    static const char* const pal_comment[16] = {
+        "; 검정", "; 빨강", "; 초록", "; 노랑", "; 파랑", "; 자홍", "; 청록", "; 흰색(밝은)",
+        "; 회색(밝은 검정)", "; 밝은 빨강", "; 밝은 초록", "; 밝은 노랑", "; 밝은 파랑",
+        "; 밝은 자홍", "; 밝은 청록", "; 흰색"
+    };
+    char pal_key[24];
+
+    s +=
         "\n"
         "[screen]\n"
-        "; 색상 형식: #RRGGBB\n"
-        "screen_text       = #C8C8C8     ; 기본 글자색\n"
-        "screen_back       = #202020     ; 기본 배경색\n"
-        "; ANSI 16색 팔레트 (SGR 30~37/90~97 색상, 0-indexed)\n"
-        "screen_palette00  = #000000     ; 검정\n"
-        "screen_palette01  = #CD0000     ; 빨강\n"
-        "screen_palette02  = #00CD00     ; 초록\n"
-        "screen_palette03  = #CDCD00     ; 노랑\n"
-        "screen_palette04  = #0000EE     ; 파랑\n"
-        "screen_palette05  = #CD00CD     ; 자홍\n"
-        "screen_palette06  = #00CDCD     ; 청록\n"
-        "screen_palette07  = #E5E5E5     ; 흰색(밝은)\n"
-        "screen_palette08  = #7F7F7F     ; 회색(밝은 검정)\n"
-        "screen_palette09  = #FF0000     ; 밝은 빨강\n"
-        "screen_palette10  = #00FF00     ; 밝은 초록\n"
-        "screen_palette11  = #FFFF00     ; 밝은 노랑\n"
-        "screen_palette12  = #5C5CFF     ; 밝은 파랑\n"
-        "screen_palette13  = #FF00FF     ; 밝은 자홍\n"
-        "screen_palette14  = #00FFFF     ; 밝은 청록\n"
-        "screen_palette15  = #FFFFFF     ; 흰색\n"
+        "; 색상 형식: #RRGGBB\n";
+    AppendIniLine(s, "screen_text", FormatColor(default_fg), "; 기본 글자색", 18, 12);
+    AppendIniLine(s, "screen_back", FormatColor(default_bg), "; 기본 배경색", 18, 12);
+    s += "; ANSI 16색 팔레트 (SGR 30~37/90~97 색상, 0-indexed)\n";
+    for (int i = 0; i < 16; i++) {
+        sprintf_s(pal_key, sizeof(pal_key), "screen_palette%02d", i);
+        AppendIniLine(s, pal_key, FormatColor(ansi_colors[i]), pal_comment[i], 18, 12);
+    }
+
+    s +=
         "\n"
         "[paper]\n"
-        "; EMF/PDF 출력용 색상\n"
-        "paper_text        = #000000\n"
-        "paper_back        = #FFFFFF\n"
-        "paper_palette00   = #FFFFFF\n"
-        "paper_palette01   = #CC0000\n"
-        "paper_palette02   = #4E9A06\n"
-        "paper_palette03   = #C4A000\n"
-        "paper_palette04   = #3465A4\n"
-        "paper_palette05   = #75507B\n"
-        "paper_palette06   = #06989A\n"
-        "paper_palette07   = #000000\n"
-        "paper_palette08   = #EEEEEE\n"
-        "paper_palette09   = #CC0000\n"
-        "paper_palette10   = #4E9A06\n"
-        "paper_palette11   = #C4A000\n"
-        "paper_palette12   = #3465A4\n"
-        "paper_palette13   = #75507B\n"
-        "paper_palette14   = #06989A\n"
-        "paper_palette15   = #000000\n"
-        "lines_per_paper   = 50         ; EMF 그림 한장에 표시되는 줄 수\n"
+        "; EMF/PDF 출력용 색상\n";
+    AppendIniLine(s, "paper_text", FormatColor(paper_default_fg), "", 18, 12);
+    AppendIniLine(s, "paper_back", FormatColor(paper_default_bg), "", 18, 12);
+    for (int i = 0; i < 16; i++) {
+        sprintf_s(pal_key, sizeof(pal_key), "paper_palette%02d", i);
+        AppendIniLine(s, pal_key, FormatColor(paper_ansi_colors[i]), "", 18, 12);
+    }
+    AppendIniLine(s, "lines_per_paper", FormatInt(cfg_lines_per_paper), "; EMF 그림 한장에 표시되는 줄 수", 18, 12);
+
+    s +=
         "\n"
         "[cursor]\n"
-        "; 커서 모양: 홀수=깜빡임, 짝수=고정\n"
-        "cursor_type     = 0             ; 0=기본(3), 1=깜빡블록, 2=고정블록, 3=깜빡밑줄, 4=고정밑줄, 5=깜빡I빔, 6=고정I빔\n"
-        "cursor_blend_bg = 4             ; 커서 색상 - 배경색 비중\n"
-        "cursor_blend_fg = 6             ; 커서 색상 - 글자색 비중\n"
-        "cursor_blink_ms = 0             ; 깜빡임 간격(ms). 0 = 시스템 설정 따름\n"
+        "; 커서 모양: 홀수=깜빡임, 짝수=고정\n";
+    AppendIniLine(s, "cursor_type", FormatInt(cursor_type),
+                  "; 0=기본(3), 1=깜빡블록, 2=고정블록, 3=깜빡밑줄, 4=고정밑줄, 5=깜빡I빔, 6=고정I빔", 16, 14);
+    AppendIniLine(s, "cursor_blend_bg", FormatInt(cursor_bg_weight), "; 커서 색상 - 배경색 비중", 16, 14);
+    AppendIniLine(s, "cursor_blend_fg", FormatInt(cursor_fg_weight), "; 커서 색상 - 글자색 비중", 16, 14);
+    AppendIniLine(s, "cursor_blink_ms", FormatInt(cursor_blink_ms), "; 깜빡임 간격(ms). 0 = 시스템 설정 따름", 16, 14);
+
+    s +=
         "\n"
-        "[bell]\n"
-        "bell_style      = 1             ; BEL(\\a) 응답: 0=끔, 1=소리(기본), 2=화면 반전 깜빡임, 3=소리+깜빡임\n"
-        "\n",
-        f);
-    if (include_titlebar) {
-        fputs(
+        "[bell]\n";
+    AppendIniLine(s, "bell_style", FormatInt(cfg_bell_style),
+                  "; BEL(\\a) 응답: 0=끔, 1=소리(기본), 2=화면 반전 깜빡임, 3=소리+깜빡임", 16, 14);
+
+    if (titlebar_color_cb) {
+        s +=
+            "\n"
             "[titlebar]\n"
-            "; Windows 11 이상만 적용됨, 비워두면 시스템 기본값 유지.\n"
-            "titlebar_caption =               ; 타이틀 바 배경색\n"
-            "titlebar_text    =               ; 타이틀 바 글자색\n"
-            "titlebar_border  =               ; 창 테두리색\n"
-            "\n",
-            f);
+            "; Windows 11 이상만 적용됨, 비워두면 시스템 기본값 유지.\n";
+        AppendIniLine(s, "titlebar_caption", FormatColor(titlebar_caption), "; 타이틀 바 배경색", 17, 15);
+        AppendIniLine(s, "titlebar_text", FormatColor(titlebar_text), "; 타이틀 바 글자색", 17, 15);
+        AppendIniLine(s, "titlebar_border", FormatColor(titlebar_border), "; 창 테두리색", 17, 15);
     }
-    fputs(
-        "[rendering]\n"
-        "builtin_glyphs = 2              ; 0=폰트, 1=블록문자 직접그림, 2=박스선까지 직접그림(기본)\n"
-        "scrollback_cap = 5000           ; 스크롤백 최대 줄 수\n"
+
+    s +=
         "\n"
-        "[child]\n"
-        "cmdline =                       ; 실행할 자식 프로세스 명령줄 (비워두면 자동 실행 안함)\n"
-        "work_directory =                ; 자식 프로세스의 작업 디렉토리 (비워두면 부모 프로세스의 작업 디렉토리를 물려받음)\n"
-        "close_kill_timeout_ms = 250     ; 창을 닫을 때 자식 프로세스 정상 종료를 기다리는 시간(ms). 지나면 강제 종료\n"
+        "[rendering]\n";
+    AppendIniLine(s, "builtin_glyphs", FormatInt(glyph_level),
+                  "; 0=폰트, 1=블록문자 직접그림, 2=박스선까지 직접그림(기본)", 15, 15);
+    AppendIniLine(s, "scrollback_cap", FormatInt(max_scrollback), "; 스크롤백 최대 줄 수", 15, 15);
+
+    s +=
+        "\n"
+        "[child]\n";
+    AppendIniLine(s, "cmdline", EncodeEscapes(cfg_cmdline),
+                  "; 실행할 자식 프로세스 명령줄 (비워두면 자동 실행 안함)", 22, 16);
+    AppendIniLine(s, "work_directory", EncodeEscapes(cfg_work_dir),
+                  "; 자식 프로세스의 작업 디렉토리 (비워두면 부모 프로세스의 작업 디렉토리를 물려받음)", 22, 16);
+    AppendIniLine(s, "close_kill_timeout_ms", FormatInt(cfg_close_kill_timeout_ms),
+                  "; 창을 닫을 때 자식 프로세스 정상 종료를 기다리는 시간(ms). 지나면 강제 종료", 22, 16);
+
+    // F10 is deliberately not written: it never reaches the macro handler (WM_SYSKEYDOWN, see
+    // terminal_keydown), so listing it would advertise a key that cannot work.
+    s +=
         "\n"
         "[macros]\n"
-        "; F1~F12 키를 누르면 아래 문자열을 그대로 자식 프로세스에 입력합니다 (F10 사용불가, 비워두면 해당 키는 원래 동작 유지).\n"
-        "F1 =\n"
-        "F2 =\n"
-        "F3 =\n"
-        "F4 =\n"
-        "F5 =\n"
-        "F6 =\n"
-        "F7 =\n"
-        "F8 =\n"
-        "F9 =\n"
-        "F11 =\n"
-        "F12 =\n"
+        "; F1~F12 키를 누르면 아래 문자열을 그대로 자식 프로세스에 입력합니다 (F10 사용불가, 비워두면 해당 키는 원래 동작 유지).\n";
+    for (int i = 0; i < 12; ++i) {
+        if (i == 9) continue;   // F10
+        char fkey[8];
+        sprintf_s(fkey, sizeof(fkey), "F%d", i + 1);
+        AppendIniLine(s, fkey, EncodeEscapes(cfg_macro_f[i]), "", 4, 0);
+    }
+
+    s +=
         "\n"
         "[triggers]\n"
-        "; 화면 커서 왼쪽 문자열이 match로 끝나면 send를 그대로 자식에 입력합니다. (복수개의 match/send 정의 가능)\n"
-        "match = password:\\x20   ; 커서 왼쪽에서 검색할 비교 대상\n"
-        "send  =                 ; 비교 대상이 발견 되었을 때 전송되는 문자열 (비워져 있으면 등록되지 않음)\n"
-        "cool  =                 ; 사용된 후 재사용 될 때까지의 대기시간 (비워져 있으면 1회성으로 사용됨)\n",
-        f);
-    fclose(f);
-    return true;
+        "; 화면 커서 왼쪽 문자열이 match로 끝나면 send를 그대로 자식에 입력합니다. (복수개의 match/send 정의 가능)\n";
+    if (cfg_triggers.empty()) {
+        // No rule registered: keep the inert example so the written file still documents the syntax.
+        // Its empty send makes ParseTriggers discard it on reload, so it cannot drift into a real rule.
+        AppendIniLine(s, "match", "password:\\x20", "; 커서 왼쪽에서 검색할 비교 대상", 6, 16);
+        AppendIniLine(s, "send", "", "; 비교 대상이 발견 되었을 때 전송되는 문자열 (비워져 있으면 등록되지 않음)", 6, 16);
+        AppendIniLine(s, "cool", "", "; 사용된 후 재사용 될 때까지의 대기시간 (비워져 있으면 1회성으로 사용됨)", 6, 16);
+    } else {
+        for (size_t i = 0; i < cfg_triggers.size(); ++i) {
+            const Trigger& t = cfg_triggers[i];
+            if (i > 0) s += "\n";
+            AppendIniLine(s, "match", EncodeEscapes(t.match), "; 커서 왼쪽에서 검색할 비교 대상", 6, 16);
+            AppendIniLine(s, "send", EncodeEscapes(t.send),
+                          "; 비교 대상이 발견 되었을 때 전송되는 문자열", 6, 16);
+            // cool_ms < 0 is what ParseTriggers assigns to a missing/empty cool (fire once), so it
+            // is written back as an empty value rather than as a negative number.
+            AppendIniLine(s, "cool", t.cool_ms < 0 ? std::string() : FormatInt(t.cool_ms),
+                          "; 사용된 후 재사용 될 때까지의 대기시간 (비워져 있으면 1회성으로 사용됨)", 6, 16);
+        }
+    }
+
+    return s;
+}
+
+// Queue text for display as soon as the window exists. Shares the deferred channel
+// setup_from_ini()/setup() use for their own status messages, so it is printed once by open(),
+// before any child output. Intended for a host-side startup notice that happens before open() --
+// after open() has run, call print() instead (text queued later is never flushed).
+void ConBox::add_message(const char* text)
+{
+    if (text && *text) ini_msg += text;
 }
 
 // Apply INI-format settings from a string. contents: UTF-8 with \n line endings.
@@ -1042,11 +1160,9 @@ void ConBox::setup(const char* contents)
 
 // Load settings from an INI file.  Sections are ignored; keys are matched by name only.
 // Relative paths are resolved against the EXE directory.
-// - File not found: auto-created with compiled-in defaults at the resolved path; a status message is
-//   appended to ini_msg and printed by open() once the window exists. Settings stay at whatever the
-//   previous setup()/setup_from_ini() call resolved (constructor defaults on the very first call).
-//   If creation also fails (e.g. the path is not a valid filename), ini_msg reports that instead of
-//   claiming success, so a bad path is visible rather than silently swallowed.
+// - File not found: nothing is written; a status message is appended to ini_msg and printed by
+//   open() once the window exists. Settings stay at whatever the previous setup()/setup_from_ini()
+//   call resolved (constructor defaults on the very first call).
 // - File found but cannot be opened: same deferred append-and-print path, no settings changed.
 // Calling this more than once (e.g. a global INI then a local override INI) appends each call's
 // status message rather than replacing it, so a "file not found" from an earlier call is not lost
@@ -1065,11 +1181,11 @@ void ConBox::setup_from_ini(const char* path)
         return s;
     };
 
+    // Missing file: report it and change nothing. No file is written here -- a named INI that does
+    // not exist is a user mistake worth showing, not a reason to drop a generated file into the
+    // user's directory (and settings simply stay at whatever the previous layer resolved).
     if (::GetFileAttributesW(wide_path.c_str()) == INVALID_FILE_ATTRIBUTES) {
-        if (CreateDefaultIni(wide_path.c_str(), titlebar_color_cb != nullptr))
-            ini_msg += "ConBox: INI file not found. Created with defaults:\r\n" + w2u(wide_path) + "\r\n";
-        else
-            ini_msg += "ConBox: INI file not found and could not be created (check the path/filename):\r\n" + w2u(wide_path) + "\r\n";
+        ini_msg += "ConBox: INI file not found (settings unchanged):\r\n" + w2u(wide_path) + "\r\n";
         return;
     }
 
@@ -5338,6 +5454,28 @@ bool ConBox::start(const char* cmdline)
     HWND main_hwnd = (host != nullptr) ? host->GetSafeHwnd() : nullptr;
     std::vector<wchar_t> child_env = BuildChildEnvironmentBlock(main_hwnd, m_hWnd);
 
+    // Blank this process's OWN standard handles across the spawn, then restore them.
+    // WHY: STARTUPINFOEX here deliberately does NOT set STARTF_USESTDHANDLES (the pseudoconsole
+    // attribute is what gives the child its console -- this is the documented ConPTY pattern). But
+    // with STARTF_USESTDHANDLES absent, CreateProcessW copies THIS process's current standard-handle
+    // VALUES into the child's process parameters. When the host was launched with its own stdio
+    // redirected ("host.exe < settings.ini", a pipe, ...), those values are file/pipe handles, and
+    // the console subsystem does not replace them with the pseudoconsole's the way it replaces
+    // console handles. Since bInheritHandles is FALSE they are not valid in the child either, so the
+    // child ends up with a broken stdin: an interactive shell reads EOF immediately and exits, which
+    // fires exit_cb and tears the host window down "for no reason" right after launch.
+    // Blanking to NULL reproduces exactly the state a GUI host launched from Explorer already has
+    // (NULL standard handles) -- the configuration every working case runs in today -- so the child
+    // reliably gets the pseudoconsole's handles regardless of how the host itself was started.
+    // Process-wide state, so it is restored immediately after the call (the window where another
+    // thread could observe NULL is just this one CreateProcessW).
+    HANDLE saved_std_in  = ::GetStdHandle(STD_INPUT_HANDLE);
+    HANDLE saved_std_out = ::GetStdHandle(STD_OUTPUT_HANDLE);
+    HANDLE saved_std_err = ::GetStdHandle(STD_ERROR_HANDLE);
+    ::SetStdHandle(STD_INPUT_HANDLE,  NULL);
+    ::SetStdHandle(STD_OUTPUT_HANDLE, NULL);
+    ::SetStdHandle(STD_ERROR_HANDLE,  NULL);
+
     BOOL ok = ::CreateProcessW(
         NULL,            // find the module from the command line
         cmd.data(),      // mutable command-line buffer
@@ -5348,8 +5486,13 @@ bool ConBox::start(const char* cmdline)
         work_dir_arg,    // lpCurrentDirectory: NULL = inherit this process's CWD
         &si.StartupInfo,
         &child_proc);
-    // Capture immediately: DeleteProcThreadAttributeList/HeapFree/CloseHandle below can overwrite it.
+    // Capture immediately: SetStdHandle/DeleteProcThreadAttributeList/HeapFree/CloseHandle below can
+    // overwrite it.
     DWORD create_err = ok ? 0 : ::GetLastError();
+
+    ::SetStdHandle(STD_INPUT_HANDLE,  saved_std_in);
+    ::SetStdHandle(STD_OUTPUT_HANDLE, saved_std_out);
+    ::SetStdHandle(STD_ERROR_HANDLE,  saved_std_err);
 
     ::DeleteProcThreadAttributeList(si.lpAttributeList);
     ::HeapFree(::GetProcessHeap(), 0, si.lpAttributeList);

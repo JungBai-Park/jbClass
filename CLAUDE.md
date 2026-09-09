@@ -117,6 +117,10 @@ project-root/
 
 # 주요 문서
 
+※ 마크다운 문서는 UTF-8 with BOM 형태로 작성한다.
+※ 마크다운 문서 작성시 문장이 길어져도 줄바꿈문자를 삽입하지 않고 작성한다. 
+   (Viewer가 자동으로 줄바꿈하는 것에 의존해야 함)
+
 #### 1. 요구사양서 (REQUIREMENTS.md)
 
 @Documents/REQUIREMENTS.md
@@ -158,6 +162,20 @@ project-root/
 #### 5. Andrei Karpathy의 LLM 코딩 원칙
 
 @Documents/Karpathy.md
+
+#### 6. jbBox Class Library 매뉴얼 (Documents/jbBox Class Library 매뉴얼.md)
+
+- 이 문서를 배포받는 대상은 **개발자**이다 (Class Library를 가져다 쓰는 입장).
+- 개발자 입장에서의 사용법, 빌드 절차, 소스 코드 구조와 각 모듈의 역할, 주의사항, 호환성 등을 담는다.
+
+#### 7. jbTerm 프로그램 매뉴얼 (Documents/jbTerm 프로그램 매뉴얼.md)
+
+- 이 문서를 배포받는 대상은 **일반 Windows 사용자**이다 (jbTerm.exe만 실행해서 쓰는 입장이며, 개발자가 아니다).
+- 이 프로그램을 충분히 활용하기 위해 사용자가 알아야 할 사항만 담는다.
+- 다음 내용은 적지 않는다 :
+  - 빌드 방법, 개발 환경 등 개발자용 정보.
+  - "이전 버전에서는 이랬는데 지금은 이렇게 바뀌었다"는 식으로 과거 버전 대비 기능 변경 이력을
+    서술하는 내용. (jbTerm은 아직 기능이 수시로 바뀌는 단계이므로, 현재 시점의 동작만 서술한다.)
 
 
 

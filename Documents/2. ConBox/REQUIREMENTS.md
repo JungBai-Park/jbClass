@@ -103,12 +103,13 @@
   - the timer expires -> `terminate()` force-kills the child, then the close is completed the same way.
 - This is automatic for any `ConBox` registered as a `FrameBox` child (`AddNew`) -- no host application code is required. Multiple `ConBox` instances under one `FrameBox` are handled independently (each answers `WM_JBCLOSEQUERY` for itself).
 - **System shutdown/logoff (`WM_ENDSESSION`)**: the `CLOSE_TIMER` grace period above is asynchronous and may never elapse if Windows tears the process down before it fires, leaving the child as an orphan. This is NOT automatic -- a host must call `terminate()` synchronously from its own `WM_ENDSESSION` handler when `wParam != 0` (session actually ending). See `Build/jbTerm/main.cpp` (`cJbTermFrame::WindowProc`) for the pattern. `WM_QUERYENDSESSION` is deliberately left unhandled (default allows the session to end) so a shutdown later cancelled by another app does not still kill the child.
+- `start()` gets a working pseudoconsole for the child regardless of the HOST's own standard handles: it blanks this process's `STD_INPUT/OUTPUT/ERROR_HANDLE` to `NULL` for the duration of the `CreateProcessW` call and restores them immediately after (see PITFALLS #22 for why this is necessary). A host that reads/writes stdio from another thread should not do so across a `start()` call.
 
 ### 10. Host Notification Callbacks
 
 - `set_exit_callback`, `set_title_cb`, and `set_titlebar_color_cb` take no opaque `user` context argument (unlike `set_input_sink`/`set_resize_sink`, which keep theirs since `start()` reuses them internally via static thunks).
 - `set_titlebar_color_cb(caption, text, border)` is fed from the `[titlebar]` INI colors; a color not set in the INI is `CLR_INVALID`. `ConBox` has no title bar of its own -- applying the values (e.g. via `DwmSetWindowAttribute`) is entirely up to the host. The callback fires once from `setup()`/`setup_from_ini()` and again immediately on registration, so it never misses the current values regardless of call order.
-- `CreateDefaultIni` writes the `[titlebar]` block into a freshly created INI only if `set_titlebar_color_cb` is already registered at that point -- so hosts that want it must register callbacks BEFORE calling `setup()`/`setup_from_ini()`.
+- `create_current_ini()` (see #13) writes the `[titlebar]` block only if `set_titlebar_color_cb` is already registered at that point -- so hosts that want it must register callbacks BEFORE calling `setup()`/`setup_from_ini()`.
 
 ### 11. Keyboard Macros ([macros]) and Line-Triggered Auto-Input ([triggers])
 
@@ -164,3 +165,18 @@
 - OSC 52 lets the child read (`?` payload) or write (base64 payload) the Windows clipboard on its own
   behalf -- how a TUI that owns the mouse copies a selection it drew itself, since it has no OS
   clipboard access of its own.
+
+### 13. Settings Serialization and Deferred Startup Text
+
+- `create_current_ini()` serializes every setting CURRENTLY in effect (compiled-in defaults plus
+  every `setup()`/`setup_from_ini()` layer applied so far) back into INI text, in the same
+  section/key/comment layout `setup_from_ini()` reads -- reloadable with no drift. String values
+  (`cmdline`, `[macros]` F1..F12, `[triggers]` match/send) are re-escaped (`EncodeEscapes`, the
+  inverse of `DecodeEscapes`) so paths and patterns containing `\`/`;`/control characters survive
+  the round trip.
+- `add_message(text)` queues a host-supplied notice on the same deferred channel `setup()`/
+  `setup_from_ini()` use for their own status text, so it is guaranteed to print (via `open()`)
+  before any child process output. Must be called before `open()` -- after that, use `print()`.
+- `setup_from_ini()` on a missing path no longer creates a default file (see PITFALLS #16): it only
+  appends a status message to the deferred channel above and leaves every setting at whatever the
+  previous layer resolved.

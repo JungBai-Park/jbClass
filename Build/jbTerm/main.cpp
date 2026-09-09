@@ -3,7 +3,24 @@
     client area is entirely filled by a single ConBox.
 
     cJbTermFrame (FrameBox subclass) adds a title-bar system menu (WM_SYSCOMMAND) with
-    Save Text/PDF/EMF and Start/Stop Logging (Korean labels), exercising ConBox's export/logging API.
+    Save Text/PDF/EMF, Start/Stop Logging, and Create Clone (Korean labels), exercising ConBox's
+    export/logging/settings-serialization API.
+
+    Standard-handle modes (cmd.exe only -- PowerShell has no '<' operator; a pipe works in both).
+    Both are detected once with GetFileType, so an ordinary launch takes neither path and pays
+    nothing for the check:
+      jbTerm.exe < settings.ini   the piped text REPLACES the embedded jbTerm.ini as the base
+                                  settings layer (not layered on top of it) and is applied to THIS
+                                  process's own settings exactly like an "@settings.ini" argument
+                                  otherwise would be; any argv @file/key=value can still override it
+                                  (see the setup() call order in main() below).
+      jbTerm.exe > settings.ini   the settings actually in effect after every layer above (embedded
+                                  globals OR stdin, then every argv layer) are written out as a full
+                                  INI file. Always runs LAST, so it reflects stdin too.
+    The title-bar system menu's "복제본 생성..." writes the CURRENT settings into a NEW copy of this
+    exe at a user-chosen path (GetSaveFileNameW), by patching the copy's embedded RCDATA resource --
+    the same mechanism "> settings.ini" and "@file" rely on to read/write settings, aimed at another
+    exe's resource instead of a stream.
 */
 
 #include "..\..\Source\FrameBox.h"
@@ -19,6 +36,47 @@ static const UINT ID_SAVE_EMF  = 0xE010;
 static const UINT ID_SAVE_TEXT = 0xE020;
 static const UINT ID_SAVE_PDF  = 0xE030;
 static const UINT ID_LOG       = 0xE040;
+static const UINT ID_CLONE     = 0xE050;
+
+// Timer id + TIMERPROC for the brief title-bar status message "복제본 생성..." shows (instead of a
+// MessageBoxW popup like the other Save items, per how this menu item was specified). A TIMERPROC
+// (not the window's own message map) means WM_TIMER for this id is intercepted by DispatchMessage
+// and never reaches cJbTermFrame::WindowProc -- so this stays entirely inside main.cpp with no
+// FrameBox.cpp change, and CLONE_MSG_TIMER_ID only needs to differ from FrameBox's own
+// MODAL_TIMER_ID (1, see FrameBox.cpp) to avoid colliding on the same HWND.
+static const UINT_PTR CLONE_MSG_TIMER_ID = 9001;
+static const UINT     CLONE_MSG_MS       = 3000;
+
+// GetTickCount64() deadline while a ShowTempTitle() message is showing; OnTitleChanged() (below)
+// checks this and drops any shell OSC 0/2 title update until it passes. Without this, a child that
+// sets its own title at startup or on every prompt (e.g. a shell.bat with a "title ..." line) can
+// overwrite the status message within milliseconds -- invisible in practice even though it really
+// was set. 0 = no message showing (the common case; OnTitleChanged applies titles normally).
+static ULONGLONG g_temp_title_until = 0;
+
+static void CALLBACK RevertTitleProc(HWND hwnd, UINT, UINT_PTR id, DWORD) {
+    ::KillTimer(hwnd, id);
+    g_temp_title_until = 0;
+    ::SetWindowTextW(hwnd, L"jbTerm");   // revert to the fixed startup title (see main()), not
+                                          // whatever the shell's title was -- seeing "jbTerm" for a
+                                          // moment beats reapplying a title that may itself now be
+                                          // stale (the shell may have moved on since it was set).
+}
+
+// Put text in the title bar for CLONE_MSG_MS (immune to OnTitleChanged() during that window), then
+// revert to "jbTerm".
+static void ShowTempTitle(HWND hwnd, const wchar_t* text) {
+    g_temp_title_until = ::GetTickCount64() + CLONE_MSG_MS;
+    ::SetWindowTextW(hwnd, text);
+    ::SetTimer(hwnd, CLONE_MSG_TIMER_ID, CLONE_MSG_MS, RevertTitleProc);
+}
+
+// Forward declarations: cJbTermFrame::WindowProc (ID_CLONE, below) needs these; their bodies come
+// after the class (grouped with the rest of the settings/resource helpers they belong with).
+static std::wstring GetSelfExePath();
+static std::string  ToIniFileBytes(const std::string& ini_text);
+static std::wstring Utf8ToWide(const std::string& s);
+static std::string  CreateResourcePatchedCopy(const std::wstring& target_path, const std::string& ini_bytes);
 
 class cJbTermApp : public CWinApp {
     int exit_code = 0;
@@ -51,13 +109,21 @@ public:
     // window class name is visible as "jbTerm" in tools like Spy++.
     const wchar_t* window_class_name() const override { return L"jbTerm"; }
 
-    void setup_sysmenu() {
+    // show_clone: whether to offer "복제본 생성..." (and the separator that closes its group).
+    // It is left out when this run took no stdin settings and no command-line arguments, because
+    // the settings in effect are then exactly the ones already embedded in this exe -- a clone
+    // would just be a copy of the running file with nothing added.
+    void setup_sysmenu(bool show_clone) {
         HMENU hSys = ::GetSystemMenu(m_hWnd, FALSE);
         if (!hSys) return;
         ::AppendMenuW(hSys, MF_SEPARATOR, 0, nullptr);
+        if (show_clone) {
+            ::AppendMenuW(hSys, MF_STRING, ID_CLONE, L"복제본 생성...");
+            ::AppendMenuW(hSys, MF_SEPARATOR, 0, nullptr);
+        }
         ::AppendMenuW(hSys, MF_STRING, ID_SAVE_TEXT, L"Text로 저장...");
-        ::AppendMenuW(hSys, MF_STRING, ID_SAVE_PDF,  L"PDF로 저장...");
         ::AppendMenuW(hSys, MF_STRING, ID_SAVE_EMF,  L"EMF로 저장...");
+        ::AppendMenuW(hSys, MF_STRING, ID_SAVE_PDF,  L"PDF로 저장...");
         ::AppendMenuW(hSys, MF_SEPARATOR, 0, nullptr);
         ::AppendMenuW(hSys, MF_STRING, ID_LOG,       L"기록 시작...");
     }
@@ -179,6 +245,42 @@ public:
                 }
                 return 0;
             }
+            if (id == ID_CLONE) {
+                std::wstring self = GetSelfExePath();
+                std::wstring self_name = L"jbTerm.exe";   // fallback if GetModuleFileNameW ever fails
+                if (!self.empty()) {
+                    size_t slash = self.find_last_of(L'\\');
+                    self_name = (slash == std::wstring::npos) ? self : self.substr(slash + 1);
+                }
+
+                // Default directory = Desktop. A failure just leaves lpstrInitialDir null, which
+                // GetSaveFileNameW treats as "use its own current-directory default" -- never fatal.
+                wchar_t desktop[MAX_PATH] = {};
+                PWSTR desktop_pidl = nullptr;
+                if (SUCCEEDED(::SHGetKnownFolderPath(FOLDERID_Desktop, 0, nullptr, &desktop_pidl)) && desktop_pidl) {
+                    wcsncpy_s(desktop, desktop_pidl, _TRUNCATE);
+                    ::CoTaskMemFree(desktop_pidl);
+                }
+
+                wchar_t file[MAX_PATH] = {};
+                wcsncpy_s(file, self_name.c_str(), _TRUNCATE);   // default file name = actual exe name
+                OPENFILENAMEW ofn = {};
+                ofn.lStructSize = sizeof(ofn);
+                ofn.hwndOwner   = m_hWnd;
+                ofn.lpstrFilter = L"실행 파일 (*.exe)\0*.exe\0모든 파일 (*.*)\0*.*\0";
+                ofn.lpstrFile   = file;
+                ofn.nMaxFile    = MAX_PATH;
+                ofn.lpstrInitialDir = desktop[0] ? desktop : nullptr;
+                ofn.Flags       = OFN_OVERWRITEPROMPT | OFN_HIDEREADONLY;
+                ofn.lpstrDefExt = L"exe";
+                if (::GetSaveFileNameW(&ofn)) {
+                    std::string ini_bytes = ToIniFileBytes(con_box->create_current_ini());
+                    std::string err = CreateResourcePatchedCopy(file, ini_bytes);
+                    ShowTempTitle(m_hWnd, err.empty() ? L"복제본을 생성했습니다."
+                                                       : (L"복제본 생성 실패: " + Utf8ToWide(err)).c_str());
+                }
+                return 0;
+            }
         }
         LRESULT result = FrameBox::WindowProc(msg, wp, lp);
         // Clicking the title bar (non-client area) reactivates this top-level window
@@ -207,8 +309,10 @@ static void OnShellExit() {
 }
 
 // ConBox title callback: the shell sent an OSC 0/2 "set title" sequence (title is UTF-8); apply
-// it to the frame's title bar.
+// it to the frame's title bar. Dropped while a ShowTempTitle() status message is showing (see
+// g_temp_title_until) so a child that retitles itself (at startup or per-prompt) cannot clobber it.
 static void OnTitleChanged(const char* title) {
+    if (g_temp_title_until != 0 && ::GetTickCount64() < g_temp_title_until) return;
     int wlen = ::MultiByteToWideChar(CP_UTF8, 0, title, -1, nullptr, 0);
     if (wlen <= 0) return;
     std::vector<wchar_t> wtitle(wlen);
@@ -228,6 +332,12 @@ static void OnTitlebarColor(COLORREF caption, COLORREF text, COLORREF border) {
 // RCDATA id embedded in jbTerm.rc (jbTerm.ini content as of build time). No resource.h in this
 // project -- keep this value in sync with the numeric id used in jbTerm.rc's "129 RCDATA ..." line.
 static const int IDR_DEFAULT_INI = 129;
+
+// Language of that resource: jbTerm.rc puts it under "LANGUAGE 18, 1" (LANG_KOREAN/SUBLANG_KOREAN).
+// CreateResourcePatchedCopy must patch the SAME language id so it REPLACES the existing entry --
+// writing a different one would leave two variants in the copy and let FindResourceW's
+// language-fallback search return either, depending on the machine's locale.
+static const WORD IDR_DEFAULT_INI_LANG = MAKELANGID(LANG_KOREAN, SUBLANG_KOREAN);
 
 // Read the embedded default jbTerm.ini back out as a UTF-8 string (raw resource bytes -- content
 // is whatever jbTerm.ini held at build time, BOM included; ConBox::setup()/ParseIni() already skip
@@ -253,6 +363,82 @@ static std::string WideToUtf8(const wchar_t* w) {
     return s;
 }
 
+static std::wstring Utf8ToWide(const std::string& s) {
+    int n = ::MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
+    std::wstring w(n > 0 ? n - 1 : 0, L'\0');
+    if (n > 0) ::MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, &w[0], n);
+    return w;
+}
+
+// Resolve path the same way an explicit "@path" argument is resolved (relative to the CURRENT
+// WORKING DIRECTORY, via GetFullPathNameW) and load it as a settings layer. Shared by the '@'
+// branch and the bare-argument-with-a-recognized-extension branch of the argv loop in main() --
+// both end up doing exactly this.
+static void ApplyIniFileArg(ConBox* conBox, const wchar_t* path) {
+    wchar_t abs_path[MAX_PATH] = {};
+    DWORD len = ::GetFullPathNameW(path, MAX_PATH, abs_path, nullptr);
+    const wchar_t* resolved = (len > 0 && len < MAX_PATH) ? abs_path : path;
+    conBox->setup_from_ini(WideToUtf8(resolved).c_str());
+}
+
+// True if warg names a path ending in .ini, .txt, or .jbt (case-insensitive -- Windows extensions
+// are). A bare argument (no leading '@', no '=') with one of these extensions is treated as a
+// settings file exactly like an explicit "@path" argument (see the argv loop in main()), so a
+// settings file can be dropped onto jbTerm or double-clicked without needing the '@' marker.
+static bool HasSettingsFileExtension(const wchar_t* warg) {
+    static const wchar_t* const exts[] = { L".ini", L".txt", L".jbt" };
+    size_t len = wcslen(warg);
+    for (const wchar_t* ext : exts) {
+        size_t elen = wcslen(ext);
+        if (len >= elen && _wcsicmp(warg + (len - elen), ext) == 0)
+            return true;
+    }
+    return false;
+}
+
+// Quote a single argument for embedding in a Windows command-line string, following the same rules
+// CreateProcessW's own argv splitter (and CommandLineToArgvW) expect: a run of backslashes is only
+// special immediately before a double quote, where it must be doubled (plus one more backslash to
+// escape the quote itself); elsewhere backslashes are literal. An argument with no space/tab/quote
+// needs no quoting at all and is returned unchanged (keeps the common case readable).
+static std::wstring QuoteWindowsArg(const std::wstring& arg) {
+    if (!arg.empty() && arg.find_first_of(L" \t\"") == std::wstring::npos)
+        return arg;
+
+    std::wstring out(1, L'"');
+    for (auto it = arg.begin(); ; ++it) {
+        size_t backslashes = 0;
+        while (it != arg.end() && *it == L'\\') { ++it; ++backslashes; }
+        if (it == arg.end()) {
+            out.append(backslashes * 2, L'\\');   // doubled: the closing quote below follows
+            break;
+        } else if (*it == L'"') {
+            out.append(backslashes * 2 + 1, L'\\');   // doubled, plus one more to escape the quote
+            out.push_back(*it);
+        } else {
+            out.append(backslashes, L'\\');   // not before a quote: literal
+            out.push_back(*it);
+        }
+    }
+    out.push_back(L'"');
+    return out;
+}
+
+// Reconstruct a valid Windows command-line string from __wargv[first..argc-1]. NOT a plain
+// space-join of the already-dequoted tokens: a token that came from a quoted phrase (e.g. "fix bug"
+// from `-m "fix bug"`) contains a space that is part of ONE argument, and joining it back with a
+// bare space would let CreateProcessW's own re-tokenizing later split it into two. QuoteWindowsArg
+// re-quotes only the tokens that actually need it, so the child receives exactly the original argv
+// -- not necessarily byte-identical formatting, but the same argument values.
+static std::wstring RebuildCommandLine(int first, int argc) {
+    std::wstring out;
+    for (int i = first; i < argc; ++i) {
+        if (i > first) out.push_back(L' ');
+        out += QuoteWindowsArg(__wargv[i]);
+    }
+    return out;
+}
+
 // Escape a bare command string before it is implicitly given a "cmdline=" key, so ConBox's universal
 // escape decoding / INI comment-cut do not reinterpret it: '\' becomes "\\" (DecodeEscapes' \\ rule
 // then restores exactly one '\', so it never combines with the next character into an unrelated
@@ -271,7 +457,115 @@ static std::string EscapeForAutoCmdline(const std::string& raw) {
     return out;
 }
 
+// True when a standard handle was redirected to a file or a pipe ("jbTerm.exe < a.ini",
+// "> a.ini", or either side of a pipe). A console handle (FILE_TYPE_CHAR -- the normal launch from
+// a terminal, including a ConPTY one) and an absent handle (NULL, e.g. started from Explorer) both
+// count as "not redirected". GetFileType only asks the kernel what the handle is: it never reads,
+// writes or blocks, so the ordinary launch path is not delayed by this probe.
+static bool IsRedirected(DWORD std_handle) {
+    HANDLE h = ::GetStdHandle(std_handle);
+    if (h == NULL || h == INVALID_HANDLE_VALUE) return false;
+    DWORD type = ::GetFileType(h);
+    return (type == FILE_TYPE_DISK || type == FILE_TYPE_PIPE);
+}
+
+// Read redirected stdin to EOF. Bytes are passed through verbatim (a UTF-8 BOM and CRLF line
+// endings are both fine: ConBox's INI parser skips the BOM and tolerates the CR). Only called when
+// IsRedirected(STD_INPUT_HANDLE) already said the handle is a file/pipe, so this never waits on a
+// console. A closed pipe ends the loop via ReadFile failing with ERROR_BROKEN_PIPE, which is normal
+// EOF here rather than an error to report.
+static std::string ReadAllStdin() {
+    std::string data;
+    HANDLE h = ::GetStdHandle(STD_INPUT_HANDLE);
+    if (h == NULL || h == INVALID_HANDLE_VALUE) return data;
+    char buf[4096];
+    DWORD n = 0;
+    while (::ReadFile(h, buf, sizeof(buf), &n, nullptr) && n > 0)
+        data.append(buf, n);
+    return data;
+}
+
+// Full path of this running exe, or empty on failure (GetModuleFileNameW itself failing, or the
+// path being MAX_PATH or longer).
+static std::wstring GetSelfExePath() {
+    wchar_t path[MAX_PATH] = {};
+    DWORD len = ::GetModuleFileNameW(nullptr, path, MAX_PATH);
+    if (len == 0 || len >= MAX_PATH) return std::wstring();
+    return path;
+}
+
+// Convert create_current_ini()'s '\n'-only text into the on-disk/embedded byte layout used
+// everywhere else in this project: UTF-8 BOM + CRLF. Shared by WriteSettingsToStdout ("> file") and
+// the "복제본 생성..." menu item -- both ultimately write the same create_current_ini() text, just to
+// a stream vs. a copy's embedded resource.
+static std::string ToIniFileBytes(const std::string& ini_text) {
+    std::string out = "\xEF\xBB\xBF";
+    out.reserve(ini_text.size() + ini_text.size() / 16 + 8);
+    for (char c : ini_text) {
+        if (c == '\n') out += "\r\n";
+        else out.push_back(c);
+    }
+    return out;
+}
+
+// Write the settings in effect to redirected stdout as a complete INI file, so "jbTerm.exe > my.ini"
+// produces a file that "jbTerm.exe @my.ini" reads back to the identical settings.
+static void WriteSettingsToStdout(const std::string& ini_text) {
+    HANDLE h = ::GetStdHandle(STD_OUTPUT_HANDLE);
+    if (h == NULL || h == INVALID_HANDLE_VALUE) return;
+    std::string out = ToIniFileBytes(ini_text);
+    DWORD written = 0;
+    ::WriteFile(h, out.data(), (DWORD)out.size(), &written, nullptr);
+}
+
+// Copy this exe to target_path (overwriting anything already there without asking -- the caller,
+// the "복제본 생성..." menu handler, already confirmed that via GetSaveFileNameW's
+// OFN_OVERWRITEPROMPT) and replace the copy's embedded INI resource (IDR_DEFAULT_INI) with
+// ini_bytes, producing a standalone exe that carries those settings as its own compiled-in globals.
+// The RUNNING image cannot be patched (the file is locked while it executes), which is why a copy is
+// made first -- BeginUpdateResourceW then opens that fresh copy exclusively. Picking target_path ==
+// the running exe's own path fails harmlessly at the CopyFileW step (Windows refuses to overwrite a
+// file mapped for execution), so no special guard is needed for that case.
+// Returns an empty string on success, or a UTF-8 error message on failure; on any failure AFTER the
+// copy exists, the copy is deleted again so no half-configured exe is left behind.
+static std::string CreateResourcePatchedCopy(const std::wstring& target_path, const std::string& ini_bytes) {
+    std::wstring self = GetSelfExePath();
+    if (self.empty())
+        return "실행 파일의 경로를 확인하지 못했습니다.";
+
+    if (!::CopyFileW(self.c_str(), target_path.c_str(), FALSE))
+        return "파일을 만들지 못했습니다. (오류 " + std::to_string(::GetLastError()) + ")";
+
+    std::string fail;
+    HANDLE res = ::BeginUpdateResourceW(target_path.c_str(), FALSE);
+    if (!res) {
+        fail = "리소스 갱신을 시작하지 못했습니다. (오류 " + std::to_string(::GetLastError()) + ")";
+    // (LPCWSTR)RT_RCDATA: RT_RCDATA expands to MAKEINTRESOURCEA (= LPCSTR) in an MBCS build, which
+    // would not convert to UpdateResourceW's LPCWSTR parameter; the cast keeps this compiling under
+    // either character-set setting.
+    } else if (!::UpdateResourceW(res, (LPWSTR)RT_RCDATA, MAKEINTRESOURCEW(IDR_DEFAULT_INI),
+                                   IDR_DEFAULT_INI_LANG,
+                                   (LPVOID)ini_bytes.data(), (DWORD)ini_bytes.size())) {
+        DWORD err = ::GetLastError();
+        ::EndUpdateResourceW(res, TRUE);   // TRUE = discard the pending update
+        fail = "설정 리소스를 기록하지 못했습니다. (오류 " + std::to_string(err) + ")";
+    } else if (!::EndUpdateResourceW(res, FALSE)) {
+        fail = "설정 리소스를 반영하지 못했습니다. (오류 " + std::to_string(::GetLastError()) + ")";
+    }
+
+    if (!fail.empty()) {
+        ::DeleteFileW(target_path.c_str());   // rolls back only the file this function just created
+        return fail;
+    }
+    return std::string();
+}
+
 int main(int argc, const char* argv[]) {
+    // Probed once, up front (see IsRedirected): a normal launch takes neither branch below and is
+    // not slowed down, matching the pre-existing startup behavior exactly.
+    const bool stdin_given  = IsRedirected(STD_INPUT_HANDLE);
+    const bool stdout_given = IsRedirected(STD_OUTPUT_HANDLE);
+
     const int width = 900, height = 600;   // placeholder only (fit_to_children() below sets
                                             // the real size from jbTerm.ini)
 
@@ -287,50 +581,78 @@ int main(int argc, const char* argv[]) {
     conBox->set_title_cb(OnTitleChanged);              // reflect the shell's OSC title in the title bar
     conBox->set_titlebar_color_cb(OnTitlebarColor);    // apply the ini's title-bar colors (Win11+)
 
-    // Global settings come exclusively from the jbTerm.ini embedded in jbTerm.rc (see
-    // IDR_DEFAULT_INI above) -- no external file is consulted for the global tier, so a single
-    // jbTerm.exe is fully self-contained. Only an explicit "@file" argument (below) loads
-    // settings from disk.
-    conBox->setup(LoadEmbeddedDefaultIni().c_str());
+    // Global settings come from the jbTerm.ini embedded in jbTerm.rc (see IDR_DEFAULT_INI above) --
+    // UNLESS stdin was given, in which case stdin REPLACES the embedded ini as the base layer
+    // entirely rather than being layered on top of it (see the stdin_given branch below). No
+    // external file is consulted for the embedded-ini case, so a single jbTerm.exe is fully
+    // self-contained; only an explicit "@file" argument (below) loads settings from disk.
+    if (!stdin_given)
+        conBox->setup(LoadEmbeddedDefaultIni().c_str());
+
+    // Redirected stdin is applied exactly like an "@file" argument would be as the very FIRST
+    // setup() call (see the !stdin_given guard above): any key stdin does not mention resolves to
+    // ConBox's compiled-in constructor default, not to the embedded jbTerm.ini's value, since that
+    // embedded ini was deliberately skipped above. argv-given layers below can still override a key
+    // stdin also set. Must run BEFORE the argv loop for that ordering to hold, and BEFORE the stdout
+    // dump further down so ">"-redirected output reflects it.
+    if (stdin_given)
+        conBox->setup(ReadAllStdin().c_str());
 
     // Local settings: command-line arguments (argv[1..]) layer on top of the global settings above.
     // __wargv is used (not argv) so non-ASCII values survive intact -- the console/command-line text
     // is not UTF-8, but ConBox expects UTF-8, so each wide argument is converted explicitly below.
-    // An argument starting with '@' is a file/path: everything after that single leading '@' is the
-    // literal path (a real filename that itself starts with '@' is given as "@@name" -- stripping only
-    // the marker leaves the literal "@name"); it is resolved against the CURRENT WORKING DIRECTORY via
-    // GetFullPathNameW (unlike the exe-relative paths above) and its contents loaded the same way as
-    // an INI file. A bare "@" with nothing after it is ignored. Any other argument containing '=' is a
-    // "key = value" settings line; one with neither '@' nor '=' is taken as a shell command line and
-    // gets "cmdline=" prepended automatically (e.g. `jbTerm "ssh user@host"`), with its '\' and ';'
-    // pre-escaped (EscapeForAutoCmdline) so it is taken literally -- only the LAST such bare argument
-    // survives if more than one is given (same last-one-wins rule as any repeated key -- see ParseIni).
-    // A "cmdline=..." the user writes explicitly is NOT pre-escaped, so \x3d/\x3b remain available
-    // there for a command that genuinely needs a literal '='/';'. File arguments are applied first, in
-    // argv order; every "=" (including the auto-"cmdline=") argument is then joined with '\n' and
+    // Each argument is classified in this order:
+    //   1. Starts with '@': the rest is a file/path (a real filename that itself starts with '@' is
+    //      given as "@@name" -- stripping only the marker leaves the literal "@name"). A bare "@"
+    //      with nothing after it is ignored.
+    //   2. Contains '=': a "key = value" settings line (collected into kv_args, applied together
+    //      below -- see the trigger-pairing note further down).
+    //   3. Ends in .ini/.txt/.jbt (case-insensitive): treated exactly like an "@" argument (see 1)
+    //      even without the marker, so a settings file can be dropped onto jbTerm or given by path
+    //      alone (`jbTerm.exe D:\profiles\work.ini`). Missing file: same as a missing "@file" --
+    //      ConBox reports it and settings stay at whatever the previous layer resolved (no crash,
+    //      no fallback to treating it as a command).
+    //   4. Anything else: this argument AND EVERY ONE AFTER IT (verbatim, not reclassified -- an
+    //      '@'/'='/.ini-looking argument here is a literal argument to the child, not reinterpreted
+    //      as jbTerm's own) are the child's command line. RebuildCommandLine re-quotes only the
+    //      __wargv tokens that need it (a token can already contain a space if the user quoted it,
+    //      e.g. `-m "fix bug"`; joining with a bare space would let CreateProcessW's own
+    //      re-tokenizing later split it back into two) before the whole string is pre-escaped
+    //      (EscapeForAutoCmdline) and given a "cmdline=" key. The loop stops here: at most one
+    //      command line can be produced per invocation now, always the first one found. A
+    //      "cmdline=..." the user writes explicitly (case 2) is NOT pre-escaped, so \x3d/\x3b remain
+    //      available there for a command that genuinely needs a literal '='/';'.
+    // '@'/.ini-file arguments (cases 1 and 3) are applied immediately, in argv order; every "="
+    // argument (case 2) plus the one auto-"cmdline=" (case 4, if any) are joined with '\n' and
     // applied in a single setup() call last, so a match=/send= trigger pair given as separate
-    // arguments still lands in one setup() call and registers correctly ([triggers] groups must share
-    // one call to pair up).
+    // arguments still lands in one setup() call and registers correctly ([triggers] groups must
+    // share one call to pair up).
     std::string kv_args;
     for (int i = 1; i < argc; ++i) {
         const wchar_t* warg = __wargv[i];
         if (warg[0] == L'@') {
             const wchar_t* file_arg = warg + 1;
             if (file_arg[0] == L'\0') continue;   // bare "@": nothing to load
-            wchar_t abs_path[MAX_PATH] = {};
-            DWORD len = ::GetFullPathNameW(file_arg, MAX_PATH, abs_path, nullptr);
-            const wchar_t* resolved = (len > 0 && len < MAX_PATH) ? abs_path : file_arg;
-            conBox->setup_from_ini(WideToUtf8(resolved).c_str());
+            ApplyIniFileArg(conBox, file_arg);
+        } else if (std::wstring(warg).find(L'=') != std::wstring::npos) {
+            if (!kv_args.empty()) kv_args += "\n";
+            kv_args += WideToUtf8(warg);
+        } else if (HasSettingsFileExtension(warg)) {
+            ApplyIniFileArg(conBox, warg);
         } else {
             if (!kv_args.empty()) kv_args += "\n";
-            if (std::wstring(warg).find(L'=') != std::wstring::npos)
-                kv_args += WideToUtf8(warg);
-            else
-                kv_args += "cmdline=" + EscapeForAutoCmdline(WideToUtf8(warg));
+            kv_args += "cmdline=" + EscapeForAutoCmdline(WideToUtf8(RebuildCommandLine(i, argc).c_str()));
+            break;   // everything from here on belongs to the child, not to jbTerm's own arguments
         }
     }
     if (!kv_args.empty())
         conBox->setup(kv_args.c_str());
+
+    // Settings are fully resolved at this point (embedded globals, stdin, every command-line layer),
+    // so this is where a redirected stdout gets the dump: what is written is exactly what this
+    // process is about to run with, stdin included.
+    if (stdout_given)
+        WriteSettingsToStdout(conBox->create_current_ini());
 
     // start_x/start_y INI keys (config_start_x/y()) resolve to CW_USEDEFAULT when unset, which
     // OpenFrame passes straight through to CreateWindow -- same as the previous hardcoded
@@ -361,7 +683,9 @@ int main(int argc, const char* argv[]) {
     conBox->open(&Top, 0, 0);                // sizes itself from the ini's font/rows/cols/margin
     Top.AddNew(0, 0, 0, 0, conBox);          // attach-only: register without moving/resizing it
     Top.con_box = conBox;
-    Top.setup_sysmenu();                     // title-bar icon menu: Save EMF/Text/PDF, Start Logging
+    // Title-bar icon menu: Save Text/EMF/PDF, Start Logging, plus "복제본 생성..." only when this run
+    // actually has settings of its own to bake into a clone (stdin and/or command-line arguments).
+    Top.setup_sysmenu(stdin_given || argc > 1);
     Top.fit_to_children();                   // resize Top to wrap conBox exactly (uses ConBox's computed size)
     conBox->SetFocus();                      // start with the cursor showing -- the WM_ACTIVATE-driven
                                               // focus fix (see WindowProc's WM_ACTIVATE handling) does not
