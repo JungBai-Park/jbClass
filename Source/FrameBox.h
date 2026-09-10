@@ -399,7 +399,10 @@ protected:
 protected:
     // Subclass-accessible: read-only DPI/zoom state, and apply_zoom for override hooks.
     int       dpi;      // real monitor DPI; updated on WM_DPICHANGED
-    int       zoom_pm;  // zoom x1000 (1000=1.0x); range [500,3000]; Ctrl+Wheel adjusts
+    int       zoom_pm;  // zoom x1000 (1000=1.0x); Ctrl+Wheel adjusts eff_dpi() (dpi*zoom_pm/1000,
+                        // i.e. the on-screen percent actually combining monitor DPI + this zoom)
+                        // in 5% steps, clamped to 25%~500% of eff_dpi() -- see ZOOM_PCT_* in
+                        // FrameBox.cpp; zoom_pm's own numeric range varies with the monitor's DPI
     int       eff_dpi() const { return max(1, ::MulDiv(dpi, zoom_pm, 1000)); }
     virtual void apply_zoom(int new_pm, bool cursor_anchor); // Ctrl+Wheel zoom: update zoom_pm, resize, rescale
     // Registered Win32 window class name for this top-level window; override to make

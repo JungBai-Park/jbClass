@@ -1719,6 +1719,8 @@ void FrameBox::rescale_children() {
 // still-hidden frame around a child before the first show().
 void FrameBox::fit_to_children() {
     if (snap_margin < 0 || !::IsWindow(m_hWnd)) return;
+    if (::IsIconic(m_hWnd)) return;   // minimized: GetClientRect is 0x0, so the measured pass below
+                                      // would read a bogus non-client size and resize to garbage
 
     int phys_margin = ::MulDiv(snap_margin, eff_dpi(), 96);
     int max_right = 0, max_bottom = 0;
@@ -1737,21 +1739,76 @@ void FrameBox::fit_to_children() {
 
     if (max_right <= 0 && max_bottom <= 0) return;
 
-    // Convert the desired client size to a window rect (accounts for title bar / borders).
-    CRect adj(0, 0, max_right + phys_margin, max_bottom + phys_margin);
+    int want_cw = max_right  + phys_margin;   // desired CLIENT width
+    int want_ch = max_bottom + phys_margin;   // desired CLIENT height
+
+    // Pass 1 -- PREDICTED non-client size. Sizing the window in one shot means the correct
+    // size is the first thing painted; pass 2 alone would briefly expose a wrong size.
+    // Must use the ForDpi variant: plain AdjustWindowRectEx sizes the non-client area for
+    // the thread's cached system DPI, not the DPI of the monitor this window is actually
+    // on, so on a mixed-DPI setup it miscalculates and leaves a gap or clips the child.
+    // The DPI passed is `dpi` (the real monitor DPI), NOT eff_dpi(): Windows draws the
+    // caption/border at the monitor's own DPI and knows nothing about zoom_pm, so feeding
+    // it a zoomed value over-allocates non-client space that then surfaces as background
+    // to the right of / below the child. Only the CLIENT side (phys_margin above) scales
+    // with zoom. Do not "unify" these two on eff_dpi().
+    CRect adj(0, 0, want_cw, want_ch);
     DWORD style   = (DWORD)::GetWindowLongW(m_hWnd, GWL_STYLE);
     DWORD exStyle = (DWORD)::GetWindowLongW(m_hWnd, GWL_EXSTYLE);
-    ::AdjustWindowRectEx(&adj, style, FALSE, exStyle);
+    ::AdjustWindowRectExForDpi(&adj, style, FALSE, exStyle, dpi);
 
     ::SetWindowPos(m_hWnd, nullptr, 0, 0, adj.Width(), adj.Height(),
                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+
+    // Pass 2 -- MEASURED non-client size, as a safety net for whatever pass 1 mispredicted
+    // (theme/OS differences, a style this window carries that the prediction tables model
+    // differently). The window now exists at its pass-1 size, so window minus client IS the
+    // true non-client size. Converges in one step because the non-client size depends on the
+    // window's style and monitor DPI, not on its width/height. A no-op (early return) whenever
+    // pass 1 was already exact, which is the normal case -- so no extra SetWindowPos, no flicker.
+    CRect cr, wnd;
+    GetClientRect(&cr);
+    GetWindowRect(&wnd);
+    if (cr.Width() == want_cw && cr.Height() == want_ch) return;
+
+    ::SetWindowPos(m_hWnd, nullptr, 0, 0,
+                   want_cw + (wnd.Width()  - cr.Width()),
+                   want_ch + (wnd.Height() - cr.Height()),
+                   SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+// Ctrl+Wheel zoom step/range are defined in terms of eff_dpi() (dpi * zoom_pm / 1000 -- the scale
+// actually rendered on screen, combining the real monitor DPI and this zoom factor), not zoom_pm
+// alone -- so a wheel notch always moves the ON-SCREEN percentage by a clean 5%, and the clamp
+// caps the on-screen percentage itself, regardless of which monitor's DPI the window is on.
+static const int ZOOM_PCT_STEP = 5;     // eff_dpi()-based percent moved per wheel notch
+static const int ZOOM_PCT_MIN  = 25;    // eff_dpi()-based percent clamp floor
+static const int ZOOM_PCT_MAX  = 500;   // eff_dpi()-based percent clamp ceiling
+
+// zoom_pm needed so that MulDiv(dpi, zoom_pm, 1000) (= eff_dpi()) displays as exactly target_pct
+// once further converted to percent via MulDiv(eff_dpi, 100, 96). Both conversions round, so a
+// single inverse MulDiv can land one tick off the target; correct that by nudging zoom_pm toward
+// target_pct and re-checking. 100/96 reduces to 25/24 (coprime), so this loop always converges --
+// every multiple of 5 is exactly reachable (proof: the eff_dpi->percent rounding skips exactly one
+// value per 24 consecutive eff_dpi integers, always at an offset =2 (mod 5), so it can never land
+// on a multiple of 5).
+static int zoom_pm_for_pct(int target_pct, int dpi) {
+    int pm = ::MulDiv(target_pct, 96000, dpi * 100);
+    for (int tries = 0; tries < 4; ++tries) {
+        int got = ::MulDiv(::MulDiv(dpi, pm, 1000), 100, 96);
+        if (got == target_pct) break;
+        pm += (got < target_pct) ? 1 : -1;
+    }
+    return pm;
 }
 
 // Ctrl+Wheel zoom. cursor_anchor=true keeps the screen pixel under the cursor fixed;
 // false anchors to the top-left corner (used when the cursor is outside the frame).
 void FrameBox::apply_zoom(int new_pm, bool cursor_anchor) {
     int old_eff = eff_dpi();
-    zoom_pm = new_pm < 500 ? 500 : new_pm > 3000 ? 3000 : new_pm;
+    int pm_min = zoom_pm_for_pct(ZOOM_PCT_MIN, dpi);
+    int pm_max = zoom_pm_for_pct(ZOOM_PCT_MAX, dpi);
+    zoom_pm = new_pm < pm_min ? pm_min : new_pm > pm_max ? pm_max : new_pm;
 
     // Notify all children BEFORE MoveWindow so ConBox/TableBox set zoom_pm + flags first.
     for (ChildEntry& e : registry) {
@@ -2091,13 +2148,23 @@ BOOL FrameBox::PreTranslateMessage(MSG* pMsg) {
 
     // Ctrl+Wheel: zoom the whole frame. If the cursor is inside the frame, anchor to the
     // cursor position (pixel under cursor stays fixed); otherwise anchor to the top-left corner.
+    // Each notch moves the displayed (eff_dpi()-based) percent to the NEXT ZOOM_PCT_STEP-multiple
+    // strictly in the wheel direction -- not a plain +-step on zoom_pm -- so a value that starts
+    // off the 5% grid (e.g. left there by a WM_DPICHANGED) snaps onto it on the very first notch,
+    // instead of drifting by a fixed offset forever.
     if (pMsg->message == WM_MOUSEWHEEL &&
         (GET_KEYSTATE_WPARAM(pMsg->wParam) & MK_CONTROL)) {
         short delta = GET_WHEEL_DELTA_WPARAM(pMsg->wParam);
-        int step = (delta > 0 ? 1 : -1) * (abs((int)delta) / WHEEL_DELTA) * 25;
+        int notches = abs((int)delta) / WHEEL_DELTA;
+        int dir = (delta > 0) ? 1 : -1;
+        int target_pct = ::MulDiv(eff_dpi(), 100, 96);
+        for (int i = 0; i < notches; ++i) {
+            target_pct = (dir > 0) ? (target_pct / ZOOM_PCT_STEP + 1) * ZOOM_PCT_STEP
+                                    : ((target_pct - 1) / ZOOM_PCT_STEP) * ZOOM_PCT_STEP;
+        }
         CPoint cursor(GET_X_LPARAM(pMsg->lParam), GET_Y_LPARAM(pMsg->lParam));
         CRect wr; GetWindowRect(&wr);
-        apply_zoom(zoom_pm + step, wr.PtInRect(cursor) != 0);
+        apply_zoom(zoom_pm_for_pct(target_pct, dpi), wr.PtInRect(cursor) != 0);
         return TRUE;
     }
 

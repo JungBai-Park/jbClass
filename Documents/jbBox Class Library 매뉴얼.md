@@ -359,7 +359,7 @@ class cMyFrame : public FrameBox {
 
 `Ctrl + 마우스 휠`로 프레임과 모든 자식을 함께 확대/축소합니다.
 
-- **줌 범위**: 50% ~ 300% (내부적으로 `zoom_pm`, 1000 = 100%). 휠 한 칸당 2.5%p씩 변합니다.
+- **줌 범위**: `eff_dpi()` 기준(= 실제 모니터 DPI와 줌을 합쳐 화면에 실제 적용되는 값) 25% ~ 500%. 휠 한 칸당 5%p 단위로 바뀌며, 현재 값이 5%의 배수가 아니어도 휠 방향으로 다음 5% 배수까지 스냅합니다(`zoom_pm` 자체의 수치 범위는 모니터 DPI에 따라 달라지지만, 화면에 적용되는 `eff_dpi()` 기준 퍼센트는 항상 25%~500%로 고정됩니다).
 - **커서 앵커**: 커서가 프레임 안에 있으면 커서 아래 픽셀이 화면에 고정되고, 밖에 있으면 좌상단이 고정됩니다.
 - **자식 전파**: 레지스트리의 모든 자식에게 `WM_JBZOOM`(wParam = zoom_pm)이 전송된 **뒤에** 실제 리사이즈가 일어납니다. ConBox/TableBox는 이 메시지에서 내부 배율을 갱신하므로, 이어지는 `WM_SIZE`에서 올바른 폰트 크기로 다시 그립니다.
 
@@ -374,7 +374,7 @@ protected:
     }
     void update_title() {
         wchar_t buf[64];
-        swprintf_s(buf, L"MyApp  %d%%  (%d DPI)", zoom_pm / 10, eff_dpi());
+        swprintf_s(buf, L"MyApp  %d%%  (%d DPI)", ::MulDiv(eff_dpi(), 100, 96), eff_dpi());
         SetWindowTextW(buf);
     }
 };

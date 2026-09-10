@@ -46,29 +46,50 @@ static const UINT ID_CLONE     = 0xE050;
 // MODAL_TIMER_ID (1, see FrameBox.cpp) to avoid colliding on the same HWND.
 static const UINT_PTR CLONE_MSG_TIMER_ID = 9001;
 static const UINT     CLONE_MSG_MS       = 3000;
+static const UINT     SCALE_MSG_MS       = 1000;   // WM_DPICHANGED / Ctrl+Wheel zoom status display
 
 // GetTickCount64() deadline while a ShowTempTitle() message is showing; OnTitleChanged() (below)
-// checks this and drops any shell OSC 0/2 title update until it passes. Without this, a child that
-// sets its own title at startup or on every prompt (e.g. a shell.bat with a "title ..." line) can
-// overwrite the status message within milliseconds -- invisible in practice even though it really
-// was set. 0 = no message showing (the common case; OnTitleChanged applies titles normally).
+// checks this and suppresses applying any shell OSC 0/2 title update to the title bar until it
+// passes (the update is still recorded into g_last_client_title either way). Without this, a child
+// that sets its own title at startup or on every prompt (e.g. a shell.bat with a "title ..." line)
+// can overwrite the status message within milliseconds -- invisible in practice even though it
+// really was set. 0 = no message showing (the common case; OnTitleChanged applies titles normally).
 static ULONGLONG g_temp_title_until = 0;
+
+// Most recent title the shell asked for via OSC 0/2, whether or not it was actually applied to the
+// title bar (see OnTitleChanged() below). Starts at the fixed startup title so RevertTitleProc has
+// something correct to restore even if the shell never sent one. RevertTitleProc restores this --
+// not a fixed string -- so the status message never clobbers whatever title the shell legitimately
+// owns, including one it set while the status message was showing.
+static std::wstring g_last_client_title = L"jbTerm";
 
 static void CALLBACK RevertTitleProc(HWND hwnd, UINT, UINT_PTR id, DWORD) {
     ::KillTimer(hwnd, id);
     g_temp_title_until = 0;
-    ::SetWindowTextW(hwnd, L"jbTerm");   // revert to the fixed startup title (see main()), not
-                                          // whatever the shell's title was -- seeing "jbTerm" for a
-                                          // moment beats reapplying a title that may itself now be
-                                          // stale (the shell may have moved on since it was set).
+    ::SetWindowTextW(hwnd, g_last_client_title.c_str());
 }
 
-// Put text in the title bar for CLONE_MSG_MS (immune to OnTitleChanged() during that window), then
-// revert to "jbTerm".
-static void ShowTempTitle(HWND hwnd, const wchar_t* text) {
-    g_temp_title_until = ::GetTickCount64() + CLONE_MSG_MS;
+// Put text in the title bar for ms milliseconds (immune to OnTitleChanged() during that window),
+// then revert to whatever the shell most recently asked for (g_last_client_title). Re-calling this
+// while already showing reuses the same timer id, which restarts SetTimer's countdown from ms --
+// so a repeat of the triggering event within the display window extends it instead of being ignored.
+static void ShowTempTitle(HWND hwnd, const wchar_t* text, UINT ms = CLONE_MSG_MS) {
+    g_temp_title_until = ::GetTickCount64() + ms;
     ::SetWindowTextW(hwnd, text);
-    ::SetTimer(hwnd, CLONE_MSG_TIMER_ID, CLONE_MSG_MS, RevertTitleProc);
+    ::SetTimer(hwnd, CLONE_MSG_TIMER_ID, ms, RevertTitleProc);
+}
+
+// Screen-scale status shown for SCALE_MSG_MS on WM_DPICHANGED (monitor DPI change) and on Ctrl+Wheel
+// zoom (apply_zoom override, below), prefixed onto whatever title the shell currently owns so the
+// client's own title text is never hidden by the status. percent is always eff_dpi()/96*100 --
+// dpi and zoom_pm combined into the one scale actually applied on screen -- so either trigger
+// reports the same continuous number instead of two independent baselines (raw dpi/96*100 vs raw
+// zoom_pm/10) that can jump apart: e.g. showing 125% for a DPI change, then 97% right after a tiny
+// Ctrl+Wheel nudge, even though the real applied scale barely moved (125% -> ~121%).
+static void ShowScaleTitle(HWND hwnd, int percent) {
+    wchar_t prefix[32];
+    ::swprintf_s(prefix, L"[화면배율 = %d%%] ", percent);
+    ShowTempTitle(hwnd, (prefix + g_last_client_title).c_str(), SCALE_MSG_MS);
 }
 
 // Forward declarations: cJbTermFrame::WindowProc (ID_CLONE, below) needs these; their bodies come
@@ -108,6 +129,13 @@ public:
     // Register under "jbTerm" instead of the shared "FrameBox" default, so the
     // window class name is visible as "jbTerm" in tools like Spy++.
     const wchar_t* window_class_name() const override { return L"jbTerm"; }
+
+    // Ctrl+Wheel zoom: show the resulting scale in the title bar for SCALE_MSG_MS. Base call
+    // first (updates zoom_pm) so the percent shown here reflects the new value.
+    void apply_zoom(int new_pm, bool cursor_anchor) override {
+        FrameBox::apply_zoom(new_pm, cursor_anchor);
+        ShowScaleTitle(m_hWnd, ::MulDiv(eff_dpi(), 100, 96));
+    }
 
     // show_clone: whether to offer "복제본 생성..." (and the separator that closes its group).
     // It is left out when this run took no stdin settings and no command-line arguments, because
@@ -153,6 +181,13 @@ public:
             // tears this process down before it elapses, leaving the child as an orphan. terminate()
             // is idempotent, so this is harmless even if the child already exited on its own.
             con_box->terminate();
+        }
+        if (msg == WM_DPICHANGED) {
+            // Base call first: it sets dpi = LOWORD(wp) before returning, so eff_dpi() below
+            // already reflects the new monitor DPI.
+            LRESULT r = FrameBox::WindowProc(msg, wp, lp);
+            ShowScaleTitle(m_hWnd, ::MulDiv(eff_dpi(), 100, 96));
+            return r;
         }
         if (msg == WM_SYSCOMMAND && con_box) {
             UINT id = (UINT)(wp & 0xFFF0);
@@ -308,15 +343,18 @@ static void OnShellExit() {
     ::PostMessageW(Top.m_hWnd, WM_CLOSE, 0, 0);
 }
 
-// ConBox title callback: the shell sent an OSC 0/2 "set title" sequence (title is UTF-8); apply
-// it to the frame's title bar. Dropped while a ShowTempTitle() status message is showing (see
-// g_temp_title_until) so a child that retitles itself (at startup or per-prompt) cannot clobber it.
+// ConBox title callback: the shell sent an OSC 0/2 "set title" sequence (title is UTF-8). Always
+// recorded into g_last_client_title, but applying it to the frame's title bar is suppressed while a
+// ShowTempTitle() status message is showing (see g_temp_title_until) so a child that retitles itself
+// (at startup or per-prompt) cannot clobber it; RevertTitleProc restores g_last_client_title once the
+// status message's timer expires, so this update is not lost -- only its on-screen display is deferred.
 static void OnTitleChanged(const char* title) {
-    if (g_temp_title_until != 0 && ::GetTickCount64() < g_temp_title_until) return;
     int wlen = ::MultiByteToWideChar(CP_UTF8, 0, title, -1, nullptr, 0);
     if (wlen <= 0) return;
     std::vector<wchar_t> wtitle(wlen);
     ::MultiByteToWideChar(CP_UTF8, 0, title, -1, wtitle.data(), wlen);
+    g_last_client_title.assign(wtitle.data());
+    if (g_temp_title_until != 0 && ::GetTickCount64() < g_temp_title_until) return;
     ::SetWindowTextW(Top.m_hWnd, wtitle.data());
 }
 

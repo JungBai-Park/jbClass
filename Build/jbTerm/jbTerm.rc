@@ -71,7 +71,7 @@ LANGUAGE 18, 1
 //
 
 VS_VERSION_INFO     VERSIONINFO
-  FILEVERSION       0,59,0,0
+  FILEVERSION       0,67,0,0
   PRODUCTVERSION    0,0,0,0
  FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
 #ifdef _DEBUG
@@ -88,13 +88,13 @@ BEGIN
         BLOCK "041204B0"
         BEGIN
             VALUE "CompanyName", "박정배"
-            VALUE "FileDescription", "JungBai's Terminal V0.59"
+            VALUE "FileDescription", "JungBai's Terminal V0.67"
             VALUE "FileVersion",     "1.0.0.1"
             VALUE "InternalName",    "jbTerm.exe"
             VALUE "LegalCopyright", "Copyright (C) Daniel Park.  All rights reserved."
             VALUE "OriginalFilename","jbTerm.exe"
             VALUE "ProductName", "JungBai's Terminal"
-            VALUE "ProductVersion",  "V0.59 Release.64 (2026-09-09 15:06)"
+            VALUE "ProductVersion",  "V0.67 Release.64 (2026-09-10 15:18)"
         END
     END
     BLOCK "VarFileInfo"

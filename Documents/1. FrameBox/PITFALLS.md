@@ -221,3 +221,45 @@
   that wants the child focused immediately at startup should also call the child's
   `SetFocus()` explicitly once, right after attaching it, rather than relying on `WM_ACTIVATE`
   alone.
+
+### 20. fit_to_children Non-Client Sizing: Predict with dpi (Not eff_dpi()), Then Measure
+
+- `fit_to_children()` computes the outer window size from the desired client size (children's
+  bounds + `snap_margin`, which itself scales with `eff_dpi()`) plus the non-client size
+  (caption/border). Plain `AdjustWindowRectEx` is DPI-unaware: it sizes the non-client area
+  using the calling thread's cached system DPI, not the DPI of the monitor the window is
+  actually on -- on a mixed-DPI dual-monitor setup this left a visible gap (or clipped the
+  child) depending on which monitor's scale matched the cached system DPI.
+- Fix, pass 1 (predicted): call `AdjustWindowRectExForDpi(&adj, style, FALSE, exStyle, dpi)`
+  (Windows 10 1607+, available since `_WIN32_WINNT` is already `0x0A00`), passing the real
+  monitor `dpi` explicitly instead of relying on the thread's implicit DPI context.
+- Pass the real `dpi`, NOT `eff_dpi()` (`dpi * zoom_pm / 1000`): Windows draws the caption/
+  border at the monitor's own DPI and knows nothing about `zoom_pm`. Passing `eff_dpi()`
+  over-allocates non-client space whenever Ctrl+Wheel zoom is active (`zoom_pm != 1000`),
+  and the surplus surfaces as visible background to the right of / below the child -- same
+  visible symptom as the original bug, but from the zoom axis instead of the monitor axis.
+  Confirmed reproducible on both a 96 DPI monitor zoomed to 125%+ and a 120 DPI monitor
+  zoomed to 150%: the gap appears purely from `eff_dpi() != dpi`, regardless of which one is
+  the real monitor DPI.
+- Fix, pass 2 (measured safety net): after pass 1's `SetWindowPos`, `GetWindowRect() -
+  GetClientRect()` gives the window's TRUE current non-client size (no prediction table
+  involved), and a second `SetWindowPos` corrects for anything pass 1 mispredicted. No-ops
+  (skips the second `SetWindowPos`) whenever pass 1 already landed exactly, which is the
+  normal case. Converges in one step because non-client size depends only on window style and
+  monitor DPI, not on width/height. Requires an `IsIconic()` guard before either pass: a
+  minimized window's `GetClientRect()` is 0x0, which would make pass 2 read a bogus
+  non-client size.
+
+### 21. Ctrl+Wheel 5% Snap: eff_dpi()->Percent Rounding Never Skips a Multiple of 5
+
+- Converting the wheel-zoom target between the displayed percent (`MulDiv(eff_dpi(), 100, 96)`)
+  and `zoom_pm` (`MulDiv(dpi, zoom_pm, 1000)`) goes through two integer roundings, so a naive
+  single-shot inverse formula (`zoom_pm_for_pct`) can land one tick off the intended percent.
+- Since 100/96 reduces to 25/24 (coprime), the eff_dpi()->percent rounding skips exactly one
+  percent value per 24 consecutive `eff_dpi()` integers (24 steps produce 25 percent values), and
+  that skipped value is always of the form `25k+12` -- i.e. always =2 (mod 5). A target that is a
+  multiple of 5 (=0 mod 5) can therefore never fall on a skipped value: every 5%-multiple in
+  [25,500] is always exactly reachable by some integer `eff_dpi()`, hence by some `zoom_pm`.
+- `zoom_pm_for_pct()` still verifies and nudges by +-1 after the initial `MulDiv` guess (rather
+  than trusting the formula blindly), to correct for the double-rounding; this loop is guaranteed
+  to converge given the above.
