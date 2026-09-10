@@ -22,8 +22,22 @@
 //     few seconds, force-killing via terminate() if needed) before the host actually closes.
 //     Automatic; no host code required. See terminate()/is_running() below.
 //   - Register callbacks (set_title_cb, set_titlebar_color_cb, set_exit_callback, set_input_sink,
-//     set_resize_sink) BEFORE setup()/setup_from_ini(): set_titlebar_color_cb in particular gates
-//     the [titlebar] block of create_current_ini() (see create_current_ini/set_titlebar_color_cb).
+//     set_resize_sink, set_layout_changed_cb) BEFORE setup()/setup_from_ini(): set_titlebar_color_cb
+//     in particular gates the [titlebar] block of create_current_ini() (see create_current_ini/
+//     set_titlebar_color_cb).
+//   - Runtime settings from the child (OSC 99, ConBox-private): the child can push a whole
+//     INI-syntax settings block in and/or clear the macro/trigger tables, optionally rebuilding the
+//     entire layout (fonts/grid/window size) as if ConBox had just started. See dispatch_osc /
+//     osc_settings for the format. Fully automatic; a host that wraps its own frame around ConBox
+//     needs set_layout_changed_cb for that, plus set_move_cb (and set_get_position_cb, so param 0
+//     can restore to wherever the user last dragged the window) if it wants runtime start_x/start_y
+//     support. ConBox exports the ESC byte to the child as the ESC environment variable, so a plain
+//     batch file can drive it:
+//         echo %ESC%]99;0
+//         type settings.ini
+//         echo %ESC%\
+//     OSC (not CSI) because conhost's ConPTY layer forwards OSC sequences it does not recognise but
+//     DISCARDS CSI sequences whose final byte it does not know -- a private CSI never arrives.
 //   - Mouse: local drag-selection/overlay scrollbar by default. When the child turns on xterm mouse
 //     tracking (?1000/?1002/?1003 with ?1006 SGR encoding, as Claude Code / vim / htop do), clicks,
 //     drags and wheel notches go to the CHILD instead, the overlay scrollbar is hidden, and the
@@ -84,6 +98,11 @@
 // behavior changes a child could reasonably branch on.
 #define CONBOX_NAME     "ConBox"
 #define CONBOX_VERSION  "1.0"
+
+// OSC number carrying ConBox's private runtime-settings command (see osc_settings / dispatch_osc).
+// Picked from the 64..99 block, which no terminal extension claims, so a sequence meant for some
+// other emulator can never land here. Changing it changes the child-facing protocol.
+#define CONBOX_OSC_SETTINGS  99
 
 #include <afxwin.h>   // MFC core (CWnd, CDC, CFont); also pulls in windows.h (ConPTY HPCON etc.)
 #include <vector>
@@ -340,6 +359,39 @@ public:
     // callback is registered, so a settings dump taken before registration would omit it.
     void set_titlebar_color_cb(void (*cb)(COLORREF caption, COLORREF text, COLORREF border));
 
+    // Set the layout-changed callback. Fired at the end of a full runtime relayout (OSC 99 param 0/1
+    // from the child), AFTER ConBox has rebuilt its fonts and resized its own window, so the
+    // callback sees ConBox's final size. A host whose frame wraps ConBox (FrameBox: snap_margin,
+    // set_margin) must re-wrap here, since nothing else notices a child-initiated size change:
+    //     conBox.set_layout_changed_cb([]{ Top.fit_to_children(); });
+    // Do NOT route this through WM_DPICHANGED: that path moves children to FrameBox's own stored
+    // logical rects (which do not track ConBox's grid-driven size) and cannot reach ConBox's
+    // DPI-change branch anyway (it tests the real GetDpiForWindow, which has not changed).
+    // nullptr = no notification (default); ConBox itself is fully laid out either way, only the
+    // host frame around it stays at its old size.
+    void set_layout_changed_cb(void (*cb)());
+
+    // Set the window-move callback. Fired for OSC 99 param 1 when its own settings text carries
+    // start_x and/or start_y, and for param 0 (restore) when a position is being put back -- never
+    // for param 2, which is for minor settings (macros/triggers/title-bar color) and must never move
+    // or resize the window. Never at startup either, where the host reads config_start_x/y itself
+    // before creating its window. x/y are virtual-screen pixels; either can be CW_USEDEFAULT, meaning
+    // "that axis was not given, keep it". ConBox is normally a WS_CHILD and cannot move the top-level
+    // window it lives in, so the host must do it (jbTerm: SetWindowPos on its frame).
+    // nullptr = start_x/start_y stay inert after startup (default).
+    void set_move_cb(void (*cb)(int x, int y));
+
+    // Set the position-query callback: the host fills x/y with the top-level frame's current
+    // screen position (e.g. jbTerm: GetWindowRect on its frame) and returns true, or returns false if
+    // it cannot. ConBox itself never learns the frame's real position any other way (WS_CHILD, no
+    // handle to the frame), so this is the only way to capture "wherever the user last dragged the
+    // window to". Called once, right as a runtime-settings session begins (the first OSC 99 param
+    // 1/2/3/4 since the last restore or startup); restore (param 0) prefers this captured position
+    // over the startup INI's start_x/y, since the user may have moved the window after startup but
+    // before the session touched anything. nullptr = restore always falls back to the startup INI's
+    // start_x/y (default).
+    void set_get_position_cb(bool (*cb)(int* x, int* y));
+
     // === ConPTY child runner (optional) ===
     // Using this group makes ConBox spawn a child and auto-wire its I/O. If start() is never called,
     // the ConPTY members stay dormant and ConBox is a pure terminal view.
@@ -510,6 +562,36 @@ private:
     // Dispatch a completed CSI sequence (final byte fin): cursor moves / erases / SGR etc.
     void dispatch_csi(wchar_t fin);
 
+    // OSC 99 (ConBox-private runtime settings). arg is everything after "99;":
+    //     <params>[\n<settings text>]
+    // <params> is a ';'-separated list of numbers acted on IN ORDER (empty = 0):
+    //     0 = restore: clear macros/triggers, then re-apply the startup snapshot. Whether the layout
+    //         is rebuilt follows the LAST 1-or-2 apply (1 -> rebuild, 2 -> leave it), and that memory
+    //         is then forgotten. With no apply on record the restore still happens, layout untouched.
+    //     1 = apply the settings text, then full_relayout()
+    //     2 = apply the settings text, no relayout
+    //     3 = drop every [macros] entry
+    //     4 = drop every [triggers] entry
+    // Everything after the first newline is the settings text, in the same INI syntax (and with the
+    // same layering) as setup_from_ini(); it may be many lines, so a whole INI file can be sent in
+    // one sequence. Any diagnostic setup() produces is left in ini_msg for print() to flush at the
+    // end of the current chunk -- printing here would re-enter print() while its own vt_feed loop is
+    // still walking print_ws.
+    // Title-bar colors and start_x/start_y act on BOTH 1 and 2 (they are host callbacks, not layout),
+    // so a settings block that only recolors the title bar or moves the window needs no rebuild.
+    void osc_settings(const std::wstring& arg);
+
+    // Shared tail of OSC 99 params 0/1/2: feed text to setup(), then fire the host callbacks whose
+    // values it may have changed (title-bar colors always; move_cb only when this text actually
+    // carried a start_x/start_y). Does NOT touch the layout -- the caller decides that.
+    void apply_settings_text(const std::string& text);
+
+    // Rebuild everything the way open() does at startup: fonts from the current specs, cell metrics,
+    // own window size from cfg_cols/cfg_rows + margins, grid, scrollbar, title-bar colors; then hand
+    // the host its layout_changed_cb so a wrapping frame can re-fit. Used by OSC 99 param 0, where
+    // any screen-affecting setting may have changed and nothing can be assumed to have stayed put.
+    void full_relayout();
+
     // Parse the accumulated OSC payload (osc_buf, "Ps;Pt") on BEL/ST. Ps 0 or 2 (set window title,
     // the xterm convention Claude Code and most shells use) decodes Pt to UTF-8 and forwards it via
     // title_cb; Ps 52 goes to osc52(). Any other Ps (icon name, color queries, etc.) is dropped --
@@ -678,6 +760,40 @@ private:
     // setup()/setup_from_ini() already ran still replays the current values immediately.
     void (*titlebar_color_cb)(COLORREF caption, COLORREF text, COLORREF border);
     COLORREF titlebar_caption, titlebar_text, titlebar_border;
+
+    // Layout-changed callback (see set_layout_changed_cb); fired at the end of full_relayout().
+    void (*layout_changed_cb)();
+
+    // Window-move callback (see set_move_cb), fired only for a runtime start_x/start_y.
+    void (*move_cb)(int x, int y);
+
+    // Position-query callback (see set_get_position_cb): asks the host for the frame's current
+    // screen position.
+    bool (*get_position_cb)(int* x, int* y);
+
+    // === OSC 99 runtime-settings state ===
+    // Startup snapshot: create_current_ini() taken at the end of open(), i.e. after every setup()
+    // layer the host made (embedded resource, stdin, command line) and before the child starts, so
+    // it is exactly "the settings this run began with". Taken once and never overwritten, so repeated
+    // apply/restore cycles always come back to the same place. Restoring re-applies it through
+    // setup(), which is why param 0 clears macros/triggers first: triggers are append-only and would
+    // otherwise pile up duplicates.
+    std::string snapshot_ini;
+    // What param 0 (restore) needs to do: 0 = nothing has diverged from the snapshot since the last
+    // restore (or since startup) -- restore is a no-op and is skipped entirely. 1 = something has
+    // been applied (param 2, or a bare macro/trigger clear via 3/4) but never with a relayout, so
+    // restore reapplies the snapshot without calling full_relayout(). 2 = param 1 ran at some point,
+    // so a relayout is owed on restore regardless of what ran afterward -- once set to 2 this never
+    // drops back to 1 (only param 0 clears it, back to 0).
+    int  restore_mode;
+    // Set by setup() when the text it just parsed actually carried a non-empty start_x/start_y, so
+    // osc_settings can tell "the block asked to move the window" from "the key was merely inherited".
+    bool start_pos_given;
+    // Position captured via get_position_cb at the start of the current runtime-settings session (see
+    // set_get_position_cb); pos_captured is false until then, and is cleared again once param 0 has
+    // used (or had no use for) it.
+    bool pos_captured;
+    int  captured_x, captured_y;
 
     // === ConPTY child state (all dormant unless start() is used) ===
     HPCON h_pc;                      // pseudo-console handle

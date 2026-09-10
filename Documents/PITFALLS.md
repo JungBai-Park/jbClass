@@ -180,3 +180,15 @@ This project adopts a modular architecture, with the PITFALLS.md files located a
 - Do not preemptively kill jbTerm.exe before MSBuild. If the link step fails with `LNK1168`, that
   means the file at the actual build output path (`Build\jbTerm\Debug.64\jbTerm.exe`) is locked by
   a running instance at that exact path -- identify that specific process before killing anything.
+
+### 18. Answering Opinion/Guess Questions: Skip the "This Is a Guess" Hedge
+
+- The global CLAUDE.md rule (mark assumptions vs. facts) still applies to factual questions, but
+  when the user's question already asks for Claude's interpretation or guess (e.g. Korean
+  "~것 같으니?", "~라고 생각해?"), the answer being an estimate is already the shared premise of
+  the question -- restating "this is a guess" / "not certain" is redundant and should be skipped.
+- Factual questions ("what is this value", "is this path correct") still need explicit
+  certainty-level markers as before; only opinion-seeking questions get the hedge dropped.
+- User correction (2026-09-10): after being asked "what do you think this batch file is for",
+  the answer hedged with "this is inference, not certain" language even though the question
+  itself was explicitly asking for a guess.

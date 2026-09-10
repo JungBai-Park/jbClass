@@ -259,3 +259,58 @@
   `CreateProcessW` call, restore them right after. `NULL` is the state a GUI host launched from
   Explorer already has (the case that always worked), so this makes every launch state converge on
   it at the one moment it matters, regardless of how the host itself was started.
+
+### 23. ConPTY Discards Unknown CSI but Forwards Unknown OSC -- Private Sequences MUST Be OSC
+
+- conhost does not pipe the child's bytes through. It PARSES them into its own console buffer and
+  re-encodes that buffer as VT for the terminal. A CSI whose final byte it does not know cannot be
+  represented in the buffer, so it leaves no trace and is silently dropped -- a ConBox-private
+  `ESC[<n>v` never arrives, no matter that ConBox implements it.
+- An OSC is different: it is by nature a request meant for the layer ABOVE conhost, so unknown
+  numbers are forwarded verbatim. Measured: 20, 70, 77, 99, 100, 777, 1962, 5100, 60000 all arrived.
+  Do NOT read this as "OSC is loosely checked" -- it is the documented division of labor.
+- What survives inside an OSC payload (all measured through a real `cmd.exe` child, not injected):
+  spaces, `=`, embedded CRLF (so a multi-line INI block needs no per-line framing), Korean UTF-8
+  (726 chars in one payload), a stray UTF-8 BOM mid-payload, and a 5.5 KB total length.
+- Consequence for design: ConBox's runtime settings command is OSC 99 (REQUIREMENTS #14). An earlier
+  CSI-based design was fully implemented and worked when fed directly into `print()`, yet did nothing
+  from a batch file -- which is exactly how this asymmetry was found. Diagnose "works when injected,
+  dead through the child" as this, not as a parser bug.
+
+### 24. Verifying Runtime Settings Without Reading the Screen
+
+- Screen-content assertions need a capture, and jbTerm's Save-Text menu item opens a modal dialog, so
+  neither is scriptable. Three indirect signals cover almost everything, all readable from PowerShell:
+  - **Window rect** (`GetWindowRect`) for anything layout-shaped. `grid_cols`/`grid_rows` map to an
+    exact pixel size (cell 9x19 at 96 DPI + 20px margins + 16/39px non-client), so a wrong value is
+    distinguishable from a missing one rather than just "changed".
+  - **A trigger** doubles as a screen assertion: it fires only if its `match` text actually reached
+    the grid. Pair it with `set /p x=PROMPT:` in the batch -- the prompt leaves the cursor on the
+    same line (`echo` would move it past), and the trigger's `send` lands in that very `set /p`, so
+    the batch itself records the outcome to a file. A missing fire is detected by having the script
+    type `NOINPUT` after a timeout instead of hanging forever.
+  - **A macro** verifies key handling: `PostMessage(WM_KEYDOWN, VK_F1)` to the ConBox window needs no
+    focus, and the macro text arrives at the waiting `set /p` the same way.
+- To assert that a whole multi-line block arrived intact, put the setting that moves the window at the
+  very END of the block; then the window only changes size if every preceding line survived.
+- Never locate the test window with `FindWindow` by class name alone: this Claude Code session may
+  itself be hosted in a `jbTerm.exe`, whose frame carries the SAME class name and would be the one
+  found. Enumerate windows and match `GetWindowThreadProcessId` against the PID that `Start-Process`
+  returned. (Same root cause as #21's kill-by-name warning, different API.)
+
+### 25. Driving OSC 99 From cmd.exe's PROMPT Variable: Two Batch-Syntax Traps
+
+- The ST (string terminator) for an OSC sequence is exactly `ESC \` -- two bytes. Writing it as `$E]\`
+  (an extra `]`) instead of `$E\` inside a PROMPT value silently breaks everything after it: ConBox's
+  OSC parser treats the second ESC as ending the FIRST OSC (dispatches it), then sees the stray `]` and
+  starts a SECOND OSC that is never terminated (no further ESC follows in a plain prompt string) --
+  every remaining character, prompt text included, is swallowed into that unterminated OSC buffer and
+  nothing more appears on screen until some later ESC happens to close it. Symptom looks like "the
+  prompt vanished / the terminal froze", not like a parse error.
+- `set "VAR=...%OTHER%..."` inside a parenthesized block (`if (...) ( ... )`) does NOT see a `set` that
+  ran on an EARLIER line of the SAME block: cmd.exe reads and %-expands the whole block up front, before
+  any line in it executes. `set "OLD=%PROMPT%"` immediately followed by `set "PROMPT=...%OLD%"`, both
+  inside one `if (...)` body, expands `%OLD%` to whatever it was BEFORE the block started (typically
+  empty), not to the value the first `set` just assigned -- classic cmd.exe behavior, not an OSC 99 bug.
+  Needs `setlocal enabledelayedexpansion` + `!OLD!` to see the intra-block update, or move the two `set`
+  lines out of the block.

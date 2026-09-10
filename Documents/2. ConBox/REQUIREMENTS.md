@@ -110,6 +110,7 @@
 - `set_exit_callback`, `set_title_cb`, and `set_titlebar_color_cb` take no opaque `user` context argument (unlike `set_input_sink`/`set_resize_sink`, which keep theirs since `start()` reuses them internally via static thunks).
 - `set_titlebar_color_cb(caption, text, border)` is fed from the `[titlebar]` INI colors; a color not set in the INI is `CLR_INVALID`. `ConBox` has no title bar of its own -- applying the values (e.g. via `DwmSetWindowAttribute`) is entirely up to the host. The callback fires once from `setup()`/`setup_from_ini()` and again immediately on registration, so it never misses the current values regardless of call order.
 - `create_current_ini()` (see #13) writes the `[titlebar]` block only if `set_titlebar_color_cb` is already registered at that point -- so hosts that want it must register callbacks BEFORE calling `setup()`/`setup_from_ini()`.
+- `set_layout_changed_cb()`, `set_move_cb()`, and `set_get_position_cb()` exist because a runtime settings block (see #14) can change things only the HOST can act on. `set_layout_changed_cb` fires after ConBox has rebuilt its fonts/grid and resized its own window, so a frame that wraps ConBox can re-fit around the new size (jbTerm: `FrameBox::fit_to_children()`). `set_move_cb(x, y)` fires for param 1 (when its own text carries `start_x`/`start_y`) and for param 0's restore (when `restore_mode == 2`) -- NEVER for param 2, which must never move or resize the window; either value may be `CW_USEDEFAULT`, meaning "that axis was not given, keep it". `set_get_position_cb(&x, &y)` is called once, at the start of a runtime-settings session (the first param 1/2/3/4 since the last restore), so param 0 can restore to the frame's actual pre-session position rather than only the startup INI's `start_x`/`start_y` -- ConBox has no other way to learn its real position (`WS_CHILD`, no handle to the top-level frame); returns false (or is left unregistered) to fall back to the INI value. None of the three replay on registration (all report an event or answer a query on demand, not a stored value).
 
 ### 11. Keyboard Macros ([macros]) and Line-Triggered Auto-Input ([triggers])
 
@@ -180,3 +181,52 @@
 - `setup_from_ini()` on a missing path no longer creates a default file (see PITFALLS #16): it only
   appends a status message to the deferred channel above and leaves every setting at whatever the
   previous layer resolved.
+
+### 14. Runtime Settings Injection From the Child (OSC 99)
+
+- The child process can change ConBox settings while running, by writing a ConBox-private OSC:
+  `ESC ] 99 ; <params> [ LF <settings text> ] ESC \`. The settings text is everything after the FIRST
+  newline, in the same INI syntax and layering as `setup_from_ini()`, and may be many lines -- a whole
+  INI file fits in one sequence (`echo %ESC%]99;1` + `type settings.ini` + `echo %ESC%\`).
+- OSC, not a private CSI: conhost's ConPTY layer forwards OSC sequences it does not recognise but
+  DISCARDS unknown-final-byte CSI sequences, so a private CSI never reaches ConBox (PITFALLS #23).
+- `<params>` is a `;`-separated list acted on IN ORDER, so one sequence can combine several
+  (e.g. `99;3;4;1` = drop macros, drop triggers, apply, rebuild). Empty/absent = 0.
+
+| Param | Action |
+|-------|--------|
+| 0 | Restore: clear macros/triggers, re-apply the startup snapshot. Rebuilds the layout and restores window position only if `restore_mode == 2` (see below). No-op if `restore_mode == 0`. |
+| 1 | Apply the settings text (moving the window too, if the text carries `start_x`/`start_y`), then rebuild the whole layout (`full_relayout()`). |
+| 2 | Apply the settings text without touching the layout OR the window position -- `start_x`/`start_y` in the text are parsed but never acted on and never left to drift internally either (see below). |
+| 3 | Drop every `[macros]` entry. |
+| 4 | Drop every `[triggers]` entry. |
+
+- The startup snapshot is `create_current_ini()` taken once at the end of `open()` -- after every host
+  `setup()` layer (embedded resource, stdin, command line) and before the child starts. It is never
+  refreshed, so repeated apply/restore cycles always land back on the settings the run began with.
+  Restore clears macros/triggers first because `setup()` can only ADD triggers (#11), which would
+  otherwise accumulate duplicates.
+- `restore_mode` tracks what param 0 needs to do, not merely "what the last param 1/2 call was": `0` =
+  nothing has diverged since the last restore/startup (param 0 is skipped entirely, including the
+  `setup()`/callback re-fire `apply_settings_text` would otherwise repeat for no visible effect); `1` =
+  something was applied but never with a relayout (param 2, or a bare `3`/`4`); `2` = param 1 ran at
+  some point. Once `2` it never drops back to `1` -- only param 0 resets it to `0`. This makes a
+  `1 -> 2 -> 0` sequence still rebuild the layout on restore, since param 2's own change does not undo
+  the earlier relayout.
+- Title-bar colors act under BOTH 1 and 2 (host callback, #10, not layout). `start_x`/`start_y` act
+  ONLY under 1 (and under 0's restore, when `restore_mode == 2`): param 2 is for minor settings and must
+  never move or resize the window, so it neither calls `set_move_cb` nor lets `cfg_start_x`/`cfg_start_y`
+  drift internally (its `setup()` call is sandwiched by a save/restore of those two fields, so a later
+  `create_current_ini()` dump never reports a position that was never actually applied).
+- Restoring the window position (param 0, `restore_mode == 2`) prefers the position captured via
+  `set_get_position_cb` at the moment the current session began (the first param 1/2/3/4 since the last
+  restore) over the startup INI's `start_x`/`start_y` -- this is "wherever the user last dragged the
+  window to", which the startup snapshot cannot know. Falls back to the snapshot's `start_x`/`start_y`
+  when no capture is available (callback unregistered or returned false).
+- Which INI keys a runtime block can and cannot change is a property of when each value is consumed;
+  `start_x`/`start_y` are the only keys given a runtime path. `cmdline`/`work_directory` are read only
+  by `start()`, so changing them affects a later clone/dump but not the running child. Screen palette
+  changes apply to text drawn AFTER them, since colors are baked into each cell at output time.
+- `ConBox` exports the ESC byte to the child as the `ESC` environment variable (alongside `PROMPT` and
+  `JBTERM`), since `cmd.exe` has no escape syntax for it -- that is what makes `echo %ESC%]99;...`
+  possible from a plain batch file.

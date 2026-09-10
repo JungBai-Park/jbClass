@@ -141,6 +141,12 @@ public:
     // It is left out when this run took no stdin settings and no command-line arguments, because
     // the settings in effect are then exactly the ones already embedded in this exe -- a clone
     // would just be a copy of the running file with nothing added.
+    //
+    // The three Save formats are nested under one "저장" popup item instead of listed flat: the
+    // system menu (GetSystemMenu's HMENU) accepts MF_POPUP like any other menu, so a submenu
+    // created with CreatePopupMenu() and attached via AppendMenuW(..., MF_POPUP, (UINT_PTR)hSave, ...)
+    // becomes owned by hSys and is destroyed with it -- no separate cleanup needed. WM_SYSCOMMAND
+    // delivery for the leaf items (ID_SAVE_TEXT/EMF/PDF) is unaffected by the nesting depth.
     void setup_sysmenu(bool show_clone) {
         HMENU hSys = ::GetSystemMenu(m_hWnd, FALSE);
         if (!hSys) return;
@@ -149,9 +155,11 @@ public:
             ::AppendMenuW(hSys, MF_STRING, ID_CLONE, L"복제본 생성...");
             ::AppendMenuW(hSys, MF_SEPARATOR, 0, nullptr);
         }
-        ::AppendMenuW(hSys, MF_STRING, ID_SAVE_TEXT, L"Text로 저장...");
-        ::AppendMenuW(hSys, MF_STRING, ID_SAVE_EMF,  L"EMF로 저장...");
-        ::AppendMenuW(hSys, MF_STRING, ID_SAVE_PDF,  L"PDF로 저장...");
+        HMENU hSave = ::CreatePopupMenu();
+        ::AppendMenuW(hSave, MF_STRING, ID_SAVE_TEXT, L"Text로 저장...");
+        ::AppendMenuW(hSave, MF_STRING, ID_SAVE_EMF,  L"EMF로 저장...");
+        ::AppendMenuW(hSave, MF_STRING, ID_SAVE_PDF,  L"PDF로 저장...");
+        ::AppendMenuW(hSys, MF_POPUP, (UINT_PTR)hSave, L"저장");
         ::AppendMenuW(hSys, MF_SEPARATOR, 0, nullptr);
         ::AppendMenuW(hSys, MF_STRING, ID_LOG,       L"기록 시작...");
     }
@@ -365,6 +373,37 @@ static void OnTitlebarColor(COLORREF caption, COLORREF text, COLORREF border) {
     if (caption != CLR_INVALID) ::DwmSetWindowAttribute(Top.m_hWnd, DWMWA_CAPTION_COLOR, &caption, sizeof(caption));
     if (text    != CLR_INVALID) ::DwmSetWindowAttribute(Top.m_hWnd, DWMWA_TEXT_COLOR,    &text,    sizeof(text));
     if (border  != CLR_INVALID) ::DwmSetWindowAttribute(Top.m_hWnd, DWMWA_BORDER_COLOR,  &border,  sizeof(border));
+}
+
+// ConBox layout-changed callback: the shell pushed new settings in with OSC 99 and ConBox has already
+// resized itself to the new font/grid. Nothing else would notice -- the frame keeps its old size --
+// so re-wrap it around ConBox exactly as the startup path does (same call, same reason).
+static void OnLayoutChanged() {
+    if (::IsWindow(Top.m_hWnd)) Top.fit_to_children();
+}
+
+// ConBox window-move callback: a runtime settings block (OSC 99) carried start_x/start_y. ConBox is
+// a WS_CHILD and cannot move the frame it lives in, so the move happens here. CW_USEDEFAULT on an
+// axis means the block did not name it -- keep the frame's current value for that axis.
+static void OnMoveWindow(int x, int y) {
+    if (!::IsWindow(Top.m_hWnd)) return;
+    RECT wr = {};
+    ::GetWindowRect(Top.m_hWnd, &wr);
+    if (x == CW_USEDEFAULT) x = wr.left;
+    if (y == CW_USEDEFAULT) y = wr.top;
+    ::SetWindowPos(Top.m_hWnd, nullptr, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+// ConBox position-query callback: asked once at the start of a runtime-settings session so OSC 99
+// param 0 can restore to wherever the user last dragged the frame, rather than only the startup INI's
+// start_x/y. ConBox cannot read this itself (WS_CHILD, no handle to the frame).
+static bool OnGetPosition(int* x, int* y) {
+    if (!::IsWindow(Top.m_hWnd)) return false;
+    RECT wr = {};
+    ::GetWindowRect(Top.m_hWnd, &wr);
+    *x = wr.left;
+    *y = wr.top;
+    return true;
 }
 
 // RCDATA id embedded in jbTerm.rc (jbTerm.ini content as of build time). No resource.h in this
@@ -618,6 +657,9 @@ int main(int argc, const char* argv[]) {
     conBox->set_exit_callback(OnShellExit);            // close jbTerm when the shell exits
     conBox->set_title_cb(OnTitleChanged);              // reflect the shell's OSC title in the title bar
     conBox->set_titlebar_color_cb(OnTitlebarColor);    // apply the ini's title-bar colors (Win11+)
+    conBox->set_layout_changed_cb(OnLayoutChanged);    // re-wrap the frame after an OSC 99 relayout
+    conBox->set_move_cb(OnMoveWindow);                 // runtime start_x/start_y moves the frame
+    conBox->set_get_position_cb(OnGetPosition);         // lets OSC 99 param 0 restore the pre-session spot
 
     // Global settings come from the jbTerm.ini embedded in jbTerm.rc (see IDR_DEFAULT_INI above) --
     // UNLESS stdin was given, in which case stdin REPLACES the embedded ini as the base layer

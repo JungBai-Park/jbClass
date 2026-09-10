@@ -28,6 +28,7 @@ ipch
 *.pch
 *.suo
 *.opensdf
+*.user
 /Build/JungBai.lib
 /Library/Deploy
 /Library/Build/Output

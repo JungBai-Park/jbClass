@@ -411,6 +411,13 @@ ConBox::ConBox()
     title_cb = nullptr;
     titlebar_color_cb = nullptr;
     titlebar_caption = titlebar_text = titlebar_border = CLR_INVALID;
+    layout_changed_cb = nullptr;
+    move_cb = nullptr;
+    get_position_cb = nullptr;
+    restore_mode = 0;
+    start_pos_given = false;
+    pos_captured = false;
+    captured_x = captured_y = 0;
 
     // ConPTY child state stays empty until start() (pure terminal view).
     h_pc = nullptr;
@@ -1118,6 +1125,14 @@ void ConBox::setup(const char* contents)
     cfg_rows = geti("grid_rows", first ? 32 : cfg_rows);
     // Window start position (config_start_x/y): absent/empty key keeps CW_USEDEFAULT (ctor
     // default on the first call, or whatever a previous layer resolved on a later call).
+    // start_pos_given records whether THIS text actually carried a value, so a runtime block
+    // (OSC 99) can move the window while an inherited value stays inert -- see osc_settings.
+    start_pos_given = false;
+    {
+        const std::string* sx = get("start_x");
+        const std::string* sy = get("start_y");
+        if ((sx && !sx->empty()) || (sy && !sy->empty())) start_pos_given = true;
+    }
     cfg_start_x = geti("start_x", first ? CW_USEDEFAULT : cfg_start_x);
     cfg_start_y = geti("start_y", first ? CW_USEDEFAULT : cfg_start_y);
     if (const std::string* s = get("cmdline")) { if (!s->empty()) cfg_cmdline = *s; }
@@ -1277,6 +1292,12 @@ void ConBox::open(CWnd* parent, int left, int top)
         SetTimer(CURSOR_TIMER, cursor_blink_ms, NULL);
     blink_on = true;
     SetTimer(BLINK_TIMER, 500, NULL);   // SGR blink: 500ms toggle (always running)
+
+    // Startup snapshot for OSC 99 param 0 (restore). Taken here because every setup() layer the host
+    // could make (embedded resource, stdin, command line) is done by now, while the child has not
+    // started and so cannot have changed anything yet. Taken once only: later applies never refresh
+    // it, so restore always lands back on the settings this run began with.
+    snapshot_ini = create_current_ini();
 
     // Print any deferred INI status message (stored by setup_from_ini before the window existed).
     if (!ini_msg.empty()) {
@@ -2407,6 +2428,16 @@ void ConBox::print(const char* text)
 
     check_triggers();   // [triggers]: chunk-end suffix match against the current line
 
+    // A runtime settings apply (OSC 99) inside the loop above leaves its diagnostics in
+    // ini_msg rather than printing them, since printing mid-loop would re-enter these very buffers.
+    // The loop is done, so flush them now. swap() first: the recursive print() must not see them
+    // again (its own loop would find ini_msg empty and stop).
+    if (!ini_msg.empty()) {
+        std::string msg;
+        msg.swap(ini_msg);
+        print(msg.c_str());
+    }
+
     // New output invalidates any selection (cell positions moved); clear it, scroll to bottom, repaint.
     sel_active = false;
     int maxtop = (int)scrollback.size();   // total lines - rows = scrollback.size() (screen always = rows)
@@ -2679,9 +2710,10 @@ void ConBox::osc52(const std::wstring& arg)
 
 // Parse osc_buf ("Ps;Pt") on OSC termination. Ps 0 ("icon name + title") and 2 ("title" only) are
 // the xterm codes shells/CLIs use to set the window title; Pt is decoded to UTF-8 and forwarded via
-// title_cb. Ps 52 is clipboard access (osc52()). Ps 8 is a hyperlink (osc8()). Any other Ps (icon
-// name=1, color queries=4/10/11, etc.) is dropped -- ConBox has no representation for those and no
-// callback fires. A payload missing the ';' separator (malformed, or an empty OSC) is ignored.
+// title_cb. Ps 52 is clipboard access (osc52()). Ps 8 is a hyperlink (osc8()). Ps 99 is ConBox's
+// private runtime-settings command (osc_settings()). Any other Ps (icon name=1, color queries=4/10/11,
+// etc.) is dropped -- ConBox has no representation for those and no callback fires. A payload missing
+// the ';' separator (malformed, or an empty OSC) is ignored.
 void ConBox::dispatch_osc()
 {
     size_t semi = osc_buf.find(L';');
@@ -2692,6 +2724,7 @@ void ConBox::dispatch_osc()
 
     if (ps == 52) { osc52(osc_buf.substr(semi + 1)); return; }
     if (ps == 8)  { osc8(osc_buf.substr(semi + 1));  return; }
+    if (ps == CONBOX_OSC_SETTINGS) { osc_settings(osc_buf.substr(semi + 1)); return; }
 
     if (ps != 0 && ps != 2) return;
     if (!title_cb) return;
@@ -2842,7 +2875,8 @@ void ConBox::dispatch_csi(wchar_t fin)
         }
         break;
 
-    case L'm': {   // SGR (color/attributes)
+    case L'm': {   // SGR (color/attributes). The private form (?m) is undefined/non-standard and ignored.
+        if (vt_priv) break;
         if (vt_nparam == 0) {
             // No params = reset (SGR 0).
             cur_fg = default_fg; cur_bg = default_bg;
@@ -2972,6 +3006,174 @@ void ConBox::dispatch_csi(wchar_t fin)
     default:
         break;   // other unsupported CSI ignored
     }
+}
+
+// OSC 99 (ConBox-private runtime settings), arg = "<params>[\n<settings text>]".
+// Params are ';'-separated numbers acted on IN ORDER, so one sequence can both clear tables and apply
+// a block (e.g. ESC]99;2;3;0 ... ST). An empty/absent param is 0. The settings text is everything past
+// the FIRST newline, which is why a whole multi-line INI file fits in one sequence -- conhost forwards
+// an OSC payload verbatim, newlines included, without drawing it into its console buffer.
+// Runs deep inside print() -> vt_feed() -> dispatch_osc(), so it must NOT call print(): that would
+// re-enter print()'s own print_buf/print_ws members while its vt_feed loop is still walking them.
+// setup() only appends its diagnostics to ini_msg (never prints), and print() flushes ini_msg after
+// its loop finishes, so a bad key in the settings text still reaches the screen -- just a moment later.
+void ConBox::osc_settings(const std::wstring& arg)
+{
+    size_t nl = arg.find(L'\n');
+    std::wstring params = (nl == std::wstring::npos) ? arg : arg.substr(0, nl);
+    while (!params.empty() && params.back() == L'\r')   // the payload arrives CRLF-terminated
+        params.pop_back();
+
+    // Settings text -> UTF-8 once, up front: several params may apply it (0 and 1 both do).
+    std::string text;
+    if (nl != std::wstring::npos && nl + 1 < arg.size()) {
+        const wchar_t* body = arg.c_str() + nl + 1;
+        int blen = (int)(arg.size() - nl - 1);
+        int n = ::WideCharToMultiByte(CP_UTF8, 0, body, blen, nullptr, 0, nullptr, nullptr);
+        if (n > 0) {
+            text.resize(n);
+            ::WideCharToMultiByte(CP_UTF8, 0, body, blen, &text[0], n, nullptr, nullptr);
+        }
+    }
+
+    for (size_t pos = 0; ; ) {
+        size_t sep = params.find(L';', pos);
+        std::wstring one = params.substr(pos, (sep == std::wstring::npos) ? std::wstring::npos : sep - pos);
+        int mode = _wtoi(one.c_str());          // non-numeric or empty -> 0
+
+        // The frame's real position is only ever knowable through the host (ConBox is a WS_CHILD with
+        // no handle to the top-level frame), so it can only be captured, never read back later. Capture
+        // it once, right as a runtime-settings session begins (restore_mode 0 -> nonzero): this is
+        // "wherever the user last dragged the window to", which param 0 prefers over the startup INI's
+        // start_x/y when restoring (see case 0) -- the user may have moved the window after startup but
+        // before this session touched anything.
+        if (mode >= 1 && mode <= 4 && restore_mode == 0 && get_position_cb)
+            pos_captured = get_position_cb(&captured_x, &captured_y);
+
+        switch (mode) {
+        case 0: {
+            // Restore. restore_mode already says whether there is anything to do: 0 means nothing
+            // has diverged from the snapshot since the last restore (or since startup), so skip the
+            // whole round trip -- including the setup()/callback re-fire apply_settings_text would
+            // otherwise repeat for no visible effect. Macros/triggers go first because setup() can
+            // only ADD triggers, so replaying the snapshot over live ones would duplicate them.
+            if (restore_mode == 0) break;
+            for (int k = 0; k < 12; ++k) cfg_macro_f[k].clear();
+            cfg_triggers.clear();
+            active_trigger_count = 0;
+            apply_settings_text(snapshot_ini);
+            if (restore_mode == 2) {
+                // Position restore only happens when param 1 ran at some point (restore_mode == 2) --
+                // param 2 never moves the window, so if it was the only thing used there is nothing to
+                // undo. Prefer the captured pre-session position (BEST: honors a manual drag done after
+                // startup but before this session); fall back to the startup INI's start_x/y (just set
+                // by apply_settings_text above, via snapshot_ini) only when no capture is available.
+                if (pos_captured && move_cb)
+                    move_cb(captured_x, captured_y);
+                else if (start_pos_given && move_cb)
+                    move_cb(cfg_start_x, cfg_start_y);
+                full_relayout();
+            }
+            pos_captured = false;
+            restore_mode = 0;                     // the round trip is closed
+            break;
+        }
+        case 1:
+            if (!text.empty()) apply_settings_text(text);
+            // Only when this very text named a position -- an inherited cfg_start_x/y must not yank
+            // the window back on every unrelated settings block.
+            if (start_pos_given && move_cb)
+                move_cb(cfg_start_x, cfg_start_y);
+            full_relayout();
+            restore_mode = 2;
+            break;
+        case 2:
+            if (!text.empty()) {
+                // Position is layout, not a minor setting -- param 2 must never move the window (the
+                // whole point of using 2 instead of 1 is no relayout flicker). Keep cfg_start_x/y from
+                // drifting too, not just skip the move: otherwise a later create_current_ini() dump
+                // (the stdout-settings/clone-to-exe menu) would serialize a position that was never
+                // actually applied to the window.
+                int sx = cfg_start_x, sy = cfg_start_y;
+                apply_settings_text(text);
+                cfg_start_x = sx;
+                cfg_start_y = sy;
+            }
+            if (restore_mode < 1) restore_mode = 1;
+            break;
+        case 3:
+            for (int k = 0; k < 12; ++k) cfg_macro_f[k].clear();
+            if (restore_mode < 1) restore_mode = 1;
+            break;
+        case 4:
+            cfg_triggers.clear();
+            active_trigger_count = 0;
+            if (restore_mode < 1) restore_mode = 1;
+            break;
+        }
+        if (sep == std::wstring::npos) break;
+        pos = sep + 1;
+    }
+}
+
+// setup() + the title-bar host callback: settings the host owns rather than ConBox. Lives here (not
+// in full_relayout) so it works under param 2 as well -- recoloring a title bar is not a layout
+// rebuild and should not require one. Window position is deliberately NOT handled here: param 1 and
+// param 0 each decide on their own whether to move the window, so a shared automatic move here would
+// also apply to param 2, which must never move it.
+void ConBox::apply_settings_text(const std::string& text)
+{
+    setup(text.c_str());
+
+    if (titlebar_color_cb)
+        titlebar_color_cb(titlebar_caption, titlebar_text, titlebar_border);
+}
+
+// OSC 99 param 0: put the layout back exactly where open() would have left it for the settings now in effect.
+// Nothing about the screen is assumed unchanged -- font, grid, margins, colors and title-bar colors
+// may all differ -- so this repeats open()'s startup sequence on the existing window instead of
+// patching individual pieces.
+void ConBox::full_relayout()
+{
+    if (!::IsWindow(m_hWnd))
+        return;
+
+    // Fonts + cell metrics, in open()'s order. apply_default_fonts only fills in a font the settings
+    // never named, so a font just set by the captured INI survives.
+    apply_default_fonts();
+    build_efont();
+    build_kfont();
+    calc_cell_size();
+
+    // Own window size from the configured grid, the same formula open() uses -- except the margins
+    // scale at eff_dpi() (real DPI x zoom), because a relayout can happen while zoomed and cell_w/h
+    // are already zoomed. The non-client difference is added so a bordered popup ConBox sizes its
+    // CLIENT to the grid (a WS_CHILD contributes 0).
+    int dpi = eff_dpi();
+    int need_w = cfg_cols * cell_w + ::MulDiv(margin_left, dpi, 96) + ::MulDiv(margin_right, dpi, 96);
+    int need_h = cfg_rows * cell_h + ::MulDiv(margin_top,  dpi, 96) + ::MulDiv(margin_bottom, dpi, 96);
+    CRect cr, wr;
+    GetClientRect(&cr);
+    GetWindowRect(&wr);
+    ::SetWindowPos(m_hWnd, nullptr, 0, 0,
+                   need_w + (wr.Width()  - cr.Width()),
+                   need_h + (wr.Height() - cr.Height()),
+                   SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+
+    // The SetWindowPos above delivers OnSize synchronously (same thread) and that already recomputes
+    // the grid, but only IF the size actually changed; call it directly so a relayout that lands on
+    // the same pixel size (e.g. a macros-only INI block sent with param 0/1) still resyncs cols/rows.
+    update_metrics();
+    update_scrollbar();
+
+    // Title-bar colors are NOT fired here: apply_settings_text() already did it, so they also reach
+    // the host under param 2 (no relayout).
+
+    // Finally let a wrapping host frame re-fit around the size this function just produced.
+    if (layout_changed_cb)
+        layout_changed_cb();
+
+    Invalidate();
 }
 
 void ConBox::update_scrollbar()
@@ -4061,6 +4263,27 @@ void ConBox::set_titlebar_color_cb(void (*cb)(COLORREF caption, COLORREF text, C
     // Replay immediately: setup()/setup_from_ini() may already have run (and found no callback to
     // fire to) before the host gets around to registering one.
     if (titlebar_color_cb) titlebar_color_cb(titlebar_caption, titlebar_text, titlebar_border);
+}
+
+void ConBox::set_layout_changed_cb(void (*cb)())
+{
+    // No replay here (unlike set_titlebar_color_cb): this callback reports an event (a relayout that
+    // just happened), not a value the host might have missed.
+    layout_changed_cb = cb;
+}
+
+void ConBox::set_move_cb(void (*cb)(int x, int y))
+{
+    // No replay either: at startup the host reads config_start_x/y itself, so there is nothing
+    // pending here for a late registration to miss.
+    move_cb = cb;
+}
+
+void ConBox::set_get_position_cb(bool (*cb)(int* x, int* y))
+{
+    // No replay: this is a query the host answers on demand (next runtime-settings session), not a
+    // value that could have been missed by registering late.
+    get_position_cb = cb;
 }
 
 void ConBox::send_input_bytes(const char* bytes, int len)
@@ -5319,12 +5542,15 @@ bool ConBox::start()
 }
 
 // Builds a CREATE_UNICODE_ENVIRONMENT block for the child: a copy of this process's own
-// environment (GetEnvironmentStringsW) with PROMPT and JBTERM set/overridden. PROMPT resets SGR
-// and cursor/mouse-reporting modes before drawing the shell's own prompt (defends against a child
-// program leaving the terminal in a state that swallows or mis-renders that prompt); JBTERM lets a
-// child program identify jbTerm and reach the two windows via SendMessage/PostMessage (main window
-// -- GetParent(), the host frame the child's own console UI would otherwise activate/resize -- and
-// this ConBox, both formatted "%08X %08X" for direct use with a HWND-parsing sscanf/strtoul).
+// environment (GetEnvironmentStringsW) with PROMPT and JBTERM set/overridden. PROMPT restores any
+// OSC 99 runtime settings the shell session applied (osc_settings case 0, a no-op if nothing was
+// ever applied -- see restore_mode) and resets SGR and cursor/mouse-reporting modes, all before
+// drawing the shell's own prompt: defends against a child program (a runtime-settings session, or
+// one that left the terminal in a state that swallows or mis-renders the prompt) leaking past its
+// own exit. JBTERM lets a child program identify jbTerm and reach the two windows via
+// SendMessage/PostMessage (main window -- GetParent(), the host frame the child's own console UI
+// would otherwise activate/resize -- and this ConBox, both formatted "%08X %08X" for direct use
+// with a HWND-parsing sscanf/strtoul).
 static std::vector<wchar_t> BuildChildEnvironmentBlock(HWND main_hwnd, HWND con_hwnd)
 {
     std::vector<wchar_t> env;
@@ -5333,8 +5559,9 @@ static std::vector<wchar_t> BuildChildEnvironmentBlock(HWND main_hwnd, HWND con_
         const wchar_t* p = block;
         while (*p != L'\0') {
             size_t len = wcslen(p);
-            // Drop any pre-existing PROMPT/JBTERM so the entries appended below are the only ones.
-            if (_wcsnicmp(p, L"PROMPT=", 7) != 0 && _wcsnicmp(p, L"JBTERM=", 7) != 0)
+            // Drop any pre-existing PROMPT/JBTERM/ESC so the entries appended below are the only ones.
+            if (_wcsnicmp(p, L"PROMPT=", 7) != 0 && _wcsnicmp(p, L"JBTERM=", 7) != 0 &&
+                _wcsnicmp(p, L"ESC=", 4) != 0)
                 env.insert(env.end(), p, p + len + 1);   // include the terminating L'\0'
             p += len + 1;
         }
@@ -5345,12 +5572,21 @@ static std::vector<wchar_t> BuildChildEnvironmentBlock(HWND main_hwnd, HWND con_
     ::wsprintfW(jbterm_val, L"%08X %08X", (unsigned)(DWORD_PTR)main_hwnd, (unsigned)(DWORD_PTR)con_hwnd);
 
     std::wstring prompt_entry =
-        L"PROMPT=$E[0m$E[?25h$E[?1000l$E[?1002l$E[?1003l$E[?1006l$P$G ";
+        L"PROMPT=$E]99;0$E\\$E[0m$E[?25h$E[?1000l$E[?1002l$E[?1003l$E[?1006l$P$G ";
     std::wstring jbterm_entry = std::wstring(L"JBTERM=") + jbterm_val;
+
+    // ESC holds the literal escape byte (0x1B), which cmd.exe cannot produce on its own: `echo` prints
+    // its argument verbatim and there is no \e/^[ escape in batch syntax. With it, a plain batch file
+    // can emit ConBox's runtime-settings sequences (`echo %ESC%]99;1`, see osc_settings) and any
+    // other VT sequence. 0x1B is an ordinary character in an environment block (only L'\0'
+    // terminates an entry), so no encoding trick is needed.
+    std::wstring esc_entry = std::wstring(L"ESC=") + wchar_t(0x1B);
 
     env.insert(env.end(), prompt_entry.begin(), prompt_entry.end());
     env.push_back(L'\0');
     env.insert(env.end(), jbterm_entry.begin(), jbterm_entry.end());
+    env.push_back(L'\0');
+    env.insert(env.end(), esc_entry.begin(), esc_entry.end());
     env.push_back(L'\0');
     env.push_back(L'\0');   // final double-null block terminator
 
